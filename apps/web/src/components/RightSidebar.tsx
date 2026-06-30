@@ -1,43 +1,15 @@
+import { CircleEllipsis, LogOut, Mountain, Shield } from "lucide-react";
+import { useState } from "react";
 import {
-  AlarmClock,
-  Bell,
-  Bookmark,
-  CalendarDays,
-  CircleEllipsis,
-  CircleHelp,
-  Flame,
-  Grid3X3,
-  LogOut,
-  MessageSquareText,
-  Mountain,
-  Newspaper,
-  Rss,
-  Shield,
-} from "lucide-react";
-import { type ReactNode, useState } from "react";
+  getRightSidebarFeature,
+  RIGHT_SIDEBAR_FEATURES,
+  type RightSidebarFeature,
+  type RightSidebarPanelId,
+} from "../features/featureRegistry";
 import { AlertsPanel } from "./AlertsPanel";
 import { StockNewsPanel } from "./StockNewsPanel";
 import { StrongestTodayPanel } from "./StrongestTodayPanel";
 import { WatchlistPanel } from "./WatchlistPanel";
-
-type RightSidebarPanel =
-  | "watchlist"
-  | "alerts"
-  | "layers"
-  | "messages"
-  | "ideas"
-  | "calendar"
-  | "news"
-  | "notifications"
-  | "apps"
-  | "help";
-
-type ToolItem = {
-  id: RightSidebarPanel;
-  title: string;
-  icon: ReactNode;
-  dock?: "top" | "bottom";
-};
 
 type Props = {
   activeSymbol: string;
@@ -48,19 +20,6 @@ type Props = {
   onLogout?(): void;
 };
 
-const TOOLS: ToolItem[] = [
-  { id: "watchlist", title: "关注列表", icon: <Bookmark size={23} strokeWidth={1.7} /> },
-  { id: "alerts", title: "预警", icon: <AlarmClock size={24} strokeWidth={1.7} /> },
-  { id: "layers", title: "今日最强", icon: <Flame size={23} strokeWidth={1.7} /> },
-  { id: "messages", title: "消息", icon: <MessageSquareText size={22} strokeWidth={1.7} /> },
-  { id: "ideas", title: "个股新闻", icon: <Newspaper size={23} strokeWidth={1.7} /> },
-  { id: "calendar", title: "日历", icon: <CalendarDays size={22} strokeWidth={1.7} />, dock: "bottom" },
-  { id: "news", title: "资讯", icon: <Rss size={22} strokeWidth={1.7} />, dock: "bottom" },
-  { id: "notifications", title: "通知", icon: <Bell size={22} strokeWidth={1.7} />, dock: "bottom" },
-  { id: "apps", title: "更多", icon: <Grid3X3 size={24} strokeWidth={1.7} />, dock: "bottom" },
-  { id: "help", title: "帮助", icon: <CircleHelp size={23} strokeWidth={1.7} />, dock: "bottom" },
-];
-
 export function RightSidebar({
   activeSymbol,
   timeframe,
@@ -69,13 +28,13 @@ export function RightSidebar({
   onOpenAdmin,
   onLogout,
 }: Props) {
-  const [activePanel, setActivePanel] = useState<RightSidebarPanel | null>(
+  const [activePanel, setActivePanel] = useState<RightSidebarPanelId | null>(
     "watchlist",
   );
-  const topTools = TOOLS.filter((tool) => tool.dock !== "bottom");
-  const bottomTools = TOOLS.filter((tool) => tool.dock === "bottom");
+  const topTools = RIGHT_SIDEBAR_FEATURES.filter((tool) => tool.dock !== "bottom");
+  const bottomTools = RIGHT_SIDEBAR_FEATURES.filter((tool) => tool.dock === "bottom");
 
-  function togglePanel(panel: RightSidebarPanel) {
+  function togglePanel(panel: RightSidebarPanelId) {
     setActivePanel((current) => (current === panel ? null : panel));
   }
 
@@ -126,10 +85,11 @@ function RailButton({
   active,
   onClick,
 }: {
-  tool: ToolItem;
+  tool: RightSidebarFeature;
   active: boolean;
   onClick(): void;
 }) {
+  const Icon = tool.icon;
   return (
     <button
       type="button"
@@ -138,13 +98,13 @@ function RailButton({
       data-active={active}
       onClick={onClick}
     >
-      {tool.icon}
+      <Icon size={tool.size} strokeWidth={tool.strokeWidth} />
     </button>
   );
 }
 
 function renderPanel(
-  panel: RightSidebarPanel,
+  panel: RightSidebarPanelId,
   activeSymbol: string,
   timeframe: string,
   onSelectSymbol: (symbol: string) => void,
@@ -227,10 +187,10 @@ function UtilityPanel({
   panel,
   activeSymbol,
 }: {
-  panel: RightSidebarPanel;
+  panel: RightSidebarPanelId;
   activeSymbol: string;
 }) {
-  const label = TOOLS.find((tool) => tool.id === panel)?.title ?? "面板";
+  const label = getRightSidebarFeature(panel)?.title ?? "面板";
   return (
     <section className="tv-utility-panel" aria-label={label}>
       <header>

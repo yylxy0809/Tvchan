@@ -212,7 +212,7 @@ Registry targets:
 
 | Layer | Registry |
 | --- | --- |
-| Frontend | `src/features/featureRegistry.ts` for sidebar/bottom-dock panels and feature lifecycle. |
+| Frontend | `src/features/featureRegistry.ts` centralizes sidebar feature definitions and bottom screener tab metadata. Status: partial; right sidebar is registry-driven, bottom dock uses registry metadata for tab typing and icons. |
 | API routes | `services/api/app/routes/registry.py` centralizes router registration. Status: complete. |
 | Workers | `services/collector/collector/worker_registry.py` and `collector.worker` provide a compatible unified worker entry. Status: complete; Docker commands have not been switched yet. |
 | Chan engine | `services/chan-service/chan_service/engine_registry.py` selects module B as the default Chan engine. Status: complete. |

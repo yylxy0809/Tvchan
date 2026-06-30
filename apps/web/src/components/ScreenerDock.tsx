@@ -1,5 +1,4 @@
 import {
-  BarChart3,
   GripHorizontal,
   Loader2,
   Plus,
@@ -30,12 +29,16 @@ import {
   createGroupWithSymbols,
   type WatchlistItem,
 } from "../api/watchlistStore";
+import {
+  SCREENER_DOCK_FEATURES,
+  type ScreenerTabId,
+} from "../features/featureRegistry";
 
 type Props = {
   onSelectSymbol(symbol: string): void;
 };
 
-type ScreenerTab = "wencai" | "chan";
+type ScreenerTab = ScreenerTabId;
 
 const DEFAULT_QUERY = "5日，15日，60日均线多头排列，当日股价突破前高";
 const MIN_PANEL_HEIGHT = 240;
@@ -553,7 +556,7 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
           }}
           onDoubleClick={() => setOpen(false)}
         >
-          <Search size={16} />
+          <ScreenerTabIcon id="wencai" />
           <span>问财选股</span>
         </button>
         <button
@@ -565,12 +568,18 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
           }}
           onDoubleClick={() => setOpen(false)}
         >
-          <BarChart3 size={16} />
+          <ScreenerTabIcon id="chan" />
           <span>缠论选股</span>
         </button>
       </nav>
     </section>
   );
+}
+
+function ScreenerTabIcon({ id }: { id: ScreenerTab }) {
+  const feature = SCREENER_DOCK_FEATURES.find((item) => item.id === id);
+  const Icon = feature?.icon ?? Search;
+  return <Icon size={16} />;
 }
 
 function toWatchlistItems(
