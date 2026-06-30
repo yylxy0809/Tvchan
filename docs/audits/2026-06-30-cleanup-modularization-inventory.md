@@ -84,13 +84,13 @@ Frontend files removed after evidence:
 | `src/components/StatusPanel.tsx` | `rg -n "StatusPanel" apps/web/src` returned only the file definition. | `npm run build`; `npm run test:contract`. |
 | `src/api/history.ts` | `rg -n "history" apps/web/src` showed no importer or UI use of this module. | `npm run build`; `npm run test:contract`. |
 
-Frontend canonical bundle gaps:
+Frontend canonical bundle status:
 
 | Gap | Evidence | Target |
 | --- | --- | --- |
-| Direct `/api/v1/bars` client still exists. | `src/api/client.ts` defines `fetchBars`. | Chart K-line reads should use `/api/v3/chart/bundle` or WS `get_chart_bundle`. |
-| Chart manager still emits `subscribe_chan`. | `src/api/chartDataManager.ts` contains `subscribe_chan` and `unsubscribe_chan`. | Replace with bundle/window subscription semantics. |
-| `marketData.ts` must stay aligned with canonical bundle path. | It exists as a separate data module. | Supporting quote/profile data can stay separate; chart K-line/Chan data should not use legacy bars/chan endpoints. |
+| Chart K-line reads are bundle-routed. | `src/api/client.ts:getBars` is now a compatibility wrapper over `getChartBundle`; no frontend source references `/api/v1/bars`. | Keep the compatibility wrapper only for non-chart callers that need bar-only shape. |
+| Chart manager uses bundle request semantics. | `src/api/chartDataManager.ts` sends WS `get_chart_bundle`; static scan finds no `subscribe_chan`, `get_bars`, or `get_chan` in `apps/web/src`. | Keep frontend chart reads on `/api/v3/chart/bundle` or WS `get_chart_bundle`. |
+| `marketData.ts` is aligned through the bundle adapter. | It calls `getBars`, which resolves through `getChartBundle`. | Supporting quote/profile data can stay separate; chart K-line/Chan data should not use legacy bars/chan endpoints. |
 
 ## Active Backend Surface
 
@@ -175,8 +175,8 @@ These are ignored or should remain untracked. They can be deleted locally after 
 | Issue | Risk | Fix |
 | --- | --- | --- |
 | `scripts/apply-db-migrations.ps1` only applies `001` through `007`, while schema files now include `008` through `011`. | Local DB can be missing auth/canonical/runtime/screener tables. | Update script to enumerate sorted `db/sql/*.sql` or explicitly include all migrations. |
-| `/ws/v2/chart` still supports legacy `get_bars`, `get_chan`, `subscribe_chan`. | Frontend can accidentally keep old contracts alive. | Keep compatibility for now, but make frontend chart reads bundle-only before deleting old paths. |
-| Frontend chart manager still contains legacy Chan subscription names. | Drag/zoom behavior can regress to mixed data paths. | Migrate to canonical bundle/window cache semantics. |
+| `/ws/v2/chart` still supports legacy `get_bars`, `get_chan`, `subscribe_chan`. | External or old test clients may still depend on compatibility message types. | Keep compatibility for now; frontend source is already bundle-only. |
+| Frontend chart manager legacy message names have been removed. | `rg -n "/api/v1/bars|/api/v1/chan/overlay|/api/v1/chart/window|subscribe_chan|get_bars|get_chan|createRealtimeSocket" apps/web/src` returns no matches. | Maintain this scan as a regression check before NAS packaging. |
 | POC vendors and legacy engine still exist. | Confusion during future maintenance. | Quarantine after module B regression fixtures pass. |
 
 ## Modularization Target
@@ -366,12 +366,12 @@ No missing Docker build context.
 
 ## Next Recommended Step
 
-Do not delete source files yet.
+Do not delete broader legacy backend paths yet.
 
-Proceed with Gate 2 first because it is isolated, low risk, and fixes a real deployment consistency issue:
+Proceed with a runtime-oriented registry adoption pass:
 
 ```text
-Update scripts/apply-db-migrations.ps1 to apply all sorted db/sql/*.sql files.
+Switch Docker and runbook worker commands to collector.worker aliases where it reduces duplication.
 ```
 
-After Gate 2 passes, proceed to frontend bundle-only migration before any frontend source cleanup.
+After that passes, quarantine POC vendors and `legacy_engine.py` only after module B regression fixtures and the local runtime checklist pass.
