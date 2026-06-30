@@ -94,17 +94,6 @@ def _analyze_with_chan_py(
     return ChanAnalyzeResponse.model_validate(payload)
 
 
-def _fallback_snapshot_version(request: ChanAnalyzeRequest) -> str:
-    if not request.bars:
-        return f"{request.symbol}:5f:empty"
-    first = request.bars[0].time
-    last = request.bars[-1].time
-    return (
-        f"{request.symbol}:5f:{first}:{last}:{len(request.bars)}:"
-        f"{_bars_fingerprint(request)[:16]}"
-    )
-
-
 def _analysis_cache_key(
     request: ChanAnalyzeRequest,
     engine: AnalyzerEngine,

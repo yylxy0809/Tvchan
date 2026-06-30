@@ -144,10 +144,7 @@ Backend files needing evidence before deletion:
 
 | Candidate | Current assessment | Required proof before removal |
 | --- | --- | --- |
-| `services/chan-service/chan_service/legacy_engine.py` | Module A legacy candidate. | `CHAN_ENGINE_MODE=module_b` is enforced in local, Docker, and tests; no fallback route uses this as accepted output. |
 | `services/collector/collector/backfill.py` | Older backfill candidate. | Current workers use `history_backfill`, `parquet_bootstrap_import`, `pytdx_5f_spool`, or `tdx_csv_import`. |
-| `work/vendor/chanlun.py-main/**` | Old module A/C POC vendor candidate. | Confirm no dynamic imports and no docs require it. |
-| `work/vendor/czsc-v0.9.69/**` | Module C POC vendor candidate. | Confirm no dynamic imports and no docs require it. |
 
 Backend and shared files removed after evidence:
 
@@ -155,6 +152,8 @@ Backend and shared files removed after evidence:
 | --- | --- | --- |
 | `services/chan-service/chan_service/adapter_template.py` | `rg -n "adapter_template" services docs` returned only the audit document and the file itself. | `pytest services/chan-service/tests -q`. |
 | `apps/web/src/api/realtime.ts:createRealtimeSocket` | `rg -n "createRealtimeSocket" apps/web/src` returned only the exported function; chart data uses `createChartSocket`. | `npm run build`; `npm run test:contract`. |
+| `services/chan-service/chan_service/legacy_engine.py` | `rg -n "legacy_engine|analyze_with_legacy_engine" services apps libs deploy scripts` returned no active importer; `CHAN_ENGINE_MODE=module_b` is enforced in local, Docker, and tests. | `pytest services/chan-service/tests -q`. |
+| `work/vendor/chanlun.py-main/**`, `work/vendor/czsc-v0.9.69/**`, and their zip files | Static scan showed only historical docs/audit references; current runtime mounts only `work/vendor/chan.py-main`. | Vendor directory now contains only `chan.py-main` and `chan.zip`. |
 
 ## Generated Or Local-Only Cleanup Candidates
 
@@ -368,10 +367,10 @@ No missing Docker build context.
 
 Do not delete broader legacy backend paths yet.
 
-Proceed with a conservative quarantine review:
+Proceed with the next compatibility review:
 
 ```text
-Review POC vendors and `legacy_engine.py` against module B regression fixtures.
+Review `services/collector/collector/backfill.py` and legacy API routes.
 ```
 
-Quarantine only after the local runtime checklist passes and no dynamic import, Docker build context, or runbook dependency remains.
+Remove only after the local runtime checklist passes and no dynamic import, Docker build context, runbook dependency, or external client compatibility requirement remains.
