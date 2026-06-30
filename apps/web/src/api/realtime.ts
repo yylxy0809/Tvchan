@@ -11,10 +11,6 @@ export type RealtimeMessage = {
   bar?: unknown;
 };
 
-export function createRealtimeSocket(): WebSocket {
-  return createSocket("/ws/v1/realtime");
-}
-
 export function createChartSocket(): WebSocket {
   return createSocket("/ws/v2/chart");
 }

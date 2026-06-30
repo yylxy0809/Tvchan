@@ -145,10 +145,16 @@ Backend files needing evidence before deletion:
 | Candidate | Current assessment | Required proof before removal |
 | --- | --- | --- |
 | `services/chan-service/chan_service/legacy_engine.py` | Module A legacy candidate. | `CHAN_ENGINE_MODE=module_b` is enforced in local, Docker, and tests; no fallback route uses this as accepted output. |
-| `services/chan-service/chan_service/adapter_template.py` | Integration template candidate. | Docs no longer reference it as user-facing guidance. |
 | `services/collector/collector/backfill.py` | Older backfill candidate. | Current workers use `history_backfill`, `parquet_bootstrap_import`, `pytdx_5f_spool`, or `tdx_csv_import`. |
 | `work/vendor/chanlun.py-main/**` | Old module A/C POC vendor candidate. | Confirm no dynamic imports and no docs require it. |
 | `work/vendor/czsc-v0.9.69/**` | Module C POC vendor candidate. | Confirm no dynamic imports and no docs require it. |
+
+Backend and shared files removed after evidence:
+
+| Removed item | Evidence | Verification |
+| --- | --- | --- |
+| `services/chan-service/chan_service/adapter_template.py` | `rg -n "adapter_template" services docs` returned only the audit document and the file itself. | `pytest services/chan-service/tests -q`. |
+| `apps/web/src/api/realtime.ts:createRealtimeSocket` | `rg -n "createRealtimeSocket" apps/web/src` returned only the exported function; chart data uses `createChartSocket`. | `npm run build`; `npm run test:contract`. |
 
 ## Generated Or Local-Only Cleanup Candidates
 
