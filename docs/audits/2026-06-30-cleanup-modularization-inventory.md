@@ -213,9 +213,9 @@ Registry targets:
 | Layer | Registry |
 | --- | --- |
 | Frontend | `src/features/featureRegistry.ts` for sidebar/bottom-dock panels and feature lifecycle. |
-| API routes | `services/api/app/routes/registry.py` to centralize router registration. |
-| Workers | `services/collector/collector/worker_registry.py` for runnable worker entries. |
-| Chan engine | `services/chan-service/chan_service/engine_registry.py` with module B as default. |
+| API routes | `services/api/app/routes/registry.py` centralizes router registration. Status: complete. |
+| Workers | `services/collector/collector/worker_registry.py` and `collector.worker` provide a compatible unified worker entry. Status: complete; Docker commands have not been switched yet. |
+| Chan engine | `services/chan-service/chan_service/engine_registry.py` selects module B as the default Chan engine. Status: complete. |
 
 ## Ponytail Use Decision
 
