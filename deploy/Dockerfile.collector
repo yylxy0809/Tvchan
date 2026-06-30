@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/services/collector:/app/libs/protocol/python:/app/services/api
+
+WORKDIR /app
+
+COPY services/collector/requirements.txt /tmp/collector-requirements.txt
+COPY services/api/requirements.txt /tmp/api-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/collector-requirements.txt -r /tmp/api-requirements.txt
+
+COPY libs/protocol/python /app/libs/protocol/python
+COPY services/api /app/services/api
+COPY services/chan-service/chan_service/vendor_chan_adapter.py /app/services/chan-service/chan_service/vendor_chan_adapter.py
+COPY services/collector /app/services/collector
+
+WORKDIR /app/services/collector
+
+CMD ["python", "-m", "collector.market_fill"]

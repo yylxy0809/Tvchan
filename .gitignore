@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Env and local state
+.env
+.env.*
+!.env.example
+deploy/*.env
+deploy/*.env.*
+!deploy/*.env.example
+*.db
+*.sqlite
+*.log
+.vs/
+
+# Licensed TradingView assets
+apps/web/public/charting_library/
+
+# Local outputs except curated deliverables
+logs/
+work/
+outputs/
+tmp/
+tmp-*
+
+# External reference/oracle kept until golden fixtures replace it
+旧版方案/

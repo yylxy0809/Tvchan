@@ -1,0 +1,246 @@
+import {
+  AlarmClock,
+  Bell,
+  Bookmark,
+  CalendarDays,
+  CircleEllipsis,
+  CircleHelp,
+  Flame,
+  Grid3X3,
+  LogOut,
+  MessageSquareText,
+  Mountain,
+  Newspaper,
+  Rss,
+  Shield,
+} from "lucide-react";
+import { type ReactNode, useState } from "react";
+import { AlertsPanel } from "./AlertsPanel";
+import { StockNewsPanel } from "./StockNewsPanel";
+import { StrongestTodayPanel } from "./StrongestTodayPanel";
+import { WatchlistPanel } from "./WatchlistPanel";
+
+type RightSidebarPanel =
+  | "watchlist"
+  | "alerts"
+  | "layers"
+  | "messages"
+  | "ideas"
+  | "calendar"
+  | "news"
+  | "notifications"
+  | "apps"
+  | "help";
+
+type ToolItem = {
+  id: RightSidebarPanel;
+  title: string;
+  icon: ReactNode;
+  dock?: "top" | "bottom";
+};
+
+type Props = {
+  activeSymbol: string;
+  timeframe: string;
+  onSelectSymbol(symbol: string): void;
+  isAdmin?: boolean;
+  onOpenAdmin?(): void;
+  onLogout?(): void;
+};
+
+const TOOLS: ToolItem[] = [
+  { id: "watchlist", title: "关注列表", icon: <Bookmark size={23} strokeWidth={1.7} /> },
+  { id: "alerts", title: "预警", icon: <AlarmClock size={24} strokeWidth={1.7} /> },
+  { id: "layers", title: "今日最强", icon: <Flame size={23} strokeWidth={1.7} /> },
+  { id: "messages", title: "消息", icon: <MessageSquareText size={22} strokeWidth={1.7} /> },
+  { id: "ideas", title: "个股新闻", icon: <Newspaper size={23} strokeWidth={1.7} /> },
+  { id: "calendar", title: "日历", icon: <CalendarDays size={22} strokeWidth={1.7} />, dock: "bottom" },
+  { id: "news", title: "资讯", icon: <Rss size={22} strokeWidth={1.7} />, dock: "bottom" },
+  { id: "notifications", title: "通知", icon: <Bell size={22} strokeWidth={1.7} />, dock: "bottom" },
+  { id: "apps", title: "更多", icon: <Grid3X3 size={24} strokeWidth={1.7} />, dock: "bottom" },
+  { id: "help", title: "帮助", icon: <CircleHelp size={23} strokeWidth={1.7} />, dock: "bottom" },
+];
+
+export function RightSidebar({
+  activeSymbol,
+  timeframe,
+  onSelectSymbol,
+  isAdmin = false,
+  onOpenAdmin,
+  onLogout,
+}: Props) {
+  const [activePanel, setActivePanel] = useState<RightSidebarPanel | null>(
+    "watchlist",
+  );
+  const topTools = TOOLS.filter((tool) => tool.dock !== "bottom");
+  const bottomTools = TOOLS.filter((tool) => tool.dock === "bottom");
+
+  function togglePanel(panel: RightSidebarPanel) {
+    setActivePanel((current) => (current === panel ? null : panel));
+  }
+
+  return (
+    <aside className="tv-right-sidebar" aria-label="TradingView 右侧栏">
+      {activePanel ? (
+        <div className="tv-side-panel" data-panel={activePanel}>
+          {renderPanel(
+            activePanel,
+            activeSymbol,
+            timeframe,
+            onSelectSymbol,
+            isAdmin,
+            onOpenAdmin,
+            onLogout,
+          )}
+        </div>
+      ) : null}
+
+      <nav className="tv-right-rail" aria-label="图表侧边工具">
+        <div className="tv-right-rail-group">
+          {topTools.map((tool) => (
+            <RailButton
+              key={tool.id}
+              tool={tool}
+              active={activePanel === tool.id}
+              onClick={() => togglePanel(tool.id)}
+            />
+          ))}
+        </div>
+        <div className="tv-right-rail-group tv-right-rail-bottom">
+          {bottomTools.map((tool) => (
+            <RailButton
+              key={tool.id}
+              tool={tool}
+              active={activePanel === tool.id}
+              onClick={() => togglePanel(tool.id)}
+            />
+          ))}
+        </div>
+      </nav>
+    </aside>
+  );
+}
+
+function RailButton({
+  tool,
+  active,
+  onClick,
+}: {
+  tool: ToolItem;
+  active: boolean;
+  onClick(): void;
+}) {
+  return (
+    <button
+      type="button"
+      title={tool.title}
+      aria-label={tool.title}
+      data-active={active}
+      onClick={onClick}
+    >
+      {tool.icon}
+    </button>
+  );
+}
+
+function renderPanel(
+  panel: RightSidebarPanel,
+  activeSymbol: string,
+  timeframe: string,
+  onSelectSymbol: (symbol: string) => void,
+  isAdmin: boolean,
+  onOpenAdmin: (() => void) | undefined,
+  onLogout: (() => void) | undefined,
+) {
+  if (panel === "watchlist") {
+    return (
+      <WatchlistPanel
+        activeSymbol={activeSymbol}
+        timeframe={timeframe}
+        onSelectSymbol={onSelectSymbol}
+      />
+    );
+  }
+  if (panel === "alerts") {
+    return <AlertsPanel activeSymbol={activeSymbol} />;
+  }
+  if (panel === "layers") {
+    return <StrongestTodayPanel />;
+  }
+  if (panel === "ideas") {
+    return <StockNewsPanel activeSymbol={activeSymbol} />;
+  }
+  if (panel === "apps") {
+    return (
+      <MorePanel
+        activeSymbol={activeSymbol}
+        isAdmin={isAdmin}
+        onOpenAdmin={onOpenAdmin}
+        onLogout={onLogout}
+      />
+    );
+  }
+  return <UtilityPanel panel={panel} activeSymbol={activeSymbol} />;
+}
+
+function MorePanel({
+  activeSymbol,
+  isAdmin,
+  onOpenAdmin,
+  onLogout,
+}: {
+  activeSymbol: string;
+  isAdmin: boolean;
+  onOpenAdmin?: () => void;
+  onLogout?: () => void;
+}) {
+  return (
+    <section className="tv-utility-panel" aria-label="更多">
+      <header>
+        <strong>更多</strong>
+        <CircleEllipsis size={20} />
+      </header>
+      <div className="tv-more-panel">
+        <div>
+          <span className="tv-more-kicker">当前会话</span>
+          <strong>{isAdmin ? "管理员" : "用户"}</strong>
+          <small>{activeSymbol}</small>
+        </div>
+        {isAdmin && onOpenAdmin ? (
+          <button type="button" onClick={onOpenAdmin}>
+            <Shield size={18} />
+            <span>后台管理</span>
+          </button>
+        ) : null}
+        {onLogout ? (
+          <button type="button" onClick={onLogout}>
+            <LogOut size={18} />
+            <span>退出登录</span>
+          </button>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function UtilityPanel({
+  panel,
+  activeSymbol,
+}: {
+  panel: RightSidebarPanel;
+  activeSymbol: string;
+}) {
+  const label = TOOLS.find((tool) => tool.id === panel)?.title ?? "面板";
+  return (
+    <section className="tv-utility-panel" aria-label={label}>
+      <header>
+        <strong>{label}</strong>
+        <CircleEllipsis size={20} />
+      </header>
+      <div className="tv-utility-empty">
+        <Mountain size={42} strokeWidth={1.4} />
+        <span>{activeSymbol}</span>
+      </div>
+    </section>
+  );
+}

@@ -1,0 +1,338 @@
+from __future__ import annotations
+
+import asyncio
+import json
+
+from fastapi.testclient import TestClient
+
+from app.main import create_app
+from app.models import ChanOverlayResponse
+from app.routes import chart_ws
+from app.routes import realtime
+
+
+def test_realtime_rejects_bad_token() -> None:
+    client = TestClient(create_app())
+    try:
+        with client.websocket_connect("/ws/v1/realtime?token=bad-token"):
+            raise AssertionError("websocket should not connect")
+    except Exception:
+        pass
+
+
+def test_chart_ws_rejects_bad_token() -> None:
+    client = TestClient(create_app())
+    try:
+        with client.websocket_connect("/ws/v2/chart?token=bad-token"):
+            raise AssertionError("websocket should not connect")
+    except Exception:
+        pass
+
+
+def test_chart_ws_request_response_protocol() -> None:
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v2/chart?token=dev-local-token") as ws:
+        ws.send_json({"type": "ping", "request_id": "ping_1"})
+        assert ws.receive_json()["type"] == "pong"
+
+        ws.send_json(
+            {
+                "type": "get_bars",
+                "request_id": "bars_1",
+                "symbol": "000001.SZ",
+                "timeframe": "5f",
+                "limit": 20,
+            }
+        )
+        bars_message = ws.receive_json()
+        assert bars_message["type"] == "bars"
+        assert bars_message["request_id"] == "bars_1"
+        assert bars_message["symbol"] == "000001.SZ"
+        assert bars_message["timeframe"] == "5f"
+        assert len(bars_message["bars"]) > 0
+
+        ws.send_json(
+            {
+                "type": "get_chan",
+                "request_id": "chan_1",
+                "symbol": "000001.SZ",
+                "timeframe": "5f",
+                "limit": 20,
+                "levels": ["5f", "30f", "1d"],
+                "modes": ["confirmed", "predictive"],
+            }
+        )
+        chan_message = ws.receive_json()
+        assert chan_message["type"] == "chan_full"
+        assert chan_message["request_id"] == "chan_1"
+        assert chan_message["chan"]["levels"] == ["5f", "30f", "1d"]
+
+        ws.send_json(
+            {
+                "type": "get_chart_window",
+                "request_id": "window_1",
+                "symbol": "000001.SZ",
+                "timeframe": "5f",
+                "limit": 20,
+            }
+        )
+        window_message = ws.receive_json()
+        assert window_message["type"] == "chart_window"
+        assert window_message["request_id"] == "window_1"
+        window = window_message["window"]
+        assert window["schema_version"] == "chart-window.v1"
+        assert window["snapshot_id"]
+        assert len(window["bars"]) > 0
+        assert window["chan"]["levels"] == ["5f", "30f", "1d"]
+
+        ws.send_json(
+            {
+                "type": "get_chart_bundle",
+                "request_id": "bundle_1",
+                "symbol": "000001.SZ",
+                "timeframe": "5f",
+                "limit": 20,
+            }
+        )
+        bundle_message = ws.receive_json()
+        assert bundle_message["type"] == "chart_bundle"
+        assert bundle_message["request_id"] == "bundle_1"
+        bundle = bundle_message["bundle"]
+        assert bundle["schema_version"] == "chart-bundle.v2"
+        assert bundle["snapshot_id"]
+        assert len(bundle["bars"]) > 0
+        assert bundle["chan"]["levels"] == ["5f", "30f", "1d"]
+
+
+def test_chart_ws_subscribe_chan_emits_snapshot_and_delta(monkeypatch) -> None:
+    monkeypatch.setattr(chart_ws, "CHAN_SNAPSHOT_INTERVAL_SECONDS", 0.01)
+    emitted = {"count": 0}
+
+    async def fake_build_chan_overlay(**kwargs):
+        emitted["count"] += 1
+        snapshot_version = "snapshot-1" if emitted["count"] == 1 else "snapshot-2"
+        return ChanOverlayResponse(
+            symbol="000001.SZ",
+            chart_timeframe="5f",
+            levels=["5f", "30f", "1d"],
+            modes=["confirmed", "predictive"],
+            snapshot_version=snapshot_version,
+            base_timeframe="5f",
+            base_ts_semantics="bar_end",
+            engine="chan-service:chan.py",
+            requested_bar_count=20,
+            bars_by_level={"5f": 20, "30f": 20, "1d": 20},
+            strokes=[],
+            segments=[],
+            centers=[],
+            signals=[],
+        )
+
+    monkeypatch.setattr(chart_ws, "build_chan_overlay", fake_build_chan_overlay)
+
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v2/chart?token=dev-local-token") as ws:
+        ws.send_json(
+            {
+                "type": "subscribe_chan",
+                "id": "chan_sub_1",
+                "symbol": "000001.SZ",
+                "timeframe": "5f",
+                "limit": 20,
+                "levels": ["5f", "30f", "1d"],
+                "modes": ["confirmed", "predictive"],
+            }
+        )
+        subscribed = ws.receive_json()
+        assert subscribed == {
+            "type": "chan_subscribed",
+            "id": "chan_sub_1",
+            "symbol": "000001.SZ",
+            "timeframe": "5f",
+        }
+
+        first = ws.receive_json()
+        assert first["type"] == "chan_snapshot"
+        assert first["id"] == "chan_sub_1"
+        assert first["snapshot_version"] == "snapshot-1"
+        assert first["chan"]["snapshot_version"] == "snapshot-1"
+
+        second = ws.receive_json()
+        assert second["type"] == "chan_delta"
+        assert second["id"] == "chan_sub_1"
+        assert second["snapshot_version"] == "snapshot-2"
+        assert second["chan"]["snapshot_version"] == "snapshot-2"
+
+        ws.send_json({"type": "unsubscribe_chan", "id": "chan_sub_1"})
+        assert ws.receive_json() == {"type": "chan_unsubscribed", "id": "chan_sub_1"}
+
+
+def test_realtime_ping_and_subscribe() -> None:
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v1/realtime?token=dev-local-token") as ws:
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+        ws.send_json(
+            {
+                "type": "subscribe",
+                "id": "sub_1",
+                "symbol": "000001.SZ",
+                "timeframes": ["5f"],
+            }
+        )
+        assert ws.receive_json() == {"type": "subscribed", "id": "sub_1"}
+
+
+def test_realtime_sends_bar_update(monkeypatch) -> None:
+    monkeypatch.setattr(realtime, "UPDATE_INTERVAL_SECONDS", 0.01)
+
+    async def no_redis(_redis_url):
+        return None
+
+    monkeypatch.setattr(realtime, "_try_create_redis_client", no_redis)
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v1/realtime?token=dev-local-token") as ws:
+        ws.send_json(
+            {
+                "type": "subscribe",
+                "id": "sub_1",
+                "symbol": "000001.SZ",
+                "timeframes": ["5f"],
+            }
+        )
+        assert ws.receive_json() == {"type": "subscribed", "id": "sub_1"}
+        message = ws.receive_json()
+        assert message["type"] == "bar_update"
+        assert message["seq"] == 1
+        assert message["symbol"] == "000001.SZ"
+        assert message["timeframe"] == "5f"
+        assert message["snapshot_version"].startswith("rt:000001.SZ:5f:")
+        assert "bar" in message
+
+
+def test_realtime_parses_redis_bar_update() -> None:
+    payload = realtime._parse_redis_message(
+        '{"symbol":"000001.sz","timeframe":"5","bar":{"time":1}}'
+    )
+    assert payload == {
+        "symbol": "000001.SZ",
+        "timeframe": "5f",
+        "bar": {"time": 1},
+    }
+
+
+def test_realtime_matches_subscriptions() -> None:
+    subscriptions = {
+        "sub_1": {
+            "id": "sub_1",
+            "symbol": "000001.SZ",
+            "timeframes": ["5f", "1d"],
+        }
+    }
+    assert realtime._matches_subscriptions(
+        {"symbol": "000001.SZ", "timeframe": "5f", "bar": {}},
+        subscriptions,
+    )
+    assert not realtime._matches_subscriptions(
+        {"symbol": "000002.SZ", "timeframe": "5f", "bar": {}},
+        subscriptions,
+    )
+
+
+def test_realtime_sends_redis_pubsub_update() -> None:
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def send_json(self, payload):
+            self.messages.append(payload)
+
+    class FakePubSub:
+        def __init__(self) -> None:
+            self.closed = False
+            self.unsubscribed = False
+
+        async def subscribe(self, _channel):
+            return None
+
+        def listen(self):
+            async def iterator():
+                yield {
+                    "type": "message",
+                    "data": json.dumps(
+                        {
+                            "symbol": "000001.SZ",
+                            "timeframe": "5f",
+                            "bar": {"time": 1, "close": 10.5},
+                        }
+                    ),
+                }
+
+            return iterator()
+
+        async def unsubscribe(self, _channel):
+            self.unsubscribed = True
+
+        async def aclose(self):
+            self.closed = True
+
+    class FakeRedisClient:
+        def __init__(self, pubsub):
+            self.pubsub_instance = pubsub
+            self.closed = False
+
+        def pubsub(self):
+            return self.pubsub_instance
+
+        async def aclose(self):
+            self.closed = True
+
+    async def scenario():
+        websocket = FakeWebSocket()
+        pubsub = FakePubSub()
+        client = FakeRedisClient(pubsub)
+        subscriptions = {
+            "sub_1": {
+                "id": "sub_1",
+                "symbol": "000001.SZ",
+                "timeframes": ["5f"],
+            }
+        }
+
+        await realtime._send_redis_updates(websocket, subscriptions, client)
+
+        assert websocket.messages == [
+            {
+                "type": "bar_update",
+                "seq": 1,
+                "symbol": "000001.SZ",
+                "timeframe": "5f",
+                "snapshot_version": "rt:000001.SZ:5f:000000000001:000000:0",
+                "bar": {"time": 1, "close": 10.5},
+                "source": "redis",
+            }
+        ]
+        assert pubsub.unsubscribed
+        assert pubsub.closed
+        assert client.closed
+
+    asyncio.run(scenario())
+
+
+def test_bar_snapshot_version_is_monotonic_for_same_symbol_and_timeframe() -> None:
+    first = realtime._bar_snapshot_version(
+        "000001.SZ",
+        "5f",
+        {"time": 1, "revision": 1, "complete": False},
+    )
+    second = realtime._bar_snapshot_version(
+        "000001.SZ",
+        "5f",
+        {"time": 1, "revision": 2, "complete": False},
+    )
+    third = realtime._bar_snapshot_version(
+        "000001.SZ",
+        "5f",
+        {"time": 2, "revision": 0, "complete": True},
+    )
+    assert first < second < third

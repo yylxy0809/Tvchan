@@ -1,0 +1,286 @@
+name: tv-a-share-backend
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: tv_backend_timescaledb
+    command: ["postgres", "-c", "max_locks_per_transaction=256"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tradingview_local}
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader}
+    ports:
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ${POSTGRES_DATA_HOST_PATH:-tv_backend_pgdata}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-tradingview_local}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: tv_backend_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_BIND:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - tv_backend_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  db-migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.db-migrate
+    container_name: tv_backend_db_migrate
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-trader}
+    command:
+      - sh
+      - -ec
+      - |
+        for i in $$(seq 1 30); do
+          if psql -h timescaledb -U "${POSTGRES_USER:-trader}" -d "${POSTGRES_DB:-tradingview_local}" -c "select 1" >/dev/null 2>&1; then
+            break
+          fi
+          if [ "$$i" = "30" ]; then
+            echo "Database did not become ready for migrations" >&2
+            exit 1
+          fi
+          echo "Waiting for database before migrations ($$i/30)"
+          sleep 2
+        done
+        for file in /migrations/*.sql; do
+          echo "Applying $$file"
+          psql -h timescaledb -U "${POSTGRES_USER:-trader}" -d "${POSTGRES_DB:-tradingview_local}" -v ON_ERROR_STOP=1 -f "$$file"
+        done
+    restart: "no"
+
+  chan-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.chan-service
+    container_name: tv_backend_chan_service
+    environment:
+      CHAN_ENGINE_MODE: ${CHAN_ENGINE_MODE:-module_b}
+      CHAN_PY_PATH: /opt/vendor/chan.py-main
+      CHAN_PY_RECURSION_LIMIT: ${CHAN_PY_RECURSION_LIMIT:-200000}
+    volumes:
+      - ${CHAN_PY_HOST_PATH:-../work/vendor/chan.py-main}:/opt/vendor/chan.py-main:ro
+    ports:
+      - "${CHAN_SERVICE_BIND:-127.0.0.1}:${CHAN_SERVICE_PORT:-8002}:8002"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=5).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    container_name: tv_backend_api
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      chan-service:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      API_TOKEN: ${API_TOKEN:-dev-local-token}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      CORS_ORIGIN_REGEX: ${CORS_ORIGIN_REGEX:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      USE_SEED_DATA: "false"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@timescaledb:5432/${POSTGRES_DB:-tradingview_local}
+      REDIS_URL: redis://redis:6379/0
+      CHAN_SERVICE_URL: http://chan-service:8002
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.siliconflow.cn/v1}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-ai/DeepSeek-V3.2}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-20}
+    ports:
+      - "${API_BIND:-0.0.0.0}:${API_PORT:-8001}:8001"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/v1/health', timeout=5).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  web-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web-gateway
+    container_name: tv_backend_web_gateway
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_GATEWAY_BIND:-0.0.0.0}:${WEB_GATEWAY_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /usr/share/nginx/html/index.html && wget -qO- http://127.0.0.1/healthz >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: tv_backend_cloudflared
+    profiles: ["tunnel"]
+    depends_on:
+      web-gateway:
+        condition: service_healthy
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARED_TOKEN:-}"]
+    restart: unless-stopped
+
+  market-fill-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.collector
+    container_name: tv_backend_market_fill_worker
+    profiles: ["workers", "market-fill"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      chan-service:
+        condition: service_healthy
+    environment: &collector_env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@timescaledb:5432/${POSTGRES_DB:-tradingview_local}
+      REDIS_URL: redis://redis:6379/0
+      CHAN_SERVICE_URL: http://chan-service:8002
+      TDX_HOST: ${TDX_HOST:-}
+      TDX_PORT: ${TDX_PORT:-7709}
+      TDX_TIMEOUT: ${TDX_TIMEOUT:-10}
+      TDX_RETRIES: ${TDX_RETRIES:-3}
+      CHAN_ANALYZE_TIMEOUT: ${CHAN_ANALYZE_TIMEOUT:-180}
+      MARKET_FILL_PROVIDER: ${MARKET_FILL_PROVIDER:-pytdx}
+      MARKET_FILL_SYMBOL_LIMIT: ${MARKET_FILL_SYMBOL_LIMIT:-10}
+      MARKET_FILL_TIMEFRAMES: ${MARKET_FILL_TIMEFRAMES:-5f,15f,30f,1h,1d,1w,1m}
+      MARKET_FILL_BAR_LIMIT: ${MARKET_FILL_BAR_LIMIT:-300}
+      MARKET_FILL_SLEEP: ${MARKET_FILL_SLEEP:-0.25}
+      MARKET_FILL_LOOP: ${MARKET_FILL_LOOP:-1}
+      MARKET_FILL_LOOP_INTERVAL: ${MARKET_FILL_LOOP_INTERVAL:-60}
+      MARKET_FILL_CHAN_LEVELS: ${MARKET_FILL_CHAN_LEVELS:-5f,30f,1d}
+      MARKET_FILL_MODES: ${MARKET_FILL_MODES:-confirmed,predictive}
+    command: ["python", "-m", "collector.market_fill"]
+    restart: unless-stopped
+
+  history-backfill-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.collector
+    container_name: tv_backend_history_backfill_worker
+    profiles: ["history"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      chan-service:
+        condition: service_healthy
+    environment:
+      <<: *collector_env
+      HISTORY_BACKFILL_PROVIDER: ${HISTORY_BACKFILL_PROVIDER:-pytdx}
+      HISTORY_BACKFILL_SYMBOL_LIMIT: ${HISTORY_BACKFILL_SYMBOL_LIMIT:-1}
+      HISTORY_BACKFILL_TIMEFRAMES: ${HISTORY_BACKFILL_TIMEFRAMES:-5f}
+      HISTORY_BACKFILL_PAGE_SIZE: ${HISTORY_BACKFILL_PAGE_SIZE:-800}
+      HISTORY_BACKFILL_TASK_LIMIT: ${HISTORY_BACKFILL_TASK_LIMIT:-3}
+      HISTORY_BACKFILL_CONCURRENCY: ${HISTORY_BACKFILL_CONCURRENCY:-1}
+      HISTORY_BACKFILL_MAX_PAGES_PER_TASK: ${HISTORY_BACKFILL_MAX_PAGES_PER_TASK:-1}
+      HISTORY_BACKFILL_LOOP: ${HISTORY_BACKFILL_LOOP:-1}
+      HISTORY_BACKFILL_LOOP_INTERVAL: ${HISTORY_BACKFILL_LOOP_INTERVAL:-30}
+      HISTORY_BACKFILL_RESET_RUNNING: ${HISTORY_BACKFILL_RESET_RUNNING:-1}
+    command: ["python", "-m", "collector.history_backfill"]
+    restart: unless-stopped
+
+  chan-recompute-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.collector
+    container_name: tv_backend_chan_recompute_worker
+    profiles: ["chan-recompute"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+      chan-service:
+        condition: service_healthy
+    environment:
+      <<: *collector_env
+      CHAN_RECOMPUTE_SYMBOL_LIMIT: ${CHAN_RECOMPUTE_SYMBOL_LIMIT:-10}
+      CHAN_RECOMPUTE_BASE_TIMEFRAME: ${CHAN_RECOMPUTE_BASE_TIMEFRAME:-5f}
+      CHAN_RECOMPUTE_LEVELS: ${CHAN_RECOMPUTE_LEVELS:-5f,30f,1d}
+      CHAN_RECOMPUTE_MODES: ${CHAN_RECOMPUTE_MODES:-confirmed,predictive}
+      CHAN_RECOMPUTE_TASK_LIMIT: ${CHAN_RECOMPUTE_TASK_LIMIT:-3}
+      CHAN_RECOMPUTE_CONCURRENCY: ${CHAN_RECOMPUTE_CONCURRENCY:-1}
+      CHAN_RECOMPUTE_LOOP: ${CHAN_RECOMPUTE_LOOP:-1}
+      CHAN_RECOMPUTE_LOOP_INTERVAL: ${CHAN_RECOMPUTE_LOOP_INTERVAL:-60}
+      CHAN_RECOMPUTE_RESET_RUNNING: ${CHAN_RECOMPUTE_RESET_RUNNING:-1}
+      CHAN_PY_PATH: /opt/vendor/chan.py-main
+    volumes:
+      - ${CHAN_PY_HOST_PATH:-../work/vendor/chan.py-main}:/opt/vendor/chan.py-main:ro
+    command: ["python", "-m", "collector.chan_recompute"]
+    restart: unless-stopped
+
+  tdx-csv-import-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.collector
+    container_name: tv_backend_tdx_csv_import_worker
+    profiles: ["tdx-csv-import"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *collector_env
+      TDX_CSV_ROOT: /data/tdx-csv
+      TDX_CSV_TIMEFRAMES: ${TDX_CSV_TIMEFRAMES:-5f}
+      TDX_CSV_SYMBOL_LIMIT: ${TDX_CSV_SYMBOL_LIMIT:-0}
+      TDX_CSV_CATEGORIES: ${TDX_CSV_CATEGORIES:-1}
+      TDX_CSV_ASSET_TYPES: ${TDX_CSV_ASSET_TYPES:-stock}
+      TDX_CSV_FQ: ${TDX_CSV_FQ:-0}
+      TDX_CSV_TASK_LIMIT: ${TDX_CSV_TASK_LIMIT:-1}
+      TDX_CSV_CONCURRENCY: ${TDX_CSV_CONCURRENCY:-1}
+      TDX_CSV_ENTRY_BATCH_SIZE: ${TDX_CSV_ENTRY_BATCH_SIZE:-50}
+      TDX_CSV_BAR_BATCH_SIZE: ${TDX_CSV_BAR_BATCH_SIZE:-50000}
+      TDX_CSV_RESET_RUNNING: ${TDX_CSV_RESET_RUNNING:-1}
+      TDX_CSV_LOOP: ${TDX_CSV_LOOP:-1}
+      TDX_CSV_LOOP_INTERVAL: ${TDX_CSV_LOOP_INTERVAL:-300}
+    volumes:
+      - ${TDX_CSV_HOST_ROOT:-../work/tdx-csv}:/data/tdx-csv:ro
+    command: ["python", "-m", "collector.tdx_csv_import"]
+    restart: unless-stopped
+
+volumes:
+  tv_backend_pgdata:
+  tv_backend_redis:
