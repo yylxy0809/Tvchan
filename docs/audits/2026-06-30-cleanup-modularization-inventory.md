@@ -74,9 +74,15 @@ Frontend files needing evidence before deletion:
 
 | Candidate | Current assessment | Required proof before removal |
 | --- | --- | --- |
-| `src/components/ChanOverlayControls.tsx` | Legacy left-panel control candidate. | No import/render path after UI cleanup, and chart setting controls still work. |
-| `src/components/StatusPanel.tsx` | Legacy diagnostic panel candidate. | No production import/render path. |
-| `src/api/history.ts` | Historical export candidate, likely not part of current chart UX. | No current UI or runbook path relies on it. |
+| None currently. | The first confirmed orphan set has been removed. | Re-run import/reference scans before adding more candidates. |
+
+Frontend files removed after evidence:
+
+| Removed file | Evidence | Verification |
+| --- | --- | --- |
+| `src/components/ChanOverlayControls.tsx` | `rg -n "ChanOverlayControls" apps/web/src` returned only the file definition. | `npm run build`; `npm run test:contract`. |
+| `src/components/StatusPanel.tsx` | `rg -n "StatusPanel" apps/web/src` returned only the file definition. | `npm run build`; `npm run test:contract`. |
+| `src/api/history.ts` | `rg -n "history" apps/web/src` showed no importer or UI use of this module. | `npm run build`; `npm run test:contract`. |
 
 Frontend canonical bundle gaps:
 
