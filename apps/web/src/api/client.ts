@@ -181,14 +181,12 @@ export async function getBars(
   to?: number,
   signal?: AbortSignal,
 ): Promise<BarsResponse> {
-  const params = new URLSearchParams({
-    symbol,
-    timeframe,
-    limit: String(limit),
-  });
-  if (from !== undefined) params.set("from", new Date(from * 1000).toISOString());
-  if (to !== undefined) params.set("to", new Date(to * 1000).toISOString());
-  return getJson<BarsResponse>(`/api/v1/bars?${params.toString()}`, signal);
+  const bundle = await getChartBundle(symbol, timeframe, limit, from, to, signal);
+  return {
+    symbol: bundle.symbol,
+    timeframe: bundle.chart_timeframe,
+    bars: bundle.bars,
+  };
 }
 
 export async function getChartBundle(

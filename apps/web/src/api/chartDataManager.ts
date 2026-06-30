@@ -84,6 +84,7 @@ type ChanSubscriptionReply = WebSocketReply & {
   symbol?: string;
   timeframe?: string;
   snapshot_version?: string;
+  bundle?: unknown;
   chan?: ChanOverlayResponse;
 };
 
@@ -298,7 +299,7 @@ class ChartWebSocketClient {
     }
     this.socket.send(
       JSON.stringify({
-        type: "unsubscribe_chan",
+        type: "unsubscribe_chart_bundle",
         id: subscriptionId,
       }),
     );
@@ -510,7 +511,7 @@ class ChartDataManager {
     return this.wsClient.subscribe(
       subscriptionId,
       {
-        type: "subscribe_chan",
+        type: "subscribe_chart_bundle",
         ...requestPayload(request),
       },
       (message) => {
@@ -790,6 +791,61 @@ class ChartDataManager {
     request: ChartWindowRequest,
     message: ChanSubscriptionReply,
   ): void {
+    const bundle = message.bundle
+      ? normalizeChartBundleForFrontend(message.bundle)
+      : null;
+    if (bundle) {
+      const symbol = String(message.symbol ?? bundle.symbol ?? request.symbol).toUpperCase();
+      const timeframe = String(
+        message.timeframe ?? bundle.chart_timeframe ?? request.timeframe,
+      );
+      const response: ChartWindowResponse = {
+        ...bundle,
+        symbol,
+        chart_timeframe: timeframe,
+        transport: "websocket",
+      };
+      const changed = this.applyPublishedSnapshotVersion(
+        symbol,
+        timeframe,
+        response.chan.snapshot_version,
+      );
+      const mergedResponse = this.mergeSessionChartWindow(response);
+      this.hydrateBundleCaches(
+        {
+          ...request,
+          symbol,
+          timeframe,
+        },
+        mergedResponse,
+      );
+      if (mergedResponse.bars.length > 0) {
+        const first = mergedResponse.bars[0];
+        const last = mergedResponse.bars[mergedResponse.bars.length - 1];
+        this.publishHistoryWindow({
+          source: "realtime",
+          symbol,
+          timeframe,
+          requestedFrom: request.from,
+          requestedTo: request.to,
+          from: first?.time,
+          to: last?.time,
+          limit: Math.max(request.limit, mergedResponse.bars.length),
+          bars: mergedResponse.bars,
+          first: first?.time,
+          last: last?.time,
+        });
+      }
+      if (changed) {
+        this.notifySnapshotUpdate({
+          source: "realtime",
+          symbol,
+          timeframe,
+          snapshotVersion: response.chan.snapshot_version,
+        });
+      }
+      return;
+    }
     if ((message.type !== "chan_snapshot" && message.type !== "chan_delta") || !message.chan) {
       return;
     }

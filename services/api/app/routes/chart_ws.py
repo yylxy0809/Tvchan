@@ -11,7 +11,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.core.config import get_settings
 from app.core.security import authenticate_token_value
 from app.routes.chan import build_chan_overlay
-from app.routes.chart import build_bars_response, build_chart_bundle, build_chart_window
+from app.routes.chart import build_bars_response, build_chart_bundle_v3, build_chart_window
 
 router = APIRouter(tags=["chart-ws"])
 CHAN_SNAPSHOT_INTERVAL_SECONDS = 3.0
@@ -36,7 +36,7 @@ async def chart_ws(websocket: WebSocket) -> None:
 
     await websocket.accept()
     request_adapter = _RequestAdapter(websocket.scope.get("app"))
-    subscriptions: dict[str, _ChartRequestParams] = {}
+    subscriptions: dict[str, _ChartSubscription] = {}
     producer_task = asyncio.create_task(
         _publish_chan_snapshots(
             websocket=websocket,
@@ -76,7 +76,7 @@ async def _handle_chart_message(
     request_adapter: "_RequestAdapter",
     message: dict[str, Any],
     request_id: str,
-    subscriptions: dict[str, "_ChartRequestParams"],
+    subscriptions: dict[str, "_ChartSubscription"],
 ) -> None:
     msg_type = str(message.get("type") or "")
     settings = get_settings()
@@ -151,12 +151,10 @@ async def _handle_chart_message(
         return
 
     if msg_type == "get_chart_bundle":
-        bundle = await build_chart_bundle(
+        bundle = await build_chart_bundle_v3(
             request=request_adapter,
             symbol=params.symbol,
             timeframe=params.timeframe,
-            levels=params.levels,
-            modes=params.modes,
             from_ts=params.from_ts,
             to_ts=params.to_ts,
             limit=params.limit,
@@ -171,14 +169,19 @@ async def _handle_chart_message(
         )
         return
 
-    if msg_type == "subscribe_chan":
+    if msg_type in {"subscribe_chan", "subscribe_chart_bundle"}:
         subscription_id = str(message.get("id") or request_id or "")
         if not subscription_id:
-            raise ValueError("subscribe_chan requires id or request_id")
-        subscriptions[subscription_id] = params
+            raise ValueError(f"{msg_type} requires id or request_id")
+        subscriptions[subscription_id] = _ChartSubscription(params=params, kind=msg_type)
+        response_type = (
+            "chart_bundle_subscribed"
+            if msg_type == "subscribe_chart_bundle"
+            else "chan_subscribed"
+        )
         await websocket.send_json(
             {
-                "type": "chan_subscribed",
+                "type": response_type,
                 "id": subscription_id,
                 "symbol": params.symbol,
                 "timeframe": params.timeframe,
@@ -186,12 +189,17 @@ async def _handle_chart_message(
         )
         return
 
-    if msg_type == "unsubscribe_chan":
+    if msg_type in {"unsubscribe_chan", "unsubscribe_chart_bundle"}:
         subscription_id = str(message.get("id") or request_id or "")
         if not subscription_id:
-            raise ValueError("unsubscribe_chan requires id or request_id")
+            raise ValueError(f"{msg_type} requires id or request_id")
         subscriptions.pop(subscription_id, None)
-        await websocket.send_json({"type": "chan_unsubscribed", "id": subscription_id})
+        response_type = (
+            "chart_bundle_unsubscribed"
+            if msg_type == "unsubscribe_chart_bundle"
+            else "chan_unsubscribed"
+        )
+        await websocket.send_json({"type": response_type, "id": subscription_id})
         return
 
     raise ValueError(f"Unsupported message type: {msg_type}")
@@ -200,7 +208,7 @@ async def _handle_chart_message(
 async def _publish_chan_snapshots(
     websocket: WebSocket,
     request_adapter: "_RequestAdapter",
-    subscriptions: dict[str, "_ChartRequestParams"],
+    subscriptions: dict[str, "_ChartSubscription"],
     settings,
 ) -> None:
     last_versions: dict[str, str] = {}
@@ -209,8 +217,37 @@ async def _publish_chan_snapshots(
             await asyncio.sleep(CHAN_SNAPSHOT_INTERVAL_SECONDS)
             if not subscriptions:
                 continue
-            for subscription_id, params in list(subscriptions.items()):
+            for subscription_id, subscription in list(subscriptions.items()):
+                params = subscription.params
                 try:
+                    if subscription.kind == "subscribe_chart_bundle":
+                        bundle = await build_chart_bundle_v3(
+                            request=request_adapter,
+                            symbol=params.symbol,
+                            timeframe=params.timeframe,
+                            from_ts=params.from_ts,
+                            to_ts=params.to_ts,
+                            limit=params.limit,
+                            settings=settings,
+                        )
+                        previous = last_versions.get(subscription_id)
+                        current = bundle.snapshot_version or bundle.snapshot_id
+                        event_type = "chart_bundle_snapshot" if previous is None else "chart_bundle_delta"
+                        if previous == current:
+                            continue
+                        last_versions[subscription_id] = current
+                        await websocket.send_json(
+                            {
+                                "type": event_type,
+                                "id": subscription_id,
+                                "symbol": bundle.symbol,
+                                "timeframe": bundle.chart_timeframe,
+                                "snapshot_version": current,
+                                "bundle": _dump_model(bundle),
+                            }
+                        )
+                        continue
+
                     chan = await build_chan_overlay(
                         request=request_adapter,
                         symbol=params.symbol,
@@ -253,6 +290,12 @@ async def _publish_chan_snapshots(
 class _RequestAdapter:
     def __init__(self, app: Any) -> None:
         self.app = app
+
+
+class _ChartSubscription:
+    def __init__(self, params: "_ChartRequestParams", kind: str) -> None:
+        self.params = params
+        self.kind = kind
 
 
 class _ChartRequestParams:
