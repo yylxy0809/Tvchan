@@ -220,7 +220,7 @@ Registry targets:
 | --- | --- |
 | Frontend | `src/features/featureRegistry.ts` centralizes sidebar feature definitions and bottom screener tab metadata. Status: partial; right sidebar is registry-driven, bottom dock uses registry metadata for tab typing and icons. |
 | API routes | `services/api/app/routes/registry.py` centralizes router registration. Status: complete. |
-| Workers | `services/collector/collector/worker_registry.py` and `collector.worker` provide a compatible unified worker entry. Status: complete; Docker commands have not been switched yet. |
+| Workers | `services/collector/collector/worker_registry.py` and `collector.worker` provide a compatible unified worker entry. Status: complete; Docker worker commands and `scripts/start-chan-recompute-worker.ps1` use registry aliases. |
 | Chan engine | `services/chan-service/chan_service/engine_registry.py` selects module B as the default Chan engine. Status: complete. |
 
 ## Ponytail Use Decision
@@ -368,10 +368,10 @@ No missing Docker build context.
 
 Do not delete broader legacy backend paths yet.
 
-Proceed with a runtime-oriented registry adoption pass:
+Proceed with a conservative quarantine review:
 
 ```text
-Switch Docker and runbook worker commands to collector.worker aliases where it reduces duplication.
+Review POC vendors and `legacy_engine.py` against module B regression fixtures.
 ```
 
-After that passes, quarantine POC vendors and `legacy_engine.py` only after module B regression fixtures and the local runtime checklist pass.
+Quarantine only after the local runtime checklist passes and no dynamic import, Docker build context, or runbook dependency remains.

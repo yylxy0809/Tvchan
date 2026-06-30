@@ -189,7 +189,7 @@ services:
       MARKET_FILL_LOOP_INTERVAL: ${MARKET_FILL_LOOP_INTERVAL:-60}
       MARKET_FILL_CHAN_LEVELS: ${MARKET_FILL_CHAN_LEVELS:-5f,30f,1d}
       MARKET_FILL_MODES: ${MARKET_FILL_MODES:-confirmed,predictive}
-    command: ["python", "-m", "collector.market_fill"]
+    command: ["python", "-m", "collector.worker", "market-fill"]
     restart: unless-stopped
 
   history-backfill-worker:
@@ -217,7 +217,7 @@ services:
       HISTORY_BACKFILL_LOOP: ${HISTORY_BACKFILL_LOOP:-1}
       HISTORY_BACKFILL_LOOP_INTERVAL: ${HISTORY_BACKFILL_LOOP_INTERVAL:-30}
       HISTORY_BACKFILL_RESET_RUNNING: ${HISTORY_BACKFILL_RESET_RUNNING:-1}
-    command: ["python", "-m", "collector.history_backfill"]
+    command: ["python", "-m", "collector.worker", "history-backfill"]
     restart: unless-stopped
 
   chan-recompute-worker:
@@ -247,7 +247,7 @@ services:
       CHAN_PY_PATH: /opt/vendor/chan.py-main
     volumes:
       - ${CHAN_PY_HOST_PATH:-../work/vendor/chan.py-main}:/opt/vendor/chan.py-main:ro
-    command: ["python", "-m", "collector.chan_recompute"]
+    command: ["python", "-m", "collector.worker", "chan-recompute"]
     restart: unless-stopped
 
   tdx-csv-import-worker:
@@ -278,7 +278,7 @@ services:
       TDX_CSV_LOOP_INTERVAL: ${TDX_CSV_LOOP_INTERVAL:-300}
     volumes:
       - ${TDX_CSV_HOST_ROOT:-../work/tdx-csv}:/data/tdx-csv:ro
-    command: ["python", "-m", "collector.tdx_csv_import"]
+    command: ["python", "-m", "collector.worker", "tdx-csv-import"]
     restart: unless-stopped
 
 volumes:

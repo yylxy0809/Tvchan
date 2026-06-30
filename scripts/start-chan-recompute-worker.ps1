@@ -36,7 +36,8 @@ if ($ChanPyPath.Trim().Length -eq 0) {
 }
 
 $ArgsList = @(
-    "-m", "collector.chan_recompute",
+    "-m", "collector.worker",
+    "chan-recompute",
     "--symbol-limit", $SymbolLimit,
     "--base-timeframe", $BaseTimeframe,
     "--chan-levels", $ChanLevels,
