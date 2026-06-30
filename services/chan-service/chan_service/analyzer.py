@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from collections import OrderedDict
 from dataclasses import dataclass
-from pathlib import Path
 from threading import Lock, RLock
 
+from chan_service.engine_registry import AnalyzerEngine, resolve_engine
 from chan_service.models import (
     ChanAnalyzeRequest,
     ChanAnalyzeResponse,
@@ -17,12 +16,6 @@ _SNAPSHOT_CACHE_MAX_ITEMS = 32
 _snapshot_registry_lock = RLock()
 _published_snapshots: OrderedDict[tuple[str, str, str, str, str], ChanAnalyzeResponse] = OrderedDict()
 _symbol_locks: dict[str, Lock] = {}
-
-
-@dataclass(frozen=True)
-class AnalyzerEngine:
-    name: str
-    mode: str
 
 
 @dataclass(frozen=True)
@@ -36,7 +29,7 @@ def analyze(request: ChanAnalyzeRequest) -> ChanAnalyzeResponse:
 
 
 def analyze_with_metadata(request: ChanAnalyzeRequest) -> AnalyzerResult:
-    engine = _resolve_engine()
+    engine = resolve_engine()
     cache_key = _analysis_cache_key(request, engine)
     symbol_lock = _symbol_lock(request.symbol)
     with symbol_lock:
@@ -57,14 +50,14 @@ def _compute_analysis_response(
     engine: AnalyzerEngine,
 ) -> ChanAnalyzeResponse:
     if engine.mode == "chan_py":
-        return _analyze_with_chan_py(request)
+        return _analyze_with_chan_py(request, engine)
     if engine.mode == "unsupported":
         raise RuntimeError(f"Unsupported Chan engine mode: {engine.name}")
     raise RuntimeError(f"Unsupported Chan engine mode: {engine.name}")
 
 
 def get_engine_metadata() -> dict[str, str]:
-    engine = _resolve_engine()
+    engine = resolve_engine()
     snapshot_metrics = _snapshot_registry_metrics()
     if engine.mode == "chan_py":
         return {
@@ -83,18 +76,11 @@ def get_engine_metadata() -> dict[str, str]:
     }
 
 
-def _resolve_engine() -> AnalyzerEngine:
-    configured_mode = os.getenv("CHAN_ENGINE_MODE", "").strip().lower()
-    if configured_mode in {"module_b", "chan_py", "chan.py"}:
-        return AnalyzerEngine(name="module-b:chan.py", mode="chan_py")
-    if configured_mode:
-        return AnalyzerEngine(name=configured_mode, mode="unsupported")
-    return AnalyzerEngine(name="module-b:chan.py", mode="chan_py")
-
-
-def _analyze_with_chan_py(request: ChanAnalyzeRequest) -> ChanAnalyzeResponse:
-    module_path = os.getenv("CHAN_PY_PATH", "").strip() or str(_default_chan_py_path())
-    if not module_path:
+def _analyze_with_chan_py(
+    request: ChanAnalyzeRequest,
+    engine: AnalyzerEngine,
+) -> ChanAnalyzeResponse:
+    if not engine.module_path:
         raise RuntimeError("CHAN_PY_PATH is not configured")
 
     from chan_service.vendor_chan_adapter import build_overlay
@@ -102,7 +88,7 @@ def _analyze_with_chan_py(request: ChanAnalyzeRequest) -> ChanAnalyzeResponse:
     payload = build_overlay(
         {
             **request.model_dump(),
-            "chan_py_path": module_path,
+            "chan_py_path": engine.module_path,
         }
     )
     return ChanAnalyzeResponse.model_validate(payload)
@@ -117,10 +103,6 @@ def _fallback_snapshot_version(request: ChanAnalyzeRequest) -> str:
         f"{request.symbol}:5f:{first}:{last}:{len(request.bars)}:"
         f"{_bars_fingerprint(request)[:16]}"
     )
-
-
-def _default_chan_py_path() -> str:
-    return str(Path(__file__).resolve().parents[3] / "work" / "vendor" / "chan.py-main")
 
 
 def _analysis_cache_key(
