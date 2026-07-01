@@ -17,14 +17,16 @@ function Invoke-ProjectPsql {
         return
     }
 
-    $container = "tv_local_timescaledb"
-    $running = docker inspect -f "{{.State.Running}}" $container 2>$null
-    if ($running -eq "true") {
-        docker exec $container psql -U trader -d tradingview_local -c $Sql
-        return
+    $containers = @("tv_backend_timescaledb", "tv_local_timescaledb")
+    foreach ($container in $containers) {
+        $running = docker inspect -f "{{.State.Running}}" $container 2>$null
+        if ($running -eq "true") {
+            docker exec $container psql -U trader -d tradingview_local -c $Sql
+            return
+        }
     }
 
-    throw "psql is not installed and Docker container '$container' is not running."
+    throw "psql is not installed and no known TimescaleDB container is running."
 }
 
 $query = @"

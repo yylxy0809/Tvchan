@@ -10,6 +10,7 @@ import {
   type CSSProperties,
   type FormEvent,
   useMemo,
+  useEffect,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -30,9 +31,9 @@ import {
   type WatchlistItem,
 } from "../api/watchlistStore";
 import {
-  SCREENER_DOCK_FEATURES,
   type ScreenerTabId,
 } from "../features/featureRegistry";
+import { useScreenerDockFeatures } from "../features/runtimeFeatureRegistry";
 
 type Props = {
   onSelectSymbol(symbol: string): void;
@@ -64,6 +65,7 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
   const [chanUnsupported, setChanUnsupported] = useState<string[]>([]);
   const [chanMessage, setChanMessage] = useState<string | null>(null);
   const [chanParser, setChanParser] = useState<string>("rules");
+  const screenerFeatures = useScreenerDockFeatures();
 
   const selectedRows = useMemo(
     () => rows.filter((row) => selected.includes(row.symbol)),
@@ -74,6 +76,18 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
     [chanRows, chanSelected],
   );
   const bodyStyleRef = useRef<{ cursor: string; userSelect: string } | null>(null);
+
+  useEffect(() => {
+    if (screenerFeatures.some((feature) => feature.id === tab)) {
+      return;
+    }
+    const nextTab = screenerFeatures[0]?.id;
+    if (nextTab) {
+      setTab(nextTab);
+    } else {
+      setOpen(false);
+    }
+  }, [screenerFeatures, tab]);
 
   function updatePanelHeightFromClientY(clientY: number) {
     const maxHeight = Math.max(
@@ -547,39 +561,27 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
       ) : null}
 
       <nav className="screener-tabs" aria-label="底部选股工具栏">
-        <button
-          type="button"
-          data-active={tab === "wencai"}
-          onClick={() => {
-            setTab("wencai");
-            setOpen(true);
-          }}
-          onDoubleClick={() => setOpen(false)}
-        >
-          <ScreenerTabIcon id="wencai" />
-          <span>问财选股</span>
-        </button>
-        <button
-          type="button"
-          data-active={tab === "chan"}
-          onClick={() => {
-            setTab("chan");
-            setOpen(true);
-          }}
-          onDoubleClick={() => setOpen(false)}
-        >
-          <ScreenerTabIcon id="chan" />
-          <span>缠论选股</span>
-        </button>
+        {screenerFeatures.map((feature) => {
+          const Icon = feature.icon;
+          return (
+            <button
+              key={feature.id}
+              type="button"
+              data-active={tab === feature.id}
+              onClick={() => {
+                setTab(feature.id);
+                setOpen(true);
+              }}
+              onDoubleClick={() => setOpen(false)}
+            >
+              <Icon size={16} />
+              <span>{feature.title}</span>
+            </button>
+          );
+        })}
       </nav>
     </section>
   );
-}
-
-function ScreenerTabIcon({ id }: { id: ScreenerTab }) {
-  const feature = SCREENER_DOCK_FEATURES.find((item) => item.id === id);
-  const Icon = feature?.icon ?? Search;
-  return <Icon size={16} />;
 }
 
 function toWatchlistItems(

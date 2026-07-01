@@ -1,11 +1,11 @@
 import { CircleEllipsis, LogOut, Mountain, Shield } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   getRightSidebarFeature,
-  RIGHT_SIDEBAR_FEATURES,
   type RightSidebarFeature,
   type RightSidebarPanelId,
 } from "../features/featureRegistry";
+import { useRightSidebarFeatures } from "../features/runtimeFeatureRegistry";
 import { AlertsPanel } from "./AlertsPanel";
 import { StockNewsPanel } from "./StockNewsPanel";
 import { StrongestTodayPanel } from "./StrongestTodayPanel";
@@ -15,6 +15,7 @@ type Props = {
   activeSymbol: string;
   timeframe: string;
   onSelectSymbol(symbol: string): void;
+  authToken?: string;
   isAdmin?: boolean;
   onOpenAdmin?(): void;
   onLogout?(): void;
@@ -24,6 +25,7 @@ export function RightSidebar({
   activeSymbol,
   timeframe,
   onSelectSymbol,
+  authToken,
   isAdmin = false,
   onOpenAdmin,
   onLogout,
@@ -31,8 +33,18 @@ export function RightSidebar({
   const [activePanel, setActivePanel] = useState<RightSidebarPanelId | null>(
     "watchlist",
   );
-  const topTools = RIGHT_SIDEBAR_FEATURES.filter((tool) => tool.dock !== "bottom");
-  const bottomTools = RIGHT_SIDEBAR_FEATURES.filter((tool) => tool.dock === "bottom");
+  const sidebarFeatures = useRightSidebarFeatures();
+  const topTools = sidebarFeatures.filter((tool) => tool.dock !== "bottom");
+  const bottomTools = sidebarFeatures.filter((tool) => tool.dock === "bottom");
+
+  useEffect(() => {
+    if (!activePanel) {
+      return;
+    }
+    if (!sidebarFeatures.some((tool) => tool.id === activePanel)) {
+      setActivePanel(null);
+    }
+  }, [activePanel, sidebarFeatures]);
 
   function togglePanel(panel: RightSidebarPanelId) {
     setActivePanel((current) => (current === panel ? null : panel));
@@ -47,6 +59,7 @@ export function RightSidebar({
             activeSymbol,
             timeframe,
             onSelectSymbol,
+            authToken,
             isAdmin,
             onOpenAdmin,
             onLogout,
@@ -108,6 +121,7 @@ function renderPanel(
   activeSymbol: string,
   timeframe: string,
   onSelectSymbol: (symbol: string) => void,
+  authToken: string | undefined,
   isAdmin: boolean,
   onOpenAdmin: (() => void) | undefined,
   onLogout: (() => void) | undefined,
@@ -118,6 +132,7 @@ function renderPanel(
         activeSymbol={activeSymbol}
         timeframe={timeframe}
         onSelectSymbol={onSelectSymbol}
+        authToken={authToken}
       />
     );
   }

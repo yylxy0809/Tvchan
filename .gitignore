@@ -24,6 +24,15 @@ deploy/*.env.*
 *.sqlite
 *.log
 .vs/
+.vscode/
+
+# Archives and local transfer packages
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
 
 # Licensed TradingView assets
 apps/web/public/charting_library/

@@ -62,11 +62,11 @@ Current active frontend modules:
 | Area | Files |
 | --- | --- |
 | Runtime config | `src/config.ts`, `src/vite-env.d.ts` |
-| Auth and tokens | `src/auth/api.ts`, `src/api/client.ts` |
+| Auth and tokens | `src/auth/api.ts`, `src/app/sessionPersistence.ts`, `src/api/client.ts` |
 | Chart data | `src/api/chartDataManager.ts`, `src/api/marketContracts.ts`, `src/api/marketData.ts`, `src/api/realtime.ts` |
 | Watchlist and panels | `src/api/watchlistStore.ts`, `src/components/RightSidebar.tsx`, `src/components/WatchlistPanel.tsx`, `src/components/AlertsPanel.tsx`, `src/components/StockNewsPanel.tsx`, `src/components/StrongestTodayPanel.tsx` |
 | Screeners | `src/api/wencaiScreener.ts`, `src/api/chanScreener.ts`, `src/components/ScreenerDock.tsx` |
-| TradingView integration | `src/tradingview/widget.ts`, `src/tradingview/datafeed.ts`, `src/tradingview/chanStudy.ts`, `src/tradingview/chanStudySettings.ts`, `src/tradingview/chanStyles.ts`, `src/tradingview/overlaySettings.ts`, `src/tradingview/time.ts`, `src/tradingview/debug.ts` |
+| TradingView integration | `src/components/ChartWorkspace.tsx`, `src/app/chartPreferences.ts`, `src/tradingview/widget.ts`, `src/tradingview/datafeed.ts`, `src/tradingview/chanStudy.ts`, `src/tradingview/chanStudySettings.ts`, `src/tradingview/chanStyles.ts`, `src/tradingview/overlaySettings.ts`, `src/tradingview/time.ts`, `src/tradingview/debug.ts` |
 | Styling | `src/styles.css` |
 | Tests | `src/tradingview/chanStudy.contract.test.ts` |
 
@@ -144,7 +144,7 @@ Backend files needing evidence before deletion:
 
 | Candidate | Current assessment | Required proof before removal |
 | --- | --- | --- |
-| `services/collector/collector/backfill.py` | Older backfill candidate. | Current workers use `history_backfill`, `parquet_bootstrap_import`, `pytdx_5f_spool`, or `tdx_csv_import`. |
+| `services/collector/collector/backfill.py` | Keep for now. It is still the `backfill` compatibility alias and pytdx probe hint target. | Remove only after a replacement pytdx probe entrypoint exists and old runbooks/tests are updated. |
 
 Backend and shared files removed after evidence:
 
@@ -173,10 +173,10 @@ These are ignored or should remain untracked. They can be deleted locally after 
 
 | Issue | Risk | Fix |
 | --- | --- | --- |
-| `scripts/apply-db-migrations.ps1` only applies `001` through `007`, while schema files now include `008` through `011`. | Local DB can be missing auth/canonical/runtime/screener tables. | Update script to enumerate sorted `db/sql/*.sql` or explicitly include all migrations. |
+| `scripts/apply-db-migrations.ps1` enumerates sorted `db/sql/*.sql` and auto-detects `tv_backend_timescaledb` / `tv_local_timescaledb`. | Local DB can be missing auth/canonical/runtime/screener tables if migrations are skipped. | Fixed; keep this script as the local migration entrypoint. |
 | `/ws/v2/chart` still supports legacy `get_bars`, `get_chan`, `subscribe_chan`. | External or old test clients may still depend on compatibility message types. | Keep compatibility for now; frontend source is already bundle-only. |
 | Frontend chart manager legacy message names have been removed. | `rg -n "/api/v1/bars|/api/v1/chan/overlay|/api/v1/chart/window|subscribe_chan|get_bars|get_chan|createRealtimeSocket" apps/web/src` returns no matches. | Maintain this scan as a regression check before NAS packaging. |
-| POC vendors and legacy engine still exist. | Confusion during future maintenance. | Quarantine after module B regression fixtures pass. |
+| POC vendors and legacy engine were removed. | Confusion during future maintenance is reduced; static scan currently shows no active imports. | Keep `work/vendor/chan.py-main` protected as the only active Chan vendor. |
 
 ## Modularization Target
 
@@ -217,7 +217,7 @@ Registry targets:
 
 | Layer | Registry |
 | --- | --- |
-| Frontend | `src/features/featureRegistry.ts` centralizes sidebar feature definitions and bottom screener tab metadata. Status: partial; right sidebar is registry-driven, bottom dock uses registry metadata for tab typing and icons. |
+| Frontend | `src/features/featureRegistry.ts` centralizes sidebar feature definitions and bottom screener tab metadata. Status: partial; right sidebar is registry-driven, bottom dock renders tab id, title, and icon from the registry. |
 | API routes | `services/api/app/routes/registry.py` centralizes router registration. Status: complete. |
 | Workers | `services/collector/collector/worker_registry.py` and `collector.worker` provide a compatible unified worker entry. Status: complete; Docker worker commands and `scripts/start-chan-recompute-worker.ps1` use registry aliases. |
 | Chan engine | `services/chan-service/chan_service/engine_registry.py` selects module B as the default Chan engine. Status: complete. |
@@ -370,7 +370,59 @@ Do not delete broader legacy backend paths yet.
 Proceed with the next compatibility review:
 
 ```text
-Review `services/collector/collector/backfill.py` and legacy API routes.
+Review legacy API routes and decide whether `collector.backfill` should be replaced by a smaller pytdx probe command.
 ```
 
 Remove only after the local runtime checklist passes and no dynamic import, Docker build context, runbook dependency, or external client compatibility requirement remains.
+
+## 2026-07-01 Runtime Modularity Progress
+
+Implemented low-risk runtime configuration and user preference foundations without changing the chart rendering contract.
+
+Completed:
+
+- Added runtime feature configuration storage and API:
+  - `db/sql/012_runtime_config.sql`
+  - `GET /api/v1/config/features`
+  - `PUT /api/v1/admin/runtime-config/{key}`
+- Wired frontend right-sidebar and bottom screener dock feature lists through runtime config with default fallback.
+- Added user settings storage and API:
+  - `db/sql/013_user_settings.sql`
+  - `GET /api/v1/user/settings`
+  - `PUT /api/v1/user/settings/{bucket}`
+  - buckets: `theme`, `watchlist`, `layout`, `indicatorSettings`
+- Split `LoginPage` and `AdminConsole` out of `App.tsx`.
+- Wired frontend chart theme and watchlist groups to server-side user settings with local fallback.
+- Wired TradingView layout and Chan indicator settings to server-side user settings with local fallback.
+- Split `ChartWorkspace` out of `App.tsx`.
+- Split session persistence and chart preference helpers into `src/app/sessionPersistence.ts` and `src/app/chartPreferences.ts`.
+- Added admin runtime feature switch UI for right-sidebar and screener dock features.
+- Added frontend runtime feature config change events so admin feature switches refresh active sidebar and screener modules without a page reload.
+- Updated `scripts/apply-db-migrations.ps1` with `-Only` support so single migrations can be applied while long-running workers are active.
+
+Verified:
+
+```powershell
+python -m pytest services/api/tests -q
+# 63 passed
+
+cd apps/web
+npm run build
+npm run test:contract
+# build passed; 6 contract tests passed
+
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/apply-db-migrations.ps1 -Only 013_user_settings.sql
+# migration applied
+```
+
+Runtime notes:
+
+- Local Docker API was rebuilt and restarted after adding user settings routes.
+- `tv_backend_timescaledb`, `tv_backend_api`, `tv_backend_chan_service`, `tv_backend_web_gateway`, and `tv_backend_redis` were healthy.
+- 10 local `chan-recompute` workers were running after reboot recovery.
+- After the 2026-07-01 power recovery, 10 local `chan-recompute` workers were restarted. Last checked waterline: `success=4056`, `pending=1706`, `running=10`, `failed=5`.
+
+Next safe steps:
+
+1. Continue extracting chart data orchestration out of `ChartWorkspace` only if a separate regression check is added for pan/zoom and Chan overlay persistence.
+2. Add a focused browser smoke test for persisted layout, theme, watchlist, runtime feature switches, and Chan indicator settings before NAS packaging.

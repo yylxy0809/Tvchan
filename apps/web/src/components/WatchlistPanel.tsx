@@ -18,6 +18,7 @@ import {
   useState,
 } from "react";
 import type { ApiSymbol } from "../api/client";
+import { listUserSettings, saveUserSetting } from "../api/userSettings";
 import {
   type ChanStrokeState,
   type MarketQuote,
@@ -45,6 +46,7 @@ type Props = {
   activeSymbol: string;
   timeframe: string;
   onSelectSymbol(symbol: string): void;
+  authToken?: string;
 };
 
 const SPLIT_STORAGE_KEY = "tv-a-share-watchlist-list-height";
@@ -55,6 +57,7 @@ export function WatchlistPanel({
   activeSymbol,
   timeframe,
   onSelectSymbol,
+  authToken,
 }: Props) {
   const [groups, setGroups] = useLocalStorageState<WatchlistGroup[]>(
     WATCHLIST_STORAGE_KEY,
@@ -81,6 +84,8 @@ export function WatchlistPanel({
   );
   const [resizing, setResizing] = useState(false);
   const contentRef = useRef<HTMLDivElement | null>(null);
+  const remoteWatchlistReadyRef = useRef(false);
+  const suppressNextWatchlistSyncRef = useRef(false);
 
   const activeGroup = useMemo(
     () => groups.find((group) => group.id === activeGroupId) ?? groups[0],
@@ -107,6 +112,55 @@ export function WatchlistPanel({
       watchlistItems[0]
     );
   }, [activeGroup?.items, activeSymbol, watchlistItems]);
+
+  useEffect(() => {
+    if (!authToken) {
+      remoteWatchlistReadyRef.current = false;
+      return;
+    }
+    let cancelled = false;
+    remoteWatchlistReadyRef.current = false;
+    void listUserSettings(authToken)
+      .then((settings) => {
+        if (cancelled) {
+          return;
+        }
+        const remote = settings.find((item) => item.bucket === "watchlist")?.value;
+        const remoteGroups = readRemoteWatchlistGroups(remote);
+        remoteWatchlistReadyRef.current = true;
+        if (remoteGroups) {
+          suppressNextWatchlistSyncRef.current = true;
+          setGroups(remoteGroups);
+          setActiveGroupId(remoteGroups[0]?.id ?? FAVORITES_GROUP_ID);
+          setExpandedGroupIds(remoteGroups.map((group) => group.id));
+        } else {
+          void saveUserSetting(authToken, "watchlist", { groups }).catch(() => {
+            // Local watchlist remains authoritative when server sync fails.
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          remoteWatchlistReadyRef.current = true;
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken, setGroups]);
+
+  useEffect(() => {
+    if (!authToken || !remoteWatchlistReadyRef.current) {
+      return;
+    }
+    if (suppressNextWatchlistSyncRef.current) {
+      suppressNextWatchlistSyncRef.current = false;
+      return;
+    }
+    void saveUserSetting(authToken, "watchlist", { groups }).catch(() => {
+      // Local watchlist remains usable if server-side settings fail.
+    });
+  }, [authToken, groups]);
 
   useEffect(() => {
     const handleExternalUpdate = (event: Event) => {
@@ -802,6 +856,17 @@ function createProfileItemFromSymbol(symbol: string): WatchlistItem {
     name: code,
     exchange: suffix ? suffix.toUpperCase() : inferExchangeFromCode(code),
   };
+}
+
+function readRemoteWatchlistGroups(value: unknown): WatchlistGroup[] | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const groups = (value as { groups?: unknown }).groups;
+  if (!Array.isArray(groups)) {
+    return null;
+  }
+  return reviveWatchlistGroups(groups);
 }
 
 function buildLocalSearchResults(

@@ -110,6 +110,10 @@ const studyIds = new WeakMap<TradingViewWidget, ShapeId>();
 const studyDatasetKeys = new WeakMap<TradingViewWidget, string>();
 const studySettingsSyncTimers = new WeakMap<TradingViewWidget, number>();
 const studyInputSignatures = new WeakMap<TradingViewWidget, string>();
+const studySettingsChangeHandlers = new WeakMap<
+  TradingViewWidget,
+  (settings: ChanOverlaySettings) => void
+>();
 const themeButtons = new WeakMap<TradingViewWidget, HTMLElement>();
 
 export async function createTradingViewWidget(
@@ -586,6 +590,7 @@ function startChanStudySettingsSync(
       const currentSettings = studyInputValuesToOverlaySettings(inputValues, fallback);
       study.applyOverrides?.(buildChanStudyOverrides(currentSettings));
       studyInputSignatures.set(widget, signature);
+      studySettingsChangeHandlers.get(widget)?.(currentSettings);
     } catch {
       stopChanStudySettingsSync(widget);
     }
@@ -683,6 +688,18 @@ export async function openChanStudySettings(widget: TradingViewWidget): Promise<
     return;
   }
   chart.showPropertiesDialog(studyId);
+}
+
+export function subscribeChanStudySettingsChanges(
+  widget: TradingViewWidget,
+  onSettingsChange: (settings: ChanOverlaySettings) => void,
+): () => void {
+  studySettingsChangeHandlers.set(widget, onSettingsChange);
+  return () => {
+    if (studySettingsChangeHandlers.get(widget) === onSettingsChange) {
+      studySettingsChangeHandlers.delete(widget);
+    }
+  };
 }
 
 export async function readChanStudySettings(

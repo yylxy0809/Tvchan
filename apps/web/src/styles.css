@@ -854,6 +854,64 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
   background: rgba(9, 13, 17, 0.74);
 }
 
+.admin-feature-panel {
+  margin-top: 18px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(9, 13, 17, 0.74);
+  padding: 16px;
+}
+
+.admin-feature-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.admin-feature-head h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.admin-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.admin-feature-card {
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.admin-feature-card h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.admin-feature-switch {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.admin-feature-switch span {
+  color: var(--text);
+}
+
+.admin-feature-switch code {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .token-row {
   display: grid;
   grid-template-columns: minmax(180px, 1.2fr) 110px 120px 190px 96px;

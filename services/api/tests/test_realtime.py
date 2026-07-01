@@ -6,7 +6,16 @@ import json
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models import ChanOverlayResponse
+from app.models import (
+    BarResponse,
+    ChanOverlayResponse,
+    ChartBundleChanLevelResponse,
+    ChartBundleChanResponse,
+    ChartBundleSourceWatermarksResponse,
+    ChartBundleV3Response,
+    ChartWindowRangeResponse,
+    ChartWindowResponse,
+)
 from app.routes import chart_ws
 from app.routes import realtime
 
@@ -29,7 +38,90 @@ def test_chart_ws_rejects_bad_token() -> None:
         pass
 
 
-def test_chart_ws_request_response_protocol() -> None:
+def test_chart_ws_request_response_protocol(monkeypatch) -> None:
+    overlay = ChanOverlayResponse(
+        symbol="000001.SZ",
+        chart_timeframe="5f",
+        levels=["5f", "30f", "1d"],
+        modes=["confirmed", "predictive"],
+        snapshot_version="snapshot-test",
+        base_timeframe="5f",
+        base_ts_semantics="bar_end",
+        engine="chan-service:chan.py",
+        requested_bar_count=20,
+        bars_by_level={"5f": 20, "30f": 20, "1d": 20},
+        strokes=[],
+        segments=[],
+        centers=[],
+        signals=[],
+    )
+    bars = [
+        BarResponse(
+            time=1_780_000_000,
+            open=10,
+            high=11,
+            low=9,
+            close=10.5,
+            volume=100,
+            amount=1000,
+            complete=True,
+            revision=0,
+        )
+    ]
+
+    async def fake_build_chan_overlay(**kwargs):
+        return overlay
+
+    async def fake_build_chart_window(**kwargs):
+        return ChartWindowResponse(
+            schema_version="chart-window.v1",
+            snapshot_id="window-test",
+            symbol="000001.SZ",
+            chart_timeframe="5f",
+            range=ChartWindowRangeResponse(from_time=None, to_time=None, limit=20),
+            bars=bars,
+            chan=overlay,
+        )
+
+    async def fake_build_chart_bundle_v3(**kwargs):
+        levels = {
+            level: ChartBundleChanLevelResponse(
+                bar_count=20,
+                strokes=[],
+                segments=[],
+                centers=[],
+                signals=[],
+                channels=[],
+            )
+            for level in ["5f", "30f", "1d"]
+        }
+        return ChartBundleV3Response(
+            schema_version="chart-bundle.v3",
+            snapshot_id="bundle-test",
+            snapshot_version="snapshot-test",
+            symbol="000001.SZ",
+            chart_timeframe="5f",
+            base_timeframe="5f",
+            bar_time_semantics="bar_end",
+            range=ChartWindowRangeResponse(from_time=None, to_time=None, limit=20),
+            analysis_levels=["5f", "30f", "1d"],
+            bars=bars,
+            chan=ChartBundleChanResponse(engine="chan-service:chan.py", levels=levels),
+            source_watermarks=ChartBundleSourceWatermarksResponse(
+                canonical_5f_last_complete_end=1_780_000_000,
+                canonical_5f_last_seen_end=1_780_000_000,
+                view_last_complete_end=1_780_000_000,
+                analysis_generated_at=1_780_000_000,
+                analysis_source="test",
+                aggregation_source="canonical-5f",
+            ),
+            warnings=[],
+        )
+
+    monkeypatch.setattr(chart_ws, "build_chan_overlay", fake_build_chan_overlay)
+    monkeypatch.setattr(chart_ws, "build_chart_window", fake_build_chart_window)
+    monkeypatch.setattr(chart_ws, "build_chart_bundle_v3", fake_build_chart_bundle_v3)
+
     client = TestClient(create_app())
     with client.websocket_connect("/ws/v2/chart?token=dev-local-token") as ws:
         ws.send_json({"type": "ping", "request_id": "ping_1"})
@@ -98,10 +190,10 @@ def test_chart_ws_request_response_protocol() -> None:
         assert bundle_message["type"] == "chart_bundle"
         assert bundle_message["request_id"] == "bundle_1"
         bundle = bundle_message["bundle"]
-        assert bundle["schema_version"] == "chart-bundle.v2"
+        assert bundle["schema_version"] == "chart-bundle.v3"
         assert bundle["snapshot_id"]
         assert len(bundle["bars"]) > 0
-        assert bundle["chan"]["levels"] == ["5f", "30f", "1d"]
+        assert set(bundle["chan"]["levels"]) == {"5f", "30f", "1d"}
 
 
 def test_chart_ws_subscribe_chan_emits_snapshot_and_delta(monkeypatch) -> None:

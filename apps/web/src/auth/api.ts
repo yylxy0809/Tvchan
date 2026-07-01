@@ -1,4 +1,4 @@
-import { apiUrl, API_TOKEN_STORAGE_KEY } from "../config";
+import { apiUrl, API_TOKEN_STORAGE_KEY, isFrontendAdminToken } from "../config";
 
 export type UserRole = "user" | "admin";
 
@@ -33,7 +33,6 @@ type AdminTokenListResponse = {
   items?: AdminToken[];
 };
 
-const FRONTEND_ADMIN_TOKEN = "Oppo0809*";
 const LOCAL_TOKEN_STORAGE_KEY = "tv-a-share-local-issued-tokens";
 const ROLE_STORAGE_KEY = "tv-a-share-user-role";
 
@@ -43,7 +42,7 @@ export async function loginWithToken(token: string): Promise<AuthSession> {
     throw new Error("Please enter an access token.");
   }
 
-  if (normalized === FRONTEND_ADMIN_TOKEN) {
+  if (isFrontendAdminToken(normalized)) {
     return {
       token: normalized,
       role: "admin",
@@ -204,7 +203,7 @@ async function loginViaHealthFallback(token: string): Promise<AuthSession> {
   }
   return {
     token,
-    role: token === FRONTEND_ADMIN_TOKEN ? "admin" : "user",
+    role: isFrontendAdminToken(token) ? "admin" : "user",
     displayName: "Legacy API token",
     label: "legacy",
   };

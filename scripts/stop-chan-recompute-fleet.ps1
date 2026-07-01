@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $matches = Get-CimInstance Win32_Process |
     Where-Object {
         $_.CommandLine -like "*collector.chan_recompute*" -or
+        ($_.CommandLine -like "*collector.worker*" -and $_.CommandLine -like "*chan-recompute*") -or
         $_.CommandLine -like "*start-chan-recompute-worker.ps1*"
     }
 

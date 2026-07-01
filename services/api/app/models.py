@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -238,6 +239,32 @@ class AdminTokenCreateResponse(AdminTokenResponse):
 
 class AdminTokenListResponse(BaseModel):
     items: list[AdminTokenResponse]
+
+
+class RuntimeConfigResponse(BaseModel):
+    key: str
+    value: Any
+    version: int
+    updated_at: datetime | None = None
+
+
+class RuntimeConfigUpdateRequest(BaseModel):
+    value: Any
+
+
+class UserSettingResponse(BaseModel):
+    bucket: str
+    value: Any
+    version: int
+    updated_at: datetime | None = None
+
+
+class UserSettingsResponse(BaseModel):
+    items: list[UserSettingResponse]
+
+
+class UserSettingUpdateRequest(BaseModel):
+    value: Any
 
 
 class ChanScreenerConditionResponse(BaseModel):

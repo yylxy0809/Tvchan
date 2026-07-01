@@ -31,6 +31,11 @@ class FakePool:
     async def fetch(self, query, *args):
         return await self.conn.fetch(query, *args)
 
+    async def fetchval(self, query, *args):
+        if "from symbols" in query:
+            return 1
+        return None
+
 
 class FakeConn:
     def __init__(self) -> None:
@@ -68,9 +73,8 @@ def test_get_bars_db_excludes_seed_when_real_source_exists_for_stored_timeframe(
         )
         assert rows[0]["close"] == 10.05
         query = conn.queries[0]
-        assert "k.source <> 1" in query
-        assert "k_real.source in (2, 3, 4)" in query
-        assert conn.args[0][0:3] == ("000001", "SZ", TIMEFRAME_TO_DB["1w"])
+        assert "source = any($3::smallint[])" in query
+        assert conn.args[0][0:3] == (1, TIMEFRAME_TO_DB["1w"], [2, 3, 4])
 
     asyncio.run(scenario())
 
@@ -80,7 +84,7 @@ def test_get_bars_db_derives_1d_from_canonical_5f() -> None:
         async def fetch(self, query, *args):
             self.queries.append(query)
             self.args.append(args)
-            assert args[2] == TIMEFRAME_TO_DB["5f"]
+            assert args[1] == TIMEFRAME_TO_DB["5f"]
             return [
                 _db_bar("2026-04-27 09:35", open=10.0, high=10.2, low=9.9, close=10.1),
                 _db_bar("2026-04-27 11:30", open=10.1, high=10.5, low=10.0, close=10.4),
@@ -102,7 +106,7 @@ def test_get_bars_db_derives_1d_from_canonical_5f() -> None:
         assert _format_time(rows[0]["time"]) == "2026-04-27 15:00"
         assert rows[0]["open"] == 10.0
         assert rows[0]["close"] == 10.7
-        assert conn.args[0][0:3] == ("000001", "SZ", TIMEFRAME_TO_DB["5f"])
+        assert conn.args[0][0:3] == (1, TIMEFRAME_TO_DB["5f"], [2, 3, 4])
 
     asyncio.run(scenario())
 
@@ -112,7 +116,7 @@ def test_get_bars_db_derives_supported_higher_timeframes_from_canonical_5f() -> 
         async def fetch(self, query, *args):
             self.queries.append(query)
             self.args.append(args)
-            assert args[2] == TIMEFRAME_TO_DB["5f"]
+            assert args[1] == TIMEFRAME_TO_DB["5f"]
             return _base_5f_rows()
 
     async def scenario(timeframe: str):
@@ -126,7 +130,7 @@ def test_get_bars_db_derives_supported_higher_timeframes_from_canonical_5f() -> 
             limit=1,
         )
         assert rows
-        assert conn.args[0][0:3] == ("000001", "SZ", TIMEFRAME_TO_DB["5f"])
+        assert conn.args[0][0:3] == (1, TIMEFRAME_TO_DB["5f"], [2, 3, 4])
 
     for timeframe in ("15f", "30f", "1h", "1d"):
         asyncio.run(scenario(timeframe))
@@ -137,7 +141,7 @@ def test_get_bars_db_keeps_0930_in_first_derived_slot() -> None:
         async def fetch(self, query, *args):
             self.queries.append(query)
             self.args.append(args)
-            assert args[2] == TIMEFRAME_TO_DB["5f"]
+            assert args[1] == TIMEFRAME_TO_DB["5f"]
             return [
                 _db_bar("2026-04-27 09:30", open=9.9, high=10.0, low=9.8, close=9.95),
                 _db_bar("2026-04-27 09:35", open=10.0, high=10.2, low=9.9, close=10.1),

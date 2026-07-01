@@ -7,7 +7,9 @@ param(
     [string]$ChanLevels = "5f,30f,1d",
     [string]$Modes = "confirmed,predictive",
     [string]$ChanPyPath = "",
-    [string]$DatabaseUrl = "postgresql://trader:change-me-before-long-running@127.0.0.1:5432/tradingview_local"
+    [string]$DatabaseUrl = "postgresql://trader:change-me-before-long-running@127.0.0.1:5432/tradingview_local",
+    [switch]$ResetRunning,
+    [switch]$SkipSetup
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +26,31 @@ if ($ChanPyPath.Trim().Length -eq 0) {
     $ChanPyPath = Join-Path $Root "work/vendor/chan.py-main"
 }
 
+if (-not $SkipSetup) {
+    $setupArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $PSScriptRoot "start-chan-recompute-worker.ps1"),
+        "-SymbolLimit", $SymbolLimit,
+        "-TaskLimit", 0,
+        "-Concurrency", 1,
+        "-BaseTimeframe", $BaseTimeframe,
+        "-ChanLevels", $ChanLevels,
+        "-Modes", $Modes,
+        "-ChanPyPath", $ChanPyPath,
+        "-DatabaseUrl", $DatabaseUrl
+    )
+    if ($ResetRunning) {
+        $setupArgs += "-ResetRunning"
+    }
+
+    Write-Host "Preparing chan recompute tasks..."
+    & powershell @setupArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Chan recompute task preparation failed with exit code $LASTEXITCODE"
+    }
+}
+
 $started = @()
 for ($i = 1; $i -le $WorkerCount; $i++) {
     $outLog = Join-Path $LogDir ("worker-{0}.out.log" -f $i)
@@ -36,6 +63,7 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
         "-TaskLimit", $TaskLimit,
         "-Concurrency", 1,
         "-Loop",
+        "-SkipEnsure",
         "-LoopInterval", $LoopInterval,
         "-BaseTimeframe", $BaseTimeframe,
         "-ChanLevels", $ChanLevels,

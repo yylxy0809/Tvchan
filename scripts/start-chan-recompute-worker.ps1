@@ -10,6 +10,7 @@ param(
     [double]$ChanTimeout = 120,
     [switch]$Loop,
     [double]$LoopInterval = 30,
+    [switch]$SkipEnsure,
     [switch]$Reset,
     [switch]$ResetRunning,
     [switch]$DryRun,
@@ -56,6 +57,9 @@ if ($Symbols.Trim().Length -gt 0) {
 }
 if ($Loop) {
     $ArgsList += @("--loop", "--loop-interval", $LoopInterval)
+}
+if ($SkipEnsure) {
+    $ArgsList += "--skip-ensure"
 }
 if ($Reset) {
     $ArgsList += "--reset"
