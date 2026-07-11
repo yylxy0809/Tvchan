@@ -6,7 +6,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from collector import local_parquet_import as import_module
-from collector.local_parquet_import import discover_tasks, parse_task, run_once
+from collector.local_parquet_import import (
+    deterministic_import_run_id,
+    discover_tasks,
+    parse_task,
+    run_once,
+    static_shard,
+)
 
 
 def _write_intraday(path: Path, symbol: str, *, bad_ohlc: bool = False) -> None:
@@ -125,3 +131,52 @@ def test_explicit_import_run_id_is_reused_across_cli_retries(tmp_path: Path, mon
     assert second["import_run_id"] == fixed_run_id
     assert {str(value) for value in FakeWriter.created_run_ids} == {fixed_run_id}
     assert {str(value) for value in FakeWriter.batch_run_ids} == {fixed_run_id}
+
+
+def test_static_symbol_shards_are_stable_disjoint_and_exhaustive() -> None:
+    symbols = ["600000.SH", "000002.SZ", "000001.SZ", "430001.BJ", "000001.SZ"]
+    shards = [static_shard(symbols, shard_index=index, shard_count=3) for index in range(3)]
+    assert shards == [["000001.SZ", "600000.SH"], ["000002.SZ"], ["430001.BJ"]]
+    assert set().union(*map(set, shards)) == {"000001.SZ", "000002.SZ", "430001.BJ", "600000.SH"}
+    assert not (set(shards[0]) & set(shards[1]) or set(shards[1]) & set(shards[2]))
+    assert deterministic_import_run_id(root="F:/data", timeframes=["5f", "1d"], scope="active_only", shard_index=0, shard_count=3) == \
+        deterministic_import_run_id(root="F:/data", timeframes=["5f", "1d"], scope="active_only", shard_index=0, shard_count=3)
+    assert deterministic_import_run_id(root="F:/data", timeframes=["5f", "1d"], scope="active_only", shard_index=0, shard_count=3) != \
+        deterministic_import_run_id(root="F:/data", timeframes=["5f", "1d"], scope="active_only", shard_index=1, shard_count=3)
+
+
+def test_run_excludes_bj_30f_and_records_static_shard(tmp_path: Path) -> None:
+    _write_intraday(tmp_path / "stock_30min" / "000001.SZ.parquet", "000001.SZ")
+    _write_intraday(tmp_path / "stock_30min" / "430001.BJ.parquet", "430001.BJ")
+    import asyncio
+    result = asyncio.run(run_once(type("Args", (), {
+        "timeframes": "30f", "symbols": "430001.BJ,000001.SZ", "active_only": False,
+        "dry_run": True, "root": tmp_path, "shard_index": 0, "shard_count": 1,
+    })()))
+    assert result["symbols"] == ["000001.SZ", "430001.BJ"]
+    assert result["sources"] == ["stock_30min/000001.SZ.parquet"]
+    assert result["excluded_bj_30f_tasks"] == 1
+
+
+def test_active_only_uses_symbol_master_then_static_shards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_intraday(tmp_path / "stock_5min" / "000002.SZ.parquet", "000002.SZ")
+
+    class FakeWriter:
+        async def open(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def fetch_active_symbols(self):
+            return {"000001.SZ", "000002.SZ", "600000.SH"}
+
+    monkeypatch.setattr(import_module, "NativeParquetWriter", lambda *_args, **_kwargs: FakeWriter())
+    import asyncio
+    result = asyncio.run(run_once(type("Args", (), {
+        "timeframes": "5f", "symbols": None, "active_only": True, "dry_run": True,
+        "root": tmp_path, "database_url": "postgresql://unused", "shard_index": 1, "shard_count": 2,
+    })()))
+    assert result["selection_scope"] == "active_only"
+    assert result["symbols"] == ["000002.SZ"]
+    assert result["sources"] == ["stock_5min/000002.SZ.parquet"]
