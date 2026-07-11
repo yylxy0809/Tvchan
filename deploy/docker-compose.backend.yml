@@ -2,7 +2,7 @@ name: tv-a-share-backend
 
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg16
+    image: timescale/timescaledb:2.28.2-pg16
     container_name: tv_backend_timescaledb
     command: ["postgres", "-c", "max_locks_per_transaction=256"]
     environment:
@@ -223,6 +223,37 @@ services:
       - ${CHAN_PY_HOST_PATH:-../work/vendor/chan.py-main}:/opt/vendor/chan.py-main:ro
     command: ["python", "-m", "collector.worker", "chan-c-stream"]
     restart: unless-stopped
+
+  chan-module-c-recompute-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.collector
+    profiles: ["batch-chan-module-c-recompute"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *collector_env
+      # Explicit one-shot profile; activate only after the audit gate passes
+      # and the realtime Chan stream worker has been stopped.
+      CHAN_MODULE_C_SYMBOL_LIMIT: ${CHAN_MODULE_C_SYMBOL_LIMIT:-0}
+      CHAN_MODULE_C_LEVELS: ${CHAN_MODULE_C_LEVELS:-5f,30f,1d,1w,1m}
+      CHAN_MODULE_C_MODES: ${CHAN_MODULE_C_MODES:-confirmed,predictive}
+      CHAN_MODULE_C_CONCURRENCY: ${CHAN_MODULE_C_CONCURRENCY:-1}
+      CHAN_MODULE_C_SHARD_INDEX: ${CHAN_MODULE_C_SHARD_INDEX:-0}
+      CHAN_MODULE_C_SHARD_COUNT: ${CHAN_MODULE_C_SHARD_COUNT:-1}
+      CHAN_MODULE_C_SLEEP: ${CHAN_MODULE_C_SLEEP:-0.1}
+      CHAN_MODULE_C_DB_POOL_MIN_SIZE: ${CHAN_MODULE_C_DB_POOL_MIN_SIZE:-1}
+      CHAN_MODULE_C_DB_POOL_MAX_SIZE: ${CHAN_MODULE_C_DB_POOL_MAX_SIZE:-1}
+      CHAN_MODULE_C_SKIP_COMPLETED: ${CHAN_MODULE_C_SKIP_COMPLETED:-1}
+      CHAN_MODULE_C_PREPARE_NATIVE_BARS: "0"
+      CHAN_PY_PATH: /opt/vendor/chan.py-main
+    volumes:
+      - ${CHAN_PY_HOST_PATH:-../work/vendor/chan.py-main}:/opt/vendor/chan.py-main:ro
+    command: ["python", "-m", "collector.worker", "chan-module-c-recompute"]
+    restart: "no"
 
   tdx-csv-import-worker:
     build:

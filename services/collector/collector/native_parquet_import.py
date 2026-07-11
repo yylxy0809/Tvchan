@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from collector.storage.postgres import (
@@ -19,6 +20,12 @@ from collector.storage.postgres import (
     source_priority_case,
     source_to_code,
     timeframe_to_db_code,
+)
+from collector.kline_import_quarantine import (
+    ImportCheckpoint,
+    QuarantineRecord,
+    commit_import_batch,
+    create_import_run,
 )
 from trading_protocol import canonical_kline_timestamp
 
@@ -43,12 +50,16 @@ class ImportTask:
     timeframe: str
     zip_path: Path
     member_path: str
+    source_ref: str
+    source_checksum: str
 
 
 @dataclass
 class ParsedBatch:
     symbols: dict[tuple[str, str], tuple]
     bars: list[tuple]
+    quarantines: list[QuarantineRecord]
+    last_source_row: int | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +86,11 @@ def parse_args() -> argparse.Namespace:
         help="Import delisted/inactive symbols from stock_basic.parquet. Disabled by default.",
     )
     parser.add_argument("--dry-run", action="store_true", default=os.getenv("NATIVE_PARQUET_DRY_RUN") == "1")
+    parser.add_argument(
+        "--import-run-id",
+        default=os.getenv("NATIVE_PARQUET_IMPORT_RUN_ID"),
+        help="UUID to resume the same import run after interruption.",
+    )
     parser.add_argument(
         "--database-url",
         default=os.getenv(
@@ -119,6 +135,11 @@ async def run_once(args: argparse.Namespace) -> None:
     )
     await writer.open()
     try:
+        import_run_id = resolve_import_run_id(getattr(args, "import_run_id", None))
+        await writer.create_import_run(
+            import_run_id=import_run_id,
+            parameters={"root": str(root), "timeframes": timeframes, "years": sorted(years)},
+        )
         symbol_meta = load_symbol_meta(root)
         allowed_symbols = set()
         if not args.include_inactive:
@@ -155,6 +176,7 @@ async def run_once(args: argparse.Namespace) -> None:
             write_concurrency=max(1, args.write_concurrency),
             progress_every=max(0, args.progress_every),
             sync_symbols_per_task=not bool(symbol_meta),
+            import_run_id=import_run_id,
         )
         watermarks = await writer.fetch_watermarks(timeframes=timeframes, symbols=symbols_filter)
     finally:
@@ -181,7 +203,17 @@ def discover_tasks(root: Path, *, timeframes: list[str], years: set[str]) -> lis
             with zipfile.ZipFile(zip_path) as archive:
                 for item in sorted(archive.infolist(), key=lambda info: info.filename):
                     if not item.is_dir() and item.filename.lower().endswith(".parquet"):
-                        tasks.append(ImportTask(timeframe=timeframe, zip_path=zip_path, member_path=item.filename))
+                        relative_zip = zip_path.relative_to(root).as_posix()
+                        checksum = f"crc32={item.CRC:08x};size={item.file_size}"
+                        tasks.append(
+                            ImportTask(
+                                timeframe=timeframe,
+                                zip_path=zip_path,
+                                member_path=item.filename,
+                                source_ref=f"{relative_zip}!{item.filename}#{checksum}",
+                                source_checksum=checksum,
+                            )
+                        )
     return tasks
 
 
@@ -196,6 +228,7 @@ async def process_tasks(
     write_concurrency: int,
     progress_every: int,
     sync_symbols_per_task: bool,
+    import_run_id: UUID | None = None,
 ) -> dict[str, int]:
     read_sem = asyncio.Semaphore(concurrency)
     write_sem = asyncio.Semaphore(write_concurrency)
@@ -211,15 +244,21 @@ async def process_tasks(
                 symbols_filter,
                 allowed_symbols,
             )
-        if not parsed.bars:
-            await record_progress(task=task, bars=0, symbols=0, skipped=True)
-            return {"bars": 0, "symbols": 0}
         async with write_sem:
-            written = await writer.upsert(
+            written = await writer.upsert_import_batch(
+                import_run_id=import_run_id,
+                task=task,
                 symbols=parsed.symbols.values() if sync_symbols_per_task else (),
                 bars=parsed.bars,
+                quarantines=parsed.quarantines,
+                last_source_row=parsed.last_source_row,
             )
-        await record_progress(task=task, bars=written, symbols=len(parsed.symbols), skipped=False)
+        await record_progress(
+            task=task,
+            bars=written,
+            symbols=len(parsed.symbols),
+            skipped=not parsed.bars and not parsed.quarantines,
+        )
         return {"bars": written, "symbols": len(parsed.symbols)}
 
     async def record_progress(*, task: ImportTask, bars: int, symbols: int, skipped: bool) -> None:
@@ -283,20 +322,39 @@ def parse_task(
 
     symbols: dict[tuple[str, str], tuple] = {}
     bars: list[tuple] = []
+    quarantines: list[QuarantineRecord] = []
     row_count = len(rows["code"])
     timeframe_code = timeframe_to_db_code(task.timeframe)
     for index in range(row_count):
-        symbol = normalize_symbol(str(rows["code"][index]))
+        raw_payload = {column: rows[column][index] for column in REQUIRED_COLUMNS[task.timeframe]}
+        raw_ts = str(rows[TIMEFRAME_PATHS[task.timeframe][1]][index])
+        try:
+            symbol = normalize_symbol(str(rows["code"][index]))
+        except (TypeError, ValueError) as exc:
+            quarantines.append(
+                quarantine_from_row(task, index, raw_payload, raw_ts, None, f"invalid_symbol:{exc}")
+            )
+            continue
         if symbols_filter and symbol not in symbols_filter:
             continue
         if allowed_symbols and symbol not in allowed_symbols:
             continue
         code, exchange = symbol.split(".", 1)
-        open_value = to_float(rows["open"][index])
-        high_value = to_float(rows["high"][index])
-        low_value = to_float(rows["low"][index])
-        close_value = to_float(rows["close"][index])
-        if min(open_value, high_value, low_value, close_value) <= 0:
+        try:
+            open_value = to_float(rows["open"][index])
+            high_value = to_float(rows["high"][index])
+            low_value = to_float(rows["low"][index])
+            close_value = to_float(rows["close"][index])
+            volume = int(round(to_float(rows["vol"][index], default=0.0)))
+            bar_ts = parse_bar_ts(task.timeframe, rows, index)
+        except (TypeError, ValueError, OverflowError) as exc:
+            quarantines.append(quarantine_from_row(task, index, raw_payload, raw_ts, symbol, f"invalid_value:{exc}"))
+            continue
+        if not valid_ohlc(open_value, high_value, low_value, close_value):
+            quarantines.append(quarantine_from_row(task, index, raw_payload, raw_ts, symbol, "invalid_ohlc"))
+            continue
+        if volume < 0:
+            quarantines.append(quarantine_from_row(task, index, raw_payload, raw_ts, symbol, "negative_volume"))
             continue
         meta = symbol_meta.get(symbol, {})
         symbols[(code, exchange)] = (
@@ -312,19 +370,53 @@ def parse_task(
                 code,
                 exchange,
                 timeframe_code,
-                parse_bar_ts(task.timeframe, rows, index),
+                bar_ts,
                 price_to_x1000(open_value),
                 price_to_x1000(high_value),
                 price_to_x1000(low_value),
                 price_to_x1000(close_value),
-                int(round(to_float(rows["vol"][index], default=0.0))),
+                volume,
                 amount_to_x100(to_optional_float(rows["amount"][index])),
                 True,
                 0,
                 SOURCE_CODE,
             )
         )
-    return ParsedBatch(symbols=symbols, bars=bars)
+    return ParsedBatch(
+        symbols=symbols,
+        bars=bars,
+        quarantines=quarantines,
+        last_source_row=row_count - 1 if row_count else None,
+    )
+
+
+def valid_ohlc(open_value: float, high_value: float, low_value: float, close_value: float) -> bool:
+    return (
+        min(open_value, high_value, low_value, close_value) > 0
+        and low_value <= min(open_value, close_value)
+        and high_value >= max(open_value, close_value)
+        and high_value >= low_value
+    )
+
+
+def quarantine_from_row(
+    task: ImportTask,
+    source_row: int,
+    raw_payload: dict[str, Any],
+    raw_ts: str,
+    symbol: str | None,
+    reason: str,
+) -> QuarantineRecord:
+    return QuarantineRecord(
+        source_name=SOURCE_NAME,
+        source_ref=task.source_ref,
+        source_row=source_row,
+        symbol_text=symbol,
+        timeframe=task.timeframe,
+        raw_ts=raw_ts,
+        reason=reason[:500],
+        raw_payload=raw_payload,
+    )
 
 
 def release_memory() -> None:
@@ -420,45 +512,98 @@ class NativeParquetWriter:
         if self.pool is not None:
             await self.pool.close()
 
+    async def create_import_run(self, *, import_run_id: UUID, parameters: dict[str, Any]) -> None:
+        """Register the run before any member can advance a durable checkpoint."""
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await create_import_run(
+                conn,
+                import_run_id=import_run_id,
+                source_name=SOURCE_NAME,
+                parameters=parameters,
+            )
+
     async def upsert(self, *, symbols: Iterable[tuple], bars: list[tuple]) -> int:
         if not bars:
             return 0
         assert self.pool is not None
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                await create_symbol_stage(conn)
-                symbol_rows = list(symbols)
-                if symbol_rows:
-                    await conn.copy_records_to_table(
-                        "_native_parquet_symbol_stage",
-                        records=symbol_rows,
-                        columns=["code", "exchange", "name", "asset_type", "market", "is_active"],
-                    )
-                    await upsert_symbols(conn)
+                await self._upsert_on_connection(conn, symbols=symbols, bars=bars)
+        return len(bars)
 
-                await create_kline_stage(conn)
-                await conn.copy_records_to_table(
-                    "_native_parquet_kline_stage",
-                    records=bars,
-                    columns=[
-                        "code",
-                        "exchange",
-                        "timeframe",
-                        "bar_end",
-                        "open_x1000",
-                        "high_x1000",
-                        "low_x1000",
-                        "close_x1000",
-                        "volume",
-                        "amount_x100",
-                        "is_complete",
-                        "revision",
-                        "source",
-                    ],
-                )
-                await register_source_coverage(conn)
-                await upsert_klines(conn)
-                await upsert_watermarks(conn)
+    async def upsert_import_batch(
+        self,
+        *,
+        import_run_id: UUID | None,
+        task: ImportTask,
+        symbols: Iterable[tuple],
+        bars: list[tuple],
+        quarantines: list[QuarantineRecord],
+        last_source_row: int | None,
+    ) -> int:
+        """Commit a source member's canonical rows and raw failures together.
+
+        ``import_run_id`` is optional only to preserve test callers of
+        ``process_tasks``. Production ``run_once`` always supplies it.
+        """
+        if import_run_id is None:
+            return await self.upsert(symbols=symbols, bars=bars)
+        assert self.pool is not None
+        symbol_rows = list(symbols)
+        async with self.pool.acquire() as conn:
+            return await commit_import_batch(
+                conn,
+                import_run_id=import_run_id,
+                checkpoint=ImportCheckpoint(
+                    source_ref=task.source_ref,
+                    source_checksum=task.source_checksum,
+                    last_source_row=last_source_row,
+                ),
+                quarantines=quarantines,
+                write_accepted=lambda transaction_conn: self._upsert_on_connection(
+                    transaction_conn,
+                    symbols=symbol_rows,
+                    bars=bars,
+                ),
+            )
+
+    async def _upsert_on_connection(self, conn, *, symbols: Iterable[tuple], bars: list[tuple]) -> int:
+        if not bars:
+            return 0
+        await create_symbol_stage(conn)
+        symbol_rows = list(symbols)
+        if symbol_rows:
+            await conn.copy_records_to_table(
+                "_native_parquet_symbol_stage",
+                records=symbol_rows,
+                columns=["code", "exchange", "name", "asset_type", "market", "is_active"],
+            )
+            await upsert_symbols(conn)
+
+        await create_kline_stage(conn)
+        await conn.copy_records_to_table(
+            "_native_parquet_kline_stage",
+            records=bars,
+            columns=[
+                "code",
+                "exchange",
+                "timeframe",
+                "bar_end",
+                "open_x1000",
+                "high_x1000",
+                "low_x1000",
+                "close_x1000",
+                "volume",
+                "amount_x100",
+                "is_complete",
+                "revision",
+                "source",
+            ],
+        )
+        await register_source_coverage(conn)
+        await upsert_klines(conn)
+        await upsert_watermarks(conn)
         return len(bars)
 
     async def upsert_symbol_rows(self, rows: Iterable[tuple]) -> int:
@@ -765,6 +910,12 @@ def parse_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def resolve_import_run_id(value: str | UUID | None) -> UUID:
+    if value is None or str(value).strip() == "":
+        return uuid4()
+    return UUID(str(value))
 
 
 def to_float(value: Any, *, default: float | None = None) -> float:
