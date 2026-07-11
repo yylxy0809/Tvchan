@@ -31,12 +31,6 @@ from collector.tdx_csv_import import (
     process_task as process_tdx_csv_task,
     resolve_metadata_from_row,
 )
-from collector import chan_recompute as chan_recompute_module
-from collector.chan_recompute import (
-    DB_TO_TIMEFRAME as CHAN_DB_TO_TIMEFRAME,
-    process_task as process_chan_task,
-    process_tasks_concurrently as process_chan_tasks_concurrently,
-)
 from collector.history_backfill import (
     DB_TO_TIMEFRAME as HISTORY_DB_TO_TIMEFRAME,
     get_provider_page,
@@ -506,12 +500,6 @@ def test_history_backfill_db_timeframe_mapping() -> None:
     assert HISTORY_DB_TO_TIMEFRAME[43200] == "1m"
 
 
-def test_chan_recompute_db_timeframe_mapping() -> None:
-    assert CHAN_DB_TO_TIMEFRAME[5] == "5f"
-    assert CHAN_DB_TO_TIMEFRAME[30] == "30f"
-    assert CHAN_DB_TO_TIMEFRAME[1440] == "1d"
-
-
 def test_history_backfill_provider_page_prefers_native_paging() -> None:
     class FakeProvider:
         def __init__(self) -> None:
@@ -569,7 +557,6 @@ def test_history_backfill_process_task_advances_offsets_until_exhausted() -> Non
             provider=FakeProvider(),
             kline_writer=writer,
             task_store=task_store,
-            chan_writer=None,
             task={
                 "id": 1,
                 "symbol": "000001.SZ",
@@ -579,9 +566,6 @@ def test_history_backfill_process_task_advances_offsets_until_exhausted() -> Non
             },
             max_pages_per_task=0,
             sleep=0,
-            chan_levels=set(),
-            modes=[],
-            chan_service_url="http://chan-service.test",
         )
     )
     assert result == {"pages": 2, "bars": 4}
@@ -637,207 +621,16 @@ def test_history_backfill_processes_tasks_with_bounded_concurrency() -> None:
             provider_factory=FakeProvider,
             kline_writer=FakeKlineWriter(),
             task_store=task_store,
-            chan_writer=None,
             tasks=tasks,
             concurrency=2,
             max_pages_per_task=1,
             sleep=0,
-            chan_levels=set(),
-            modes=[],
-            chan_service_url="http://chan-service.test",
         )
     )
     assert result == {"pages": 3, "bars": 3}
     assert Monitor.created == 3
     assert Monitor.max_active == 2
     assert len(task_store.records) == 3
-
-
-def test_chan_recompute_process_task_writes_full_history(monkeypatch) -> None:
-    async def fake_compute(*, kline_writer, symbol, base_timeframe, analysis_levels, modes, chan_py_path, page_size):
-        assert symbol == "000001.SZ"
-        assert base_timeframe == "5f"
-        assert analysis_levels == ["5f", "30f", "1d"]
-        assert modes == ["confirmed", "predictive"]
-        assert page_size == 512
-        bars = [_fake_bar(symbol, base_timeframe, 0), _fake_bar(symbol, base_timeframe, 1)]
-        return bars, {
-            "engine": "module-b:chan.py",
-            "strokes": [
-                {
-                    "id": "bi-1",
-                    "level": "5f",
-                    "start": {"time": 1, "price": 1.0},
-                    "end": {"time": 2, "price": 2.0},
-                    "begin_base_ts": 1,
-                    "end_base_ts": 2,
-                },
-                {
-                    "id": "seg-1",
-                    "level": "30f",
-                    "start": {"time": 1, "price": 1.0},
-                    "end": {"time": 2, "price": 2.0},
-                    "begin_base_ts": 1,
-                    "end_base_ts": 2,
-                },
-                {
-                    "id": "trend-1",
-                    "level": "1d",
-                    "start": {"time": 1, "price": 1.0},
-                    "end": {"time": 2, "price": 2.0},
-                    "begin_base_ts": 1,
-                    "end_base_ts": 2,
-                },
-            ],
-            "segments": [],
-            "centers": [],
-            "signals": [],
-            "channels": [],
-        }
-
-    monkeypatch.setattr(chan_recompute_module, "compute_chan_overlay_chunked", fake_compute)
-
-    class FakeKlineWriter:
-        async def get_bars_chunk(self, symbol, level, *, after_ts=None, limit=5000):
-            raise AssertionError("process_task should delegate chunked loading to compute_chan_overlay_chunked")
-
-    class FakeChanWriter:
-        def __init__(self) -> None:
-            self.calls = []
-
-        async def replace_analysis(self, **kwargs):
-            self.calls.append(kwargs)
-            return {"strokes": 1, "segments": 0, "centers": 0, "signals": 0}
-
-    class FakeTaskStore:
-        def __init__(self) -> None:
-            self.successes = []
-
-        async def record_success(self, **kwargs):
-            self.successes.append(kwargs)
-
-        async def record_failure(self, **kwargs):
-            raise AssertionError(f"unexpected failure: {kwargs}")
-
-    chan_writer = FakeChanWriter()
-    task_store = FakeTaskStore()
-    result = asyncio.run(
-        process_chan_task(
-            kline_writer=FakeKlineWriter(),
-            chan_writer=chan_writer,
-            task_store=task_store,
-            task={
-                "id": 7,
-                "symbol": "000001.SZ",
-                "chan_level": 5,
-                "modes": "confirmed,predictive",
-            },
-            analysis_levels=["5f", "30f", "1d"],
-            sleep=0,
-            chan_py_path=None,
-            page_size=512,
-        )
-    )
-    assert result == {"runs": 1}
-    assert [item["level"] for item in chan_writer.calls] == ["5f", "30f", "1d"]
-    assert chan_writer.calls[0]["bar_count"] == 2
-    assert chan_writer.calls[0]["response"]["engine"] == "module-b:chan.py"
-    assert [item["id"] for item in chan_writer.calls[0]["response"]["strokes"]] == ["bi-1"]
-    assert [item["id"] for item in chan_writer.calls[1]["response"]["strokes"]] == ["seg-1"]
-    assert task_store.successes[0]["task_id"] == 7
-    assert task_store.successes[0]["bar_count"] == 2
-
-
-def test_chan_recompute_processes_tasks_with_bounded_concurrency(monkeypatch) -> None:
-    class Monitor:
-        active = 0
-        max_active = 0
-
-    async def fake_compute(*, kline_writer, symbol, base_timeframe, analysis_levels, modes, chan_py_path, page_size):
-        Monitor.active += 1
-        Monitor.max_active = max(Monitor.max_active, Monitor.active)
-        await asyncio.sleep(0.01)
-        Monitor.active -= 1
-        return [_fake_bar(symbol, base_timeframe, 0), _fake_bar(symbol, base_timeframe, 1)], {
-            "engine": "module-b:chan.py",
-            "strokes": [
-                {
-                    "id": f"{symbol}-5f",
-                    "level": "5f",
-                    "start": {"time": 1, "price": 1.0},
-                    "end": {"time": 2, "price": 2.0},
-                    "begin_base_ts": 1,
-                    "end_base_ts": 2,
-                },
-                {
-                    "id": f"{symbol}-30f",
-                    "level": "30f",
-                    "start": {"time": 1, "price": 1.0},
-                    "end": {"time": 2, "price": 2.0},
-                    "begin_base_ts": 1,
-                    "end_base_ts": 2,
-                },
-                {
-                    "id": f"{symbol}-1d",
-                    "level": "1d",
-                    "start": {"time": 1, "price": 1.0},
-                    "end": {"time": 2, "price": 2.0},
-                    "begin_base_ts": 1,
-                    "end_base_ts": 2,
-                },
-            ],
-            "segments": [],
-            "centers": [],
-            "signals": [],
-            "channels": [],
-        }
-
-    monkeypatch.setattr(chan_recompute_module, "compute_chan_overlay_chunked", fake_compute)
-
-    class FakeKlineWriter:
-        async def get_bars_chunk(self, symbol, level, *, after_ts=None, limit=5000):
-            raise AssertionError("process_task should delegate chunked loading to compute_chan_overlay_chunked")
-
-    class FakeChanWriter:
-        async def replace_analysis(self, **kwargs):
-            return {"strokes": 0, "segments": 0, "centers": 0, "signals": 0}
-
-    class FakeTaskStore:
-        def __init__(self) -> None:
-            self.successes = []
-
-        async def record_success(self, **kwargs):
-            self.successes.append(kwargs)
-
-        async def record_failure(self, **kwargs):
-            raise AssertionError(f"unexpected failure: {kwargs}")
-
-    task_store = FakeTaskStore()
-    tasks = [
-        {
-            "id": index + 1,
-            "symbol": f"00000{index + 1}.SZ",
-            "chan_level": 5,
-            "modes": "confirmed,predictive",
-        }
-        for index in range(3)
-    ]
-    result = asyncio.run(
-        process_chan_tasks_concurrently(
-            kline_writer=FakeKlineWriter(),
-            chan_writer=FakeChanWriter(),
-            task_store=task_store,
-            tasks=tasks,
-            analysis_levels=["5f", "30f", "1d"],
-            concurrency=2,
-            sleep=0,
-            chan_py_path=None,
-            page_size=512,
-        )
-    )
-    assert result == {"runs": 3}
-    assert Monitor.max_active == 2
-    assert len(task_store.successes) == 3
 
 
 def _fake_bar(symbol: str, timeframe: str, index: int) -> Bar:

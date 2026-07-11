@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime
 from typing import Any
@@ -239,7 +240,14 @@ def _bar_snapshot_version(symbol: str, timeframe: str, bar: dict[str, Any]) -> s
     bar_time = int(bar.get("time") or 0)
     revision = int(bar.get("revision") or 0)
     complete = 1 if bool(bar.get("complete")) else 0
+    fingerprint = hashlib.blake2s(
+        "|".join(
+            str(bar.get(field) or "")
+            for field in ("open", "high", "low", "close", "volume")
+        ).encode("utf-8"),
+        digest_size=6,
+    ).hexdigest()
     return (
         f"rt:{symbol.upper()}:{normalized_timeframe}:"
-        f"{bar_time:012d}:{revision:06d}:{complete}"
+        f"{bar_time:012d}:{fingerprint}:{revision:06d}:{complete}"
     )

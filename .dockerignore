@@ -1,0 +1,53 @@
+# Git and editor state
+.git
+.gitignore
+.dockerignore
+.vs/
+.vscode/
+
+# Local secrets and runtime config
+.env
+.env.*
+deploy/*.env
+deploy/*.env.*
+!deploy/*.env.example
+
+# Python caches and virtualenvs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node/build output
+node_modules/
+apps/web/node_modules/
+dist/
+**/dist/
+!apps/web/dist/
+!apps/web/dist/**
+apps/web/.vite/
+apps/web/tsconfig.tsbuildinfo
+
+# Local logs, packages, scratch output
+logs/
+outputs/
+tmp/
+tmp-*
+work/
+*.log
+*.pid
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# Licensed/runtime-only assets copied outside source control
+apps/web/public/charting_library/
+
+# External reference copy kept outside deploy builds
+旧版方案/

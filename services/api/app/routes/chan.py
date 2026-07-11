@@ -1,26 +1,50 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-from datetime import datetime
-from time import monotonic
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.core.config import Settings, get_settings
 from app.core.security import require_token
 from app.models import ChanOverlayResponse
-from app.repositories.bars import generate_seed_bars, resolve_symbol
-from app.repositories.chan_postgres import get_precomputed_chan_overlay_db
-from app.repositories.postgres import get_bars_db, resolve_symbol_db
-from app.services.chan_client import ChanServiceError, analyze_with_chan_service
+from app.repositories.chan_postgres import (
+    OverlayTooLargeError,
+    get_windowed_module_c_overlay_db,
+)
 from trading_protocol import normalize_timeframe
 
-DEFAULT_LEVELS = ("5f", "30f", "1d")
+DEFAULT_LEVELS = ("5f", "30f", "1d", "1w", "1m")
 DEFAULT_MODES = ("confirmed", "predictive")
-_ANALYSIS_CACHE_MAX_ITEMS = 32
-_ANALYSIS_FAST_CACHE_TTL_SECONDS = 300
-_analysis_overlay_cache: OrderedDict[tuple, ChanOverlayResponse] = OrderedDict()
-_analysis_overlay_fast_cache: OrderedDict[tuple, tuple[float, ChanOverlayResponse]] = OrderedDict()
+DISPLAY_LEVELS = {
+    "5f": ("5f", "30f", "1d"),
+    "15f": ("5f", "30f", "1d"),
+    "30f": ("30f", "1d"),
+    "1h": ("30f", "1d"),
+    "1d": ("1d", "1w"),
+    "1w": ("1w", "1m"),
+    "1m": ("1m",),
+}
+MAX_OVERLAY_WINDOW_SECONDS = 366 * 24 * 60 * 60
+MAX_OVERLAY_WINDOW_BARS = 360
+OVERLAY_WINDOW_GUARD_BARS = 12
+TIMEFRAME_SECONDS = {
+    "5f": 5 * 60,
+    "15f": 15 * 60,
+    "30f": 30 * 60,
+    "1h": 60 * 60,
+    "1d": 24 * 60 * 60,
+    "1w": 7 * 24 * 60 * 60,
+    # Calendar months vary; 31 days keeps the cap conservative.
+    "1m": 31 * 24 * 60 * 60,
+}
+# Stored daily and monthly bars follow trading calendars, not evenly spaced
+# wall-clock intervals. Keep the viewport cap bounded by bar count while
+# allowing ordinary cold 300-bar chart windows across holidays and suspensions.
+CALENDAR_WINDOW_MULTIPLIERS = {
+    "1d": 1.8,
+    "1w": 1.3,
+    "1m": 1.5,
+}
 
 router = APIRouter(prefix="/chan", tags=["chan"], dependencies=[Depends(require_token)])
 
@@ -30,7 +54,7 @@ async def get_chan_overlay(
     request: Request,
     symbol: str = Query(..., min_length=6, max_length=16),
     timeframe: str = Query(default="5f"),
-    levels: str = Query(default="5f,30f,1d"),
+    levels: str = Query(default=""),
     modes: str = Query(default="confirmed,predictive"),
     from_ts: datetime | None = Query(default=None, alias="from"),
     to_ts: datetime | None = Query(default=None, alias="to"),
@@ -60,317 +84,99 @@ async def build_chan_overlay(
     to_ts: datetime | None,
     limit: int,
     settings: Settings,
+    authoritative_window: bool = False,
+    legacy_bundle: bool = False,
 ) -> ChanOverlayResponse:
     try:
         chart_timeframe = normalize_timeframe(timeframe)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    chan_levels = _parse_levels(levels)
-    chan_modes = _parse_modes(modes)
-
-    symbol_name, level_bars = await _load_level_bars(
-        request=request,
-        symbol=symbol,
-        chart_timeframe=chart_timeframe,
-        levels=[],
-        start=from_ts,
-        end=to_ts,
-        limit=limit,
-        settings=settings,
-    )
-    bars_by_level_count = _bar_counts(level_bars, chan_levels)
-    if not settings.use_seed_data and settings.use_precomputed_chan:
-        pool = getattr(request.app.state, "db_pool", None)
-        if pool is not None:
-            precomputed = await get_precomputed_chan_overlay_db(
-                pool,
-                symbol=symbol_name,
-                chart_timeframe=chart_timeframe,
-                levels=chan_levels,
-                modes=chan_modes,
-                requested_bar_count=limit,
-                bars_by_level=level_bars,
-            )
-            if precomputed is not None:
-                return precomputed
-
-    if not all(level in level_bars for level in chan_levels):
-        symbol_name, level_bars = await _load_level_bars(
-            request=request,
-            symbol=symbol_name,
-            chart_timeframe=chart_timeframe,
-            levels=chan_levels,
-            start=from_ts,
-            end=to_ts,
-            limit=limit,
-            settings=settings,
+    if legacy_bundle:
+        # Compatibility bundles retain their caller-selected legacy levels.
+        chan_levels = _parse_levels(levels) if levels.strip() else list(DEFAULT_LEVELS)
+        requested_levels = chan_levels
+    else:
+        chan_levels = _display_levels_for_chart(chart_timeframe)
+        requested_levels = _parse_levels(levels) if levels.strip() else chan_levels
+    if authoritative_window and requested_levels != chan_levels:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Levels for {chart_timeframe} must be: {', '.join(chan_levels)}",
         )
-        bars_by_level_count = _bar_counts(level_bars, chan_levels)
-
-    if settings.chan_service_url:
-        try:
-            if not settings.use_seed_data:
-                cached = _load_fast_analysis_overlay_cache(
-                    symbol=symbol_name,
-                    service_url=settings.chan_service_url,
-                    chart_timeframe=chart_timeframe,
-                    levels=chan_levels,
-                    modes=chan_modes,
-                    requested_bar_count=limit,
-                    bars_by_level=level_bars,
-                )
-                if cached is not None:
-                    return cached
-            analysis_bars = await _load_chan_analysis_bars(
-                request=request,
-                settings=settings,
-                symbol=symbol_name,
-                visible_bars=level_bars,
-                end=to_ts,
-            )
-            cached = _load_analysis_overlay_cache(
-                symbol=symbol_name,
-                chart_timeframe=chart_timeframe,
-                levels=chan_levels,
-                modes=chan_modes,
-                requested_bar_count=limit,
-                bars_by_level=level_bars,
-                analysis_bars=analysis_bars,
-            )
-            if cached is not None:
-                return cached
-            analyzed = await analyze_with_chan_service(
-                base_url=settings.chan_service_url,
-                symbol=symbol_name,
-                chart_timeframe=chart_timeframe,
-                levels=chan_levels,
-                modes=chan_modes,
-                requested_bar_count=limit,
-                bars_by_level=level_bars,
-                analysis_bars=analysis_bars,
-            )
-            _publish_analysis_overlay_cache(
-                symbol=symbol_name,
-                levels=chan_levels,
-                modes=chan_modes,
-                analysis_bars=analysis_bars,
-                overlay=analyzed,
-            )
-            if not settings.use_seed_data:
-                _publish_fast_analysis_overlay_cache(
-                    symbol=symbol_name,
-                    service_url=settings.chan_service_url,
-                    levels=chan_levels,
-                    modes=chan_modes,
-                    overlay=analyzed,
-                )
-            return analyzed
-        except ChanServiceError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    raise HTTPException(
-        status_code=503,
-        detail="Chan overlay requires precomputed data or CHAN_SERVICE_URL module-b service",
-    )
-
-
-async def _load_level_bars(
-    request: Request,
-    symbol: str,
-    chart_timeframe: str,
-    levels: list[str],
-    start: datetime | None,
-    end: datetime | None,
-    limit: int,
-    settings: Settings,
-) -> tuple[str, dict[str, list[dict]]]:
-    if not settings.use_seed_data:
+    chan_modes = _parse_modes(modes)
+    if authoritative_window:
+        first_ts, last_ts = _validate_window(from_ts, to_ts, chart_timeframe, limit)
         pool = getattr(request.app.state, "db_pool", None)
         if pool is None:
+            if settings.use_seed_data:
+                return _empty_published_overlay(
+                    symbol=symbol.upper(), chart_timeframe=chart_timeframe, levels=chan_levels,
+                    modes=chan_modes, requested_bar_count=limit,
+                    bars_by_level={level: 0 for level in chan_levels}, level_bars={},
+                )
             raise HTTPException(status_code=503, detail="Database pool is not ready")
-        symbol_row = await resolve_symbol_db(pool, symbol)
-        if symbol_row is None:
-            raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
-        load_levels = _unique_levels([*levels, chart_timeframe, "5f"])
-        bars_by_level = {
-            level: await get_bars_db(pool, symbol_row["symbol"], level, start, end, limit)
-            for level in load_levels
-        }
-        return symbol_row["symbol"], bars_by_level
-
-    symbol_info = resolve_symbol(symbol)
-    if symbol_info is None:
-        raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
-    load_levels = _unique_levels([*levels, chart_timeframe, "5f"])
-    bars_by_level = {
-        level: [
-            bar.as_api_dict()
-            for bar in generate_seed_bars(
-                symbol_info.symbol,
-                level,
-                start=start,
-                end=end,
-                limit=limit,
+        try:
+            precomputed = await get_windowed_module_c_overlay_db(
+                pool,
+                symbol=symbol,
+                chart_timeframe=chart_timeframe,
+                levels=chan_levels,
+                modes=chan_modes,
+                first_ts=first_ts,
+                last_ts=last_ts,
+                requested_bar_count=limit,
             )
-        ]
-        for level in load_levels
-    }
-    return symbol_info.symbol, bars_by_level
+        except OverlayTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        if precomputed is not None:
+            return precomputed
+        return _empty_published_overlay(
+            symbol=symbol.upper(), chart_timeframe=chart_timeframe, levels=chan_levels,
+            modes=chan_modes, requested_bar_count=limit,
+            bars_by_level={level: 0 for level in chan_levels}, level_bars={},
+        )
+
+    return _empty_published_overlay(
+        symbol=symbol.upper(),
+        chart_timeframe=chart_timeframe,
+        levels=chan_levels,
+        modes=chan_modes,
+        requested_bar_count=limit,
+        bars_by_level={level: 0 for level in chan_levels},
+        level_bars={},
+    )
 
 
-def _bar_counts(bars_by_level: dict[str, list[dict]], levels: list[str]) -> dict[str, int]:
-    return {level: len(bars_by_level.get(level, [])) for level in levels}
-
-
-def _load_analysis_overlay_cache(
+def _empty_published_overlay(
     *,
     symbol: str,
     chart_timeframe: str,
     levels: list[str],
     modes: list[str],
     requested_bar_count: int,
-    bars_by_level: dict[str, list[dict]],
-    analysis_bars: list[dict],
-) -> ChanOverlayResponse | None:
-    key = _analysis_overlay_cache_key(symbol, levels, modes, analysis_bars)
-    cached = _analysis_overlay_cache.get(key)
-    if cached is None:
-        return None
-    _analysis_overlay_cache.move_to_end(key)
-    return cached.model_copy(
-        update={
-            "chart_timeframe": chart_timeframe,
-            "requested_bar_count": requested_bar_count,
-            "bars_by_level": _bar_counts(bars_by_level, levels),
-        },
-        deep=True,
-    )
-
-
-def _load_fast_analysis_overlay_cache(
-    *,
-    symbol: str,
-    service_url: str,
-    chart_timeframe: str,
-    levels: list[str],
-    modes: list[str],
-    requested_bar_count: int,
-    bars_by_level: dict[str, list[dict]],
-) -> ChanOverlayResponse | None:
-    key = _fast_analysis_overlay_cache_key(symbol, service_url, levels, modes)
-    cached = _analysis_overlay_fast_cache.get(key)
-    if cached is None:
-        return None
-    created_at, overlay = cached
-    if monotonic() - created_at > _ANALYSIS_FAST_CACHE_TTL_SECONDS:
-        _analysis_overlay_fast_cache.pop(key, None)
-        return None
-    _analysis_overlay_fast_cache.move_to_end(key)
-    return overlay.model_copy(
-        update={
-            "chart_timeframe": chart_timeframe,
-            "requested_bar_count": requested_bar_count,
-            "bars_by_level": _bar_counts(bars_by_level, levels),
-        },
-        deep=True,
-    )
-
-
-def _publish_fast_analysis_overlay_cache(
-    *,
-    symbol: str,
-    service_url: str,
-    levels: list[str],
-    modes: list[str],
-    overlay: ChanOverlayResponse,
-) -> None:
-    key = _fast_analysis_overlay_cache_key(symbol, service_url, levels, modes)
-    _analysis_overlay_fast_cache[key] = (monotonic(), overlay.model_copy(deep=True))
-    _analysis_overlay_fast_cache.move_to_end(key)
-    while len(_analysis_overlay_fast_cache) > _ANALYSIS_CACHE_MAX_ITEMS:
-        _analysis_overlay_fast_cache.popitem(last=False)
-
-
-def _fast_analysis_overlay_cache_key(
-    symbol: str,
-    service_url: str,
-    levels: list[str],
-    modes: list[str],
-) -> tuple:
-    return (
-        symbol.upper(),
-        service_url.rstrip("/"),
-        id(analyze_with_chan_service),
-        tuple(levels),
-        tuple(modes),
-    )
-
-
-def _publish_analysis_overlay_cache(
-    *,
-    symbol: str,
-    levels: list[str],
-    modes: list[str],
-    analysis_bars: list[dict],
-    overlay: ChanOverlayResponse,
-) -> None:
-    key = _analysis_overlay_cache_key(symbol, levels, modes, analysis_bars)
-    _analysis_overlay_cache[key] = overlay.model_copy(deep=True)
-    _analysis_overlay_cache.move_to_end(key)
-    while len(_analysis_overlay_cache) > _ANALYSIS_CACHE_MAX_ITEMS:
-        _analysis_overlay_cache.popitem(last=False)
-
-
-def _analysis_overlay_cache_key(
-    symbol: str,
-    levels: list[str],
-    modes: list[str],
-    analysis_bars: list[dict],
-) -> tuple:
-    if not analysis_bars:
-        return (symbol.upper(), tuple(levels), tuple(modes), "empty")
-    first = analysis_bars[0]
-    last = analysis_bars[-1]
-    return (
-        symbol.upper(),
-        tuple(levels),
-        tuple(modes),
-        len(analysis_bars),
-        first.get("time"),
-        last.get("time"),
-        last.get("revision"),
-        last.get("open"),
-        last.get("high"),
-        last.get("low"),
-        last.get("close"),
-        last.get("volume"),
-    )
-
-
-async def _load_chan_analysis_bars(
-    *,
-    request: Request,
-    settings: Settings,
-    symbol: str,
-    visible_bars: dict[str, list[dict]],
-    end: datetime | None,
-) -> list[dict]:
-    if settings.use_seed_data:
-        return visible_bars.get("5f", [])
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is None:
-        return visible_bars.get("5f", [])
-    # Use the full 5f history up to the requested end time so Chan recursion
-    # is computed on the complete path, while the chart still renders only the
-    # requested window.
-    return await get_bars_db(
-        pool,
-        symbol,
-        "5f",
-        None,
-        end,
-        1_000_000,
+    bars_by_level: dict[str, int],
+    level_bars: dict[str, list[dict]],
+) -> ChanOverlayResponse:
+    window_bars = level_bars.get(chart_timeframe) or level_bars.get("5f") or []
+    first = window_bars[0].get("time") if window_bars else ""
+    last = window_bars[-1].get("time") if window_bars else ""
+    return ChanOverlayResponse(
+        symbol=symbol,
+        chart_timeframe=chart_timeframe,
+        levels=levels,
+        modes=modes,
+        snapshot_version=f"{symbol}:published-empty:{chart_timeframe}:{first}:{last}:{requested_bar_count}",
+        base_timeframe="5f",
+        base_ts_semantics="bar_end",
+        engine="database:chan-published-empty",
+        requested_bar_count=requested_bar_count,
+        bars_by_level=bars_by_level,
+        strokes=[],
+        segments=[],
+        centers=[],
+        signals=[],
+        channels=[],
     )
 
 
@@ -403,6 +209,51 @@ def _parse_levels(value: str) -> list[str]:
     return normalized
 
 
+def _display_levels_for_chart(chart_timeframe: str) -> list[str]:
+    try:
+        return list(DISPLAY_LEVELS[chart_timeframe])
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=f"Unsupported chart timeframe: {chart_timeframe}") from exc
+
+
+def _validate_window(
+    from_ts: datetime | None,
+    to_ts: datetime | None,
+    chart_timeframe: str,
+    limit: int,
+) -> tuple[datetime, datetime]:
+    if from_ts is None or to_ts is None:
+        raise HTTPException(status_code=422, detail="Both from and to are required for a chart overlay")
+    if from_ts.tzinfo is None or from_ts.utcoffset() is None:
+        raise HTTPException(status_code=422, detail="from must include a UTC offset")
+    if to_ts.tzinfo is None or to_ts.utcoffset() is None:
+        raise HTTPException(status_code=422, detail="to must include a UTC offset")
+    from_ts = from_ts.astimezone(UTC)
+    to_ts = to_ts.astimezone(UTC)
+    if from_ts > to_ts:
+        raise HTTPException(status_code=400, detail="from must be less than or equal to to")
+    # A bounded monthly 300-bar viewport naturally spans about 25 years. Cap
+    # the request by a bar-count horizon instead of a fixed wall-clock ceiling,
+    # retaining a small trading-calendar guard while rejecting arbitrary spans.
+    bounded_bars = min(limit, MAX_OVERLAY_WINDOW_BARS) + OVERLAY_WINDOW_GUARD_BARS
+    requested_window_seconds = int(
+        TIMEFRAME_SECONDS[chart_timeframe]
+        * bounded_bars
+        * CALENDAR_WINDOW_MULTIPLIERS.get(chart_timeframe, 1.0)
+    )
+    maximum_window_seconds = max(MAX_OVERLAY_WINDOW_SECONDS, requested_window_seconds)
+    if (to_ts - from_ts).total_seconds() > maximum_window_seconds:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "overlay_window_too_large",
+                "message": "Overlay window exceeds the bounded request allowance",
+                "maximum_seconds": maximum_window_seconds,
+            },
+        )
+    return from_ts, to_ts
+
+
 def _parse_modes(value: str) -> list[str]:
     requested = [item.strip().lower() for item in value.split(",") if item.strip()]
     modes = requested or list(DEFAULT_MODES)
@@ -412,4 +263,6 @@ def _parse_modes(value: str) -> list[str]:
             status_code=400,
             detail=f"Unsupported chan modes: {', '.join(invalid)}",
         )
+    if len(set(modes)) != len(modes):
+        raise HTTPException(status_code=400, detail="Duplicate chan modes are not allowed")
     return modes

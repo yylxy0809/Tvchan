@@ -50,9 +50,9 @@ It is not a cap on strokes, segments, centers, or buy/sell signals.
 The preferred path is precomputed database data:
 
 - market-fill writes the latest K-lines
-- market-fill reloads all stored bars for each Chan level
-- chan-service/`chan.py` calculates a continuous historical Chan chain from the
-  earliest stored K-line to the latest stored K-line
+- market-fill marks the latest canonical 5f range dirty for Chan publishing
+- chan-tail-publisher extends the published Chan chain from the latest confirmed
+  stroke endpoint
 - the API returns only the part of that chain that intersects the current
   requested K-line window
 
@@ -173,6 +173,46 @@ Default PineJS slot layout:
 The slot counts are renderer capacity, not API data limits. The API still
 returns every Chan object from the full historical chain that intersects the
 requested K-line window.
+
+## Task 5 Protocol
+
+`/ws/v2/chart` uses `subscribe_chan` for realtime Chan updates. Subscriptions
+must provide an inclusive `from`/`to` range and use the backend's frozen
+analysis-level mapping for the requested chart timeframe. Extra or reordered
+levels are rejected; when levels are omitted, the server supplies the frozen
+mapping.
+
+Each update is a `chan-event.v1` envelope:
+
+```json
+{
+  "type": "chan_overlay",
+  "schema_version": "chan-event.v1",
+  "kind": "snapshot",
+  "id": "active-chart",
+  "symbol": "000001.SZ",
+  "chart_timeframe": "5f",
+  "modes": ["confirmed", "predictive"],
+  "snapshot_version": "published-version",
+  "base_version": null,
+  "sequence": 1,
+  "range": {"from": 1780000000, "to": 1780001200},
+  "upserts": {"strokes": [], "segments": [], "centers": [], "signals": []},
+  "deletes": {"strokes": [], "segments": [], "centers": [], "signals": []}
+}
+```
+
+`kind="delta"` requires a different non-empty `base_version`, a strictly
+increasing subscription `sequence`, and at least one stable-ID upsert or
+delete. It never carries a renamed full overlay. Apply it only when its
+`base_version` equals the cached version; ignore duplicate or older sequences.
+On a source sequence gap or source-version mismatch, the server sends one
+bounded active-range snapshot instead of invalidating the last valid overlay.
+Bar revision events remain on `/ws/v1/realtime` and do not share Chan versions.
+
+`subscribe_chart_bundle` is disabled by default in production so the realtime
+path cannot rebuild full chart bundles. It is available only when the explicit
+`ENABLE_LEGACY_CHART_BUNDLE_SUBSCRIBE=true` compatibility flag is set.
 
 ## Next replacement step
 

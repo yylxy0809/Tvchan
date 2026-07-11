@@ -5,8 +5,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from trading_protocol import MODULE_C_CONFIG_HASH
 
-DEFINITION_VERSION = "chan-state-v1"
+MARKET_SNAPSHOT_MAX_SYMBOLS = 20
+MARKET_SNAPSHOT_TIMEOUT_MS = 800
+SUPPORTED_MODULE_C_CONFIG_HASHES = (
+    MODULE_C_CONFIG_HASH,
+    "module-c:native-5lvl-v3-bi-strict-false",
+)
 
 LEVEL_LABELS = {
     5: "5f",
@@ -116,6 +122,7 @@ async def query_chan_screener(
     else:
         conditions = parsed_conditions
         unsupported = parsed_unsupported or []
+    conditions, unsupported = _module_c_conditions(conditions, unsupported)
     if not conditions:
         return {
             "query": query,
@@ -159,7 +166,7 @@ async def _find_matching_symbols(
     mode: str,
     limit: int,
 ):
-    params: list[Any] = [mode, DEFINITION_VERSION]
+    params: list[Any] = [mode, list(SUPPORTED_MODULE_C_CONFIG_HASHES)]
     exists_clauses: list[str] = []
     for condition in conditions:
         exists_clauses.append(_condition_sql(condition, params, mode=mode))
@@ -178,139 +185,204 @@ async def _find_matching_symbols(
 def _condition_sql(condition: ScreenerCondition, params: list[Any], *, mode: str) -> str:
     params.append(condition.level)
     level_param = len(params)
-    if mode == "current":
-        clauses = [
-            "$1::text = 'current'",
-            "st.symbol_id = s.id",
-            f"st.chan_level = ${level_param}",
-            "st.definition_version = $2",
-            f"""st.id = (
-                select st2.id
-                from chan_level_state_snapshots st2
-                where st2.symbol_id = s.id
-                  and st2.chan_level = ${level_param}
-                  and st2.definition_version = $2
-                  and st2.mode in ('predictive', 'confirmed')
-                order by
-                  case st2.mode when 'predictive' then 0 when 'confirmed' then 1 else 2 end,
-                  st2.computed_at desc
-                limit 1
-            )""",
-        ]
-    else:
-        clauses = [
-            "st.symbol_id = s.id",
-            f"st.chan_level = ${level_param}",
-            "st.mode = $1",
-            "st.definition_version = $2",
-        ]
-    if condition.kind == "structure":
-        params.append(condition.value)
-        state_param = len(params)
-        clauses.append(f"st.structure_state = ${state_param}")
-        if condition.direction is not None:
-            params.append(condition.direction)
-            direction_param = len(params)
-            clauses.append(f"st.structure_direction = ${direction_param}")
-    elif condition.kind == "stroke":
+    head_clauses = [
+        "head.symbol_id = s.id",
+        f"head.chan_level = ${level_param}",
+        "head.base_timeframe = head.chan_level",
+        "head.status = 'published'",
+        "head.run_id is not null",
+        "run.status = 'success'",
+        "run.config_hash = any($2::varchar[])",
+        _mode_sql(mode),
+    ]
+    detail_clause: str
+    if condition.kind == "stroke":
         params.append(condition.direction)
         direction_param = len(params)
-        clauses.append(f"st.latest_stroke_direction = ${direction_param}")
+        detail_clause = f"""
+            exists (
+                select 1 from chan_c_strokes detail
+                where detail.run_id = head.run_id
+                  and detail.mode = case head.mode when 'confirmed' then 1 when 'predictive' then 2 end
+                  and detail.id = (
+                      select latest.id from chan_c_strokes latest
+                      where latest.run_id = head.run_id
+                        and latest.mode = detail.mode
+                      order by coalesce(latest.end_base_ts, latest.end_ts) desc, latest.seq desc, latest.id desc
+                      limit 1
+                  )
+                  and detail.direction = ${direction_param}
+            )"""
     elif condition.kind == "segment":
         params.append(condition.direction)
         direction_param = len(params)
-        clauses.append(f"st.latest_segment_direction = ${direction_param}")
+        detail_clause = f"""
+            exists (
+                select 1 from chan_c_segments detail
+                where detail.run_id = head.run_id
+                  and detail.mode = case head.mode when 'confirmed' then 1 when 'predictive' then 2 end
+                  and detail.id = (
+                      select latest.id from chan_c_segments latest
+                      where latest.run_id = head.run_id
+                        and latest.mode = detail.mode
+                      order by coalesce(latest.end_base_ts, latest.end_ts) desc, latest.seq desc, latest.id desc
+                      limit 1
+                  )
+                  and detail.direction = ${direction_param}
+            )"""
     elif condition.kind == "signal":
         side = _signal_side(condition.value)
-        params.append(f"%{condition.value}%")
-        pattern_param = len(params)
-        side_param = None
-        if side is not None:
-            params.append(side)
-            side_param = len(params)
-        signal_clause = (
-            f"(st.last_signal_type ilike ${pattern_param} "
-            f"or st.last_signal_bsp_type ilike ${pattern_param}"
-        )
-        if side_param is not None:
-            signal_clause += f" or st.last_signal_side = ${side_param}"
-        signal_clause += ")"
-        clauses.append(signal_clause)
+        params.append(_signal_bsp_type(condition.value))
+        bsp_type_param = len(params)
+        params.append(side)
+        side_param = len(params)
+        detail_clause = f"""
+            exists (
+                select 1 from chan_c_signals detail
+                where detail.run_id = head.run_id
+                  and detail.mode = case head.mode when 'confirmed' then 1 when 'predictive' then 2 end
+                  and detail.id = (
+                      select latest.id from chan_c_signals latest
+                      where latest.run_id = head.run_id
+                        and latest.mode = detail.mode
+                      order by coalesce(latest.base_ts, latest.ts) desc, latest.id desc
+                      limit 1
+                  )
+                  and detail.extra ->> 'bsp_type' = ${bsp_type_param}
+                  and detail.extra ->> 'side' = ${side_param}
+            )"""
     else:
         raise ValueError(f"Unsupported screener condition kind: {condition.kind}")
-    return "exists (select 1 from chan_level_state_snapshots st where " + " and ".join(clauses) + ")"
+    return """exists (
+        select 1
+        from scheme2_chan_c_published_heads head
+        join chan_c_runs run on run.id = head.run_id
+        where """ + " and ".join(head_clauses) + " and " + detail_clause + ")"
+
+
+def _mode_sql(mode: str, *, table_alias: str = "head") -> str:
+    if mode != "current":
+        return f"{table_alias}.mode = $1"
+    return f"""(
+        {table_alias}.mode = 'predictive'
+        or (
+            {table_alias}.mode = 'confirmed'
+            and not exists (
+                select 1
+                from scheme2_chan_c_published_heads preferred
+                join chan_c_runs preferred_run on preferred_run.id = preferred.run_id
+                where preferred.symbol_id = {table_alias}.symbol_id
+                  and preferred.chan_level = {table_alias}.chan_level
+                  and preferred.base_timeframe = {table_alias}.base_timeframe
+                  and preferred.mode = 'predictive'
+                  and preferred.status = 'published'
+                  and preferred.run_id is not null
+                  and preferred_run.status = 'success'
+                  and preferred_run.config_hash = any($2::varchar[])
+            )
+        )
+    )"""
+
+
+def _module_c_conditions(
+    conditions: list[ScreenerCondition],
+    unsupported: list[str],
+) -> tuple[list[ScreenerCondition], list[str]]:
+    supported: list[ScreenerCondition] = []
+    unsupported_items = list(unsupported)
+    for condition in conditions:
+        # Module C publishes raw structures, but not the retired derived structure-state contract.
+        if condition.kind == "structure" or (
+            condition.kind == "signal" and _signal_bsp_type(condition.value) is None
+        ):
+            if condition.raw and condition.raw not in unsupported_items:
+                unsupported_items.append(condition.raw)
+            continue
+        supported.append(condition)
+    return supported, unsupported_items
 
 
 async def _fetch_states(conn, *, symbol_ids: list[int], mode: str) -> dict[int, dict[str, dict[str, Any]]]:
     if not symbol_ids:
         return {}
-    if mode == "current":
-        rows = await conn.fetch(
-            """
-            with ranked as (
-                select
-                    *,
-                    row_number() over (
-                        partition by symbol_id, chan_level
-                        order by
-                            case mode when 'predictive' then 0 when 'confirmed' then 1 else 2 end,
-                            computed_at desc
-                    ) as rn
-                from chan_level_state_snapshots
-                where symbol_id = any($1::bigint[])
-                  and mode in ('predictive', 'confirmed')
-                  and definition_version = $2
-            )
+    rows = await conn.fetch(
+        f"""
+        with ranked_heads as (
             select
-                symbol_id,
-                chan_level,
-                mode,
-                structure_state,
-                structure_direction,
-                latest_stroke_direction,
-                latest_segment_direction,
-                center_count,
-                last_signal_type,
-                last_signal_side,
-                last_signal_bsp_type,
-                is_complete,
-                asof_base_ts,
-                source_bar_until
-            from ranked
-            where rn = 1
-            order by symbol_id, chan_level
-            """,
-            symbol_ids,
-            DEFINITION_VERSION,
+                head.symbol_id,
+                head.chan_level,
+                head.mode,
+                head.run_id,
+                head.base_to_bar_end,
+                row_number() over (
+                    partition by head.symbol_id, head.chan_level
+                    order by
+                        case head.mode when 'predictive' then 0 when 'confirmed' then 1 else 2 end,
+                        coalesce(head.published_at, head.updated_at) desc,
+                        head.id desc
+                ) as rn
+            from scheme2_chan_c_published_heads head
+            join chan_c_runs run on run.id = head.run_id
+            where head.symbol_id = any($1::bigint[])
+              and head.base_timeframe = head.chan_level
+              and head.status = 'published'
+              and head.run_id is not null
+              and run.status = 'success'
+              and run.config_hash = any($2::varchar[])
+              and {_mode_sql(mode, table_alias='head')}
         )
-    else:
-        rows = await conn.fetch(
-            """
-            select
-                symbol_id,
-                chan_level,
-                mode,
-                structure_state,
-                structure_direction,
-                latest_stroke_direction,
-                latest_segment_direction,
-                center_count,
-                last_signal_type,
-                last_signal_side,
-                last_signal_bsp_type,
-                is_complete,
-                asof_base_ts,
-                source_bar_until
-            from chan_level_state_snapshots
-            where symbol_id = any($1::bigint[])
-              and mode = $2
-              and definition_version = $3
-            order by symbol_id, chan_level
-            """,
-            symbol_ids,
-            mode,
-            DEFINITION_VERSION,
-        )
+        select
+            head.symbol_id,
+            head.chan_level,
+            head.mode,
+            null::varchar as structure_state,
+            null::smallint as structure_direction,
+            stroke.direction as latest_stroke_direction,
+            segment.direction as latest_segment_direction,
+            centers.center_count,
+            signal.signal_type as last_signal_type,
+            signal.extra ->> 'side' as last_signal_side,
+            signal.extra ->> 'bsp_type' as last_signal_bsp_type,
+            null::boolean as is_complete,
+            head.base_to_bar_end as asof_base_ts,
+            head.base_to_bar_end as source_bar_until
+        from ranked_heads head
+        left join lateral (
+            select direction
+            from chan_c_strokes
+            where run_id = head.run_id
+              and mode = case head.mode when 'confirmed' then 1 when 'predictive' then 2 end
+            order by coalesce(end_base_ts, end_ts) desc, seq desc, id desc
+            limit 1
+        ) stroke on true
+        left join lateral (
+            select direction
+            from chan_c_segments
+            where run_id = head.run_id
+              and mode = case head.mode when 'confirmed' then 1 when 'predictive' then 2 end
+            order by coalesce(end_base_ts, end_ts) desc, seq desc, id desc
+            limit 1
+        ) segment on true
+        left join lateral (
+            select count(*)::integer as center_count
+            from chan_c_centers
+            where run_id = head.run_id
+              and mode = case head.mode when 'confirmed' then 1 when 'predictive' then 2 end
+        ) centers on true
+        left join lateral (
+            select signal_type, extra
+            from chan_c_signals
+            where run_id = head.run_id
+              and mode = case head.mode when 'confirmed' then 1 when 'predictive' then 2 end
+            order by coalesce(base_ts, ts) desc, id desc
+            limit 1
+        ) signal on true
+        where head.rn = 1
+        order by head.symbol_id, head.chan_level
+        """,
+        symbol_ids,
+        list(SUPPORTED_MODULE_C_CONFIG_HASHES),
+    )
     result: dict[int, dict[str, dict[str, Any]]] = {}
     for row in rows:
         symbol_id = int(row["symbol_id"])
@@ -336,41 +408,49 @@ async def _fetch_states(conn, *, symbol_ids: list[int], mode: str) -> dict[int, 
 async def _fetch_market_snapshots(conn, *, symbol_ids: list[int]) -> dict[int, dict[str, Any]]:
     if not symbol_ids:
         return {}
-    rows = await conn.fetch(
-        """
-        with latest as (
-            select distinct on (symbol_id)
-                symbol_id,
-                ts,
-                close_x1000,
-                amount_x100
-            from klines
-            where symbol_id = any($1::bigint[])
-              and timeframe = 5
-              and source = any($2::smallint[])
-            order by symbol_id, ts desc
-        )
-        select
-            l.symbol_id,
-            l.ts,
-            l.close_x1000,
-            l.amount_x100,
-            prev.close_x1000 as previous_close_x1000
-        from latest l
-        left join lateral (
-            select k.close_x1000
-            from klines k
-            where k.symbol_id = l.symbol_id
-              and k.timeframe = 5
-              and k.source = any($2::smallint[])
-              and k.ts < (date_trunc('day', l.ts at time zone 'Asia/Shanghai') at time zone 'Asia/Shanghai')
-            order by k.ts desc
-            limit 1
-        ) prev on true
-        """,
-        symbol_ids,
-        [2, 3, 4],
-    )
+    if len(symbol_ids) > MARKET_SNAPSHOT_MAX_SYMBOLS:
+        return {}
+    try:
+        async with conn.transaction():
+            await conn.execute(f"set local statement_timeout = {MARKET_SNAPSHOT_TIMEOUT_MS}")
+            rows = await conn.fetch(
+                """
+                with latest as (
+                    select distinct on (symbol_id)
+                        symbol_id,
+                        ts,
+                        close_x1000,
+                        amount_x100
+                    from klines
+                    where symbol_id = any($1::bigint[])
+                      and timeframe = 5
+                      and source = any($2::smallint[])
+                    order by symbol_id, ts desc
+                )
+                select
+                    l.symbol_id,
+                    l.ts,
+                    l.close_x1000,
+                    l.amount_x100,
+                    prev.close_x1000 as previous_close_x1000
+                from latest l
+                left join lateral (
+                    select k.close_x1000
+                    from klines k
+                    where k.symbol_id = l.symbol_id
+                      and k.timeframe = 5
+                      and k.source = any($2::smallint[])
+                      and k.ts < (date_trunc('day', l.ts at time zone 'Asia/Shanghai') at time zone 'Asia/Shanghai')
+                    order by k.ts desc
+                    limit 1
+                ) prev on true
+                """,
+                symbol_ids,
+                [2, 3, 4],
+            )
+    except Exception:
+        # Screener conditions are authoritative; market fields are best-effort enrichment.
+        return {}
     result: dict[int, dict[str, Any]] = {}
     for row in rows:
         price = _x1000_to_float(row["close_x1000"])
@@ -524,6 +604,13 @@ def _signal_side(value: str | None) -> str | None:
     if "卖" in value:
         return "sell"
     return None
+
+
+def _signal_bsp_type(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"(?:类)?([12])[买卖]", value)
+    return match.group(1) if match else None
 
 
 def _direction_label(value: int | None) -> str | None:

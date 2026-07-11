@@ -15,7 +15,11 @@ def test_worker_name_normalization_and_alias() -> None:
 def test_list_workers_is_sorted() -> None:
     names = [spec.name for spec in worker_registry.list_workers()]
     assert names == sorted(names)
-    assert "chan-recompute" in names
+    assert "chan-c-stream" in names
+    assert "chan-module-c-recompute" in names
+    assert "chan-recompute" not in names
+    assert "chan-tail-publisher" not in names
+    assert "realtime-pipeline" not in names
     assert "tdx-csv-import" in names
 
 

@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from app.repositories.chan_screener import conditions_from_llm_payload, parse_chan_screener_query
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+
+from app.repositories.chan_screener import (
+    ScreenerCondition,
+    conditions_from_llm_payload,
+    parse_chan_screener_query,
+    query_chan_screener,
+)
 
 
 def test_parse_multi_level_structure_and_segment_query() -> None:
@@ -116,3 +125,90 @@ def test_llm_payload_conditions_share_canonical_parser_shape() -> None:
         },
     ]
     assert unsupported == ["30f\u7ebf\u6bb5\u7834\u574f"]
+
+
+def test_module_c_screener_queries_only_published_module_c_outputs() -> None:
+    class Conn:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+        async def execute(self, query: str) -> None:
+            self.queries.append(query)
+
+        async def fetch(self, query: str, *args):
+            self.queries.append(query)
+            if "from symbols s" in query:
+                return [{"id": 7, "code": "000001", "exchange": "SZ", "name": "Ping An"}]
+            if "with ranked_heads" in query:
+                return [{
+                    "symbol_id": 7,
+                    "chan_level": 5,
+                    "mode": "confirmed",
+                    "structure_state": None,
+                    "structure_direction": None,
+                    "latest_stroke_direction": 1,
+                    "latest_segment_direction": -1,
+                    "center_count": 2,
+                    "last_signal_type": "2类买",
+                    "last_signal_side": "buy",
+                    "last_signal_bsp_type": "2",
+                    "is_complete": None,
+                    "asof_base_ts": datetime(2026, 7, 11, tzinfo=UTC),
+                    "source_bar_until": datetime(2026, 7, 11, tzinfo=UTC),
+                }]
+            if "from klines" in query:
+                return []
+            raise AssertionError(query)
+
+    class Pool:
+        def __init__(self) -> None:
+            self.conn = Conn()
+
+        @asynccontextmanager
+        async def acquire(self):
+            yield self.conn
+
+    pool = Pool()
+    response = asyncio.run(query_chan_screener(
+        pool,
+        query="5f向上一笔",
+        limit=10,
+        parsed_conditions=[ScreenerCondition(5, "stroke", 1, None, "5f向上一笔")],
+    ))
+
+    sql = "\n".join(pool.conn.queries)
+    assert "scheme2_chan_c_published_heads" in sql
+    assert "chan_c_runs" in sql
+    assert "chan_c_strokes" in sql
+    retired_tables = (
+        "chan_" + "level_state_snapshots",
+        "chan_" + "cross_level_states",
+        "scheme2_chan_" + "published_heads",
+        "chan_" + "strokes",
+        "chan_" + "segments",
+        "chan_" + "centers",
+        "chan_" + "signals",
+        "chan_" + "runs",
+    )
+    assert all(table not in sql for table in retired_tables)
+    assert response["items"][0]["states"]["5f"]["structure_state"] is None
+    assert response["items"][0]["states"]["5f"]["is_complete"] is None
+
+
+def test_module_c_marks_derived_structure_state_unsupported() -> None:
+    condition = ScreenerCondition(30, "structure", 1, "trend", "30f趋势上涨")
+
+    response = asyncio.run(query_chan_screener(
+        None,
+        query=condition.raw,
+        limit=10,
+        parsed_conditions=[condition],
+    ))
+
+    assert response["conditions"] == []
+    assert response["unsupported"] == [condition.raw]
+    assert response["items"] == []

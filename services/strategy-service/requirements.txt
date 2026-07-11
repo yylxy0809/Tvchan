@@ -1,0 +1,2 @@
+asyncpg==0.30.0
+pytest==8.3.4

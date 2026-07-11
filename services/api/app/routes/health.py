@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import httpx
 from fastapi import APIRouter, Depends, Request
 
 from app.core.config import Settings, get_settings
 from app.models import HealthResponse
 from app.repositories.bars import utc_now_iso
+from app.repositories.chan_postgres import get_module_c_published_head_coverage_db
 
 router = APIRouter(tags=["health"])
 
@@ -24,21 +24,30 @@ async def health(
             try:
                 async with pool.acquire() as conn:
                     await conn.fetchval("select 1")
-                    has_klines = await conn.fetchval(
-                        "select exists(select 1 from klines limit 1)"
-                    )
+                    try:
+                        sources = await conn.fetch(
+                            """
+                            select distinct source
+                            from scheme2_ingest_watermarks
+                            order by source
+                            """
+                        )
+                    except Exception:
+                        sources = []
                 db_status = "ok"
-                source_labels = ["available"] if has_klines else []
+                source_labels = [_source_label(row["source"]) for row in sources]
             except Exception:
                 db_status = "error"
                 source_labels = []
-    chan_status = await _chan_status(settings)
+    module_c_status = await _module_c_status(
+        getattr(request.app.state, "db_pool", None), settings
+    )
     return HealthResponse(
         status="ok",
         db=db_status,
         redis="not_checked",
         collector="seed" if settings.use_seed_data else "not_checked",
-        chan=chan_status,
+        module_c=module_c_status,
         server_time=utc_now_iso(),
         seed_data=settings.use_seed_data,
         data_source=(
@@ -54,28 +63,26 @@ async def health(
     )
 
 
-def _source_label(value: int) -> str:
+def _source_label(value) -> str:
+    if isinstance(value, str):
+        return value
     return {
         1: "seed",
         2: "pytdx",
         3: "tdx_csv",
         4: "parquet_5f",
+        5: "mootdx",
+        6: "tencent",
+        7: "baidu",
     }.get(value, f"source_{value}")
 
 
-async def _chan_status(settings: Settings) -> str:
-    if not settings.chan_service_url:
-        return "local-fallback"
+async def _module_c_status(pool, settings: Settings) -> dict:
+    if settings.use_seed_data:
+        return {"ready": False, "reason": "seed_data"}
+    if pool is None:
+        return {"ready": False, "reason": "db_pool_not_ready"}
     try:
-        async with httpx.AsyncClient(
-            base_url=settings.chan_service_url.rstrip("/"),
-            timeout=2.0,
-            trust_env=False,
-        ) as client:
-            response = await client.get("/health")
-            response.raise_for_status()
-            body = response.json()
+        return await get_module_c_published_head_coverage_db(pool)
     except Exception:
-        return "error"
-    engine = body.get("engine", "unknown")
-    return f"chan-service:{engine}"
+        return {"ready": False, "reason": "coverage_query_failed"}

@@ -6,6 +6,10 @@ ENV PYTHONPATH=/app/libs/protocol/python:/app/services/api
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY services/api/requirements.txt /tmp/api-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/api-requirements.txt
 

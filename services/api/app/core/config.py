@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 
 
@@ -24,7 +24,6 @@ class Settings:
         "postgresql://trader:change-me-before-long-running@127.0.0.1:5432/tradingview_local",
     )
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    chan_service_url: str = field(default_factory=lambda: os.getenv("CHAN_SERVICE_URL", ""))
     use_seed_data: bool = os.getenv("USE_SEED_DATA", "true").lower() in {
         "1",
         "true",
@@ -47,6 +46,17 @@ class Settings:
         "yes",
         "on",
     }
+    wencai_cookie: str = os.getenv("WENCAI_COOKIE", "")
+    iwencai_base_url: str = os.getenv("IWENCAI_BASE_URL", "https://openapi.iwencai.com")
+    iwencai_api_key: str = os.getenv("IWENCAI_API_KEY", "")
+    wencai_user_agent: str = os.getenv("WENCAI_USER_AGENT", "")
+    wencai_pro: bool = os.getenv("WENCAI_PRO", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    wencai_timeout_seconds: float = float(os.getenv("WENCAI_TIMEOUT_SECONDS", "20"))
 
 
 @lru_cache

@@ -1,0 +1,20 @@
+{
+  "strategy_contract_version": "weekly_daily_b2_official_v1.0",
+  "official": {
+    "entry": {
+      "require_30f_b1": true,
+      "accepted_30f_types": ["1"],
+      "confidence_threshold": 70
+    },
+    "confidence": {
+      "30F_B1": 40,
+      "DAILY_BOTTOM_FRACTAL": 30,
+      "5F_B2_CONFIRM_30F_B1": 30
+    }
+  },
+  "candidate": {
+    "candidate_policy_id": "candidate_30f_1p_research_only",
+    "accepted_30f_types": ["1", "1p"],
+    "research_only": true
+  }
+}

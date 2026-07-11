@@ -47,7 +47,7 @@ def test_chart_ws_request_response_protocol(monkeypatch) -> None:
         snapshot_version="snapshot-test",
         base_timeframe="5f",
         base_ts_semantics="bar_end",
-        engine="chan-service:chan.py",
+        engine="database:chan-module-c-windowed",
         requested_bar_count=20,
         bars_by_level={"5f": 20, "30f": 20, "1d": 20},
         strokes=[],
@@ -106,7 +106,7 @@ def test_chart_ws_request_response_protocol(monkeypatch) -> None:
             range=ChartWindowRangeResponse(from_time=None, to_time=None, limit=20),
             analysis_levels=["5f", "30f", "1d"],
             bars=bars,
-            chan=ChartBundleChanResponse(engine="chan-service:chan.py", levels=levels),
+            chan=ChartBundleChanResponse(engine="database:chan-module-c-windowed", levels=levels),
             source_watermarks=ChartBundleSourceWatermarksResponse(
                 canonical_5f_last_complete_end=1_780_000_000,
                 canonical_5f_last_seen_end=1_780_000_000,
@@ -150,6 +150,8 @@ def test_chart_ws_request_response_protocol(monkeypatch) -> None:
                 "symbol": "000001.SZ",
                 "timeframe": "5f",
                 "limit": 20,
+                "from": 1_780_000_000,
+                "to": 1_780_001_200,
                 "levels": ["5f", "30f", "1d"],
                 "modes": ["confirmed", "predictive"],
             }
@@ -211,7 +213,7 @@ def test_chart_ws_subscribe_chan_emits_snapshot_and_delta(monkeypatch) -> None:
             snapshot_version=snapshot_version,
             base_timeframe="5f",
             base_ts_semantics="bar_end",
-            engine="chan-service:chan.py",
+            engine="database:chan-module-c-windowed",
             requested_bar_count=20,
             bars_by_level={"5f": 20, "30f": 20, "1d": 20},
             strokes=[],
@@ -231,29 +233,30 @@ def test_chart_ws_subscribe_chan_emits_snapshot_and_delta(monkeypatch) -> None:
                 "symbol": "000001.SZ",
                 "timeframe": "5f",
                 "limit": 20,
+                "from": 1_780_000_000,
+                "to": 1_780_001_200,
                 "levels": ["5f", "30f", "1d"],
                 "modes": ["confirmed", "predictive"],
             }
         )
         subscribed = ws.receive_json()
-        assert subscribed == {
-            "type": "chan_subscribed",
-            "id": "chan_sub_1",
-            "symbol": "000001.SZ",
-            "timeframe": "5f",
-        }
+        assert subscribed["type"] == "chan_subscribed"
+        assert subscribed["chart_timeframe"] == "5f"
+        assert subscribed["levels"] == ["5f", "30f", "1d"]
 
         first = ws.receive_json()
-        assert first["type"] == "chan_snapshot"
+        assert first["type"] == "chan_overlay"
+        assert first["kind"] == "snapshot"
         assert first["id"] == "chan_sub_1"
         assert first["snapshot_version"] == "snapshot-1"
-        assert first["chan"]["snapshot_version"] == "snapshot-1"
+        assert first["range"] == {"from": 1_780_000_000, "to": 1_780_001_200}
 
         second = ws.receive_json()
-        assert second["type"] == "chan_delta"
+        assert second["type"] == "chan_overlay"
+        # A version-only change is a bounded snapshot, not a fake empty delta.
+        assert second["kind"] == "snapshot"
         assert second["id"] == "chan_sub_1"
         assert second["snapshot_version"] == "snapshot-2"
-        assert second["chan"]["snapshot_version"] == "snapshot-2"
 
         ws.send_json({"type": "unsubscribe_chan", "id": "chan_sub_1"})
         assert ws.receive_json() == {"type": "chan_unsubscribed", "id": "chan_sub_1"}
@@ -392,6 +395,11 @@ def test_realtime_sends_redis_pubsub_update() -> None:
         }
 
         await realtime._send_redis_updates(websocket, subscriptions, client)
+        expected_version = realtime._bar_snapshot_version(
+            "000001.SZ",
+            "5f",
+            {"time": 1, "close": 10.5},
+        )
 
         assert websocket.messages == [
             {
@@ -399,7 +407,7 @@ def test_realtime_sends_redis_pubsub_update() -> None:
                 "seq": 1,
                 "symbol": "000001.SZ",
                 "timeframe": "5f",
-                "snapshot_version": "rt:000001.SZ:5f:000000000001:000000:0",
+                "snapshot_version": expected_version,
                 "bar": {"time": 1, "close": 10.5},
                 "source": "redis",
             }
@@ -428,3 +436,18 @@ def test_bar_snapshot_version_is_monotonic_for_same_symbol_and_timeframe() -> No
         {"time": 2, "revision": 0, "complete": True},
     )
     assert first < second < third
+
+
+def test_bar_snapshot_version_changes_for_ohlcv_revision() -> None:
+    first = realtime._bar_snapshot_version(
+        "000001.SZ",
+        "5f",
+        {"time": 1, "open": 10, "high": 10.5, "low": 9.9, "close": 10.2, "volume": 100},
+    )
+    second = realtime._bar_snapshot_version(
+        "000001.SZ",
+        "5f",
+        {"time": 1, "open": 10, "high": 10.6, "low": 9.9, "close": 10.2, "volume": 100},
+    )
+
+    assert first != second

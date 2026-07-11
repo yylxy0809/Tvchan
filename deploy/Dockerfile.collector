@@ -12,9 +12,8 @@ RUN pip install --no-cache-dir -r /tmp/collector-requirements.txt -r /tmp/api-re
 
 COPY libs/protocol/python /app/libs/protocol/python
 COPY services/api /app/services/api
-COPY services/chan-service/chan_service/vendor_chan_adapter.py /app/services/chan-service/chan_service/vendor_chan_adapter.py
 COPY services/collector /app/services/collector
 
 WORKDIR /app/services/collector
 
-CMD ["python", "-m", "collector.market_fill"]
+CMD ["python", "-m", "collector.worker", "chan-c-stream"]

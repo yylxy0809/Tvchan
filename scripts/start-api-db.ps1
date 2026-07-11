@@ -16,9 +16,6 @@ if (-not $env:DATABASE_URL) {
 }
 $env:REDIS_URL = $RedisUrl
 $env:API_TOKEN = "dev-local-token"
-if (-not $env:CHAN_SERVICE_URL) {
-    $env:CHAN_SERVICE_URL = "http://127.0.0.1:8002"
-}
 $env:PYTHONPATH = $ProtocolDir
 
 Set-Location $ApiDir

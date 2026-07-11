@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from collector.storage.postgres import amount_to_x100, price_to_x1000
-from trading_protocol import Bar, SymbolInfo
+from collector.storage.postgres import amount_to_x100, price_to_x1000, source_priority_case
+from trading_protocol import Bar, SymbolInfo, canonical_kline_timestamp
 
 PARQUET_5F_SOURCE = "parquet_5f"
 PARQUET_5F_SOURCE_CODE = 4
@@ -273,6 +273,7 @@ class PostgresScheme2KlineWriter:
                         "source",
                     ],
                 )
+                await _register_source_coverage_from_stage(conn)
                 await _upsert_klines_from_stage(conn)
                 await _upsert_watermarks_from_stage(conn)
         return len(bar_rows)
@@ -298,7 +299,7 @@ def _bar_rows(bars: Iterable[Bar]) -> list[tuple]:
         code, exchange = _split_symbol(bar.symbol)
         # The parquet source column is named trade_time. Scheme 2 stores it as the
         # canonical 5f bar_end in klines.ts without adding 5 minutes or shifting TZ.
-        bar_end = bar.ts
+        bar_end = canonical_kline_timestamp("5f", bar.ts)
         rows.append(
             (
                 code,
@@ -386,7 +387,7 @@ async def _create_kline_stage(conn) -> None:
 
 async def _upsert_klines_from_stage(conn) -> None:
     await conn.execute(
-        """
+        f"""
         with staged_rows as (
             select distinct on (symbols.id, stage.timeframe, stage.bar_end)
                 symbols.id as symbol_id,
@@ -446,6 +447,14 @@ async def _upsert_klines_from_stage(conn) -> None:
             revision = excluded.revision,
             source = excluded.source,
             updated_at = now()
+        where ({source_priority_case('excluded.source')}) > ({source_priority_case('klines.source')})
+           or (
+                ({source_priority_case('excluded.source')}) = ({source_priority_case('klines.source')})
+                and (
+                    excluded.revision > klines.revision
+                    or (excluded.is_complete and not klines.is_complete)
+                )
+           )
         """
     )
 
@@ -481,4 +490,19 @@ async def _upsert_watermarks_from_stage(conn) -> None:
             updated_at = now()
         """,
         PARQUET_5F_SOURCE,
+    )
+
+
+async def _register_source_coverage_from_stage(conn) -> None:
+    await conn.execute(
+        """
+        insert into kline_source_coverage (symbol_id, timeframe, source, covered_until)
+        select symbols.id, stage.timeframe, 4, max(stage.bar_end)
+        from _scheme2_kline_stage stage
+        join symbols on symbols.code = stage.code and symbols.exchange = stage.exchange
+        group by symbols.id, stage.timeframe
+        on conflict (symbol_id, timeframe, source) do update
+        set covered_until = greatest(kline_source_coverage.covered_until, excluded.covered_until),
+            updated_at = now()
+        """
     )

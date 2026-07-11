@@ -13,8 +13,6 @@ param(
     [switch]$Reset,
     [switch]$ResetRunning,
     [switch]$DryRun,
-    [switch]$RecomputeChanOnSuccess,
-    [string]$ChanServiceUrl = "http://127.0.0.1:8002",
     [string]$TdxHost = "",
     [int]$TdxPort = 7709,
     [int]$TdxTimeout = 10,
@@ -31,7 +29,6 @@ $ApiDir = Join-Path $Root "services/api"
 
 $env:PYTHONPATH = "$CollectorDir;$ProtocolDir;$ApiDir"
 $env:DATABASE_URL = $DatabaseUrl
-$env:CHAN_SERVICE_URL = $ChanServiceUrl
 
 $ArgsList = @(
     "-m", "collector.history_backfill",
@@ -43,7 +40,6 @@ $ArgsList = @(
     "--concurrency", $Concurrency,
     "--max-pages-per-task", $MaxPagesPerTask,
     "--sleep", $Sleep,
-    "--chan-service-url", $ChanServiceUrl,
     "--tdx-port", $TdxPort,
     "--tdx-timeout", $TdxTimeout,
     "--tdx-retries", $TdxRetries,
@@ -67,9 +63,6 @@ if ($ResetRunning) {
 }
 if ($DryRun) {
     $ArgsList += "--dry-run"
-}
-if ($RecomputeChanOnSuccess) {
-    $ArgsList += "--recompute-chan-on-success"
 }
 
 Set-Location $CollectorDir

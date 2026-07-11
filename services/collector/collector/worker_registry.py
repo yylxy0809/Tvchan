@@ -20,15 +20,25 @@ _WORKERS: dict[str, WorkerSpec] = {
         module="collector.market_fill",
         description="Realtime and nearline market K-line fill worker.",
     ),
+    "symbol-master-refresh": WorkerSpec(
+        name="symbol-master-refresh",
+        module="collector.symbol_master",
+        description="Refresh tradable A-share symbol master from provider discovery.",
+    ),
     "history-backfill": WorkerSpec(
         name="history-backfill",
         module="collector.history_backfill",
         description="Recoverable historical K-line backfill worker.",
     ),
-    "chan-recompute": WorkerSpec(
-        name="chan-recompute",
-        module="collector.chan_recompute",
-        description="Queued full-history Chan recompute worker.",
+    "chan-module-c-recompute": WorkerSpec(
+        name="chan-module-c-recompute",
+        module="collector.chan_module_c_recompute",
+        description="Module C native-timeframe full-history Chan recompute worker.",
+    ),
+    "chan-c-stream": WorkerSpec(
+        name="chan-c-stream",
+        module="collector.chan_c_stream",
+        description="Module C native-timeframe streaming Chan tail worker.",
     ),
     "tdx-csv-import": WorkerSpec(
         name="tdx-csv-import",

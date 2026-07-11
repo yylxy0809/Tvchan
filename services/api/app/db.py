@@ -20,11 +20,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "asyncpg is required when USE_SEED_DATA=false. "
                 "Install services/api/requirements.txt."
             ) from exc
-        app.state.db_pool = await asyncpg.create_pool(settings.database_url)
+        # Chart reads are coalesced by the frontend managers. One lazy reader
+        # avoids compiling the same hypertable query independently on idle
+        # connections; the local deployment favours predictable latency and
+        # low resource use over parallel chart reads.
+        app.state.db_pool = await asyncpg.create_pool(
+            settings.database_url,
+            min_size=1,
+            max_size=1,
+        )
     try:
         yield
     finally:
         pool = getattr(app.state, "db_pool", None)
         if pool is not None:
             await pool.close()
-

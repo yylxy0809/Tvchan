@@ -40,7 +40,6 @@ $Dirs = @(
     "apps\web\dist",
     "libs\protocol\python",
     "services\api",
-    "services\chan-service",
     "services\collector"
 )
 
@@ -51,14 +50,19 @@ foreach ($Dir in $Dirs) {
     Copy-Item -LiteralPath $Source -Destination $Target -Recurse -Force
 }
 
-$DefaultNasEnvSource = Join-Path $StageRoot "deploy\backend.env.nas"
-if (-not (Test-Path $DefaultNasEnvSource)) {
-    throw "Missing NAS env template: $DefaultNasEnvSource"
+$StageDeploy = Join-Path $StageRoot "deploy"
+Get-ChildItem -LiteralPath $StageDeploy -File -Force |
+    Where-Object {
+        ($_.Name -like "*.env" -or $_.Name -like "*.env.*" -or $_.Name -like "backend.env*") -and
+        ($_.Name -notlike "*.example")
+    } |
+    Remove-Item -Force
+
+$EnvTemplateSource = Join-Path $StageDeploy "backend.env.example"
+if (-not (Test-Path $EnvTemplateSource)) {
+    throw "Missing env template: $EnvTemplateSource"
 }
-$LocalNasEnvSource = Join-Path $RepoRoot "work\deploy\backend.env.nas.local"
-$NasEnvSource = if (Test-Path $LocalNasEnvSource) { $LocalNasEnvSource } else { $DefaultNasEnvSource }
-Copy-Item -LiteralPath $NasEnvSource -Destination (Join-Path $StageRoot "deploy\.env") -Force
-Copy-Item -LiteralPath $NasEnvSource -Destination (Join-Path $StageRoot "deploy\backend.env") -Force
+Copy-Item -LiteralPath $EnvTemplateSource -Destination (Join-Path $StageDeploy "backend.env.template") -Force
 
 if ($IncludeChan) {
     $ChanSource = Join-Path $RepoRoot "work\vendor\chan.py-main"
@@ -80,14 +84,14 @@ Set-Content -LiteralPath $TdxReadme -Encoding UTF8 -Value @(
     "Copy downloaded TDX zip folders here before enabling the tdx-csv-import profile.",
     "Expected subfolders are the original TDX Chinese K-line folders, such as the 5-minute, 15-minute, 30-minute, and 60-minute zip folders.",
     "",
-    "For Chan recompute, 5f bars are the base input. 30f and 1d Chan levels are recursively derived from 5f."
+    "Module C Chan workers consume native-timeframe bars."
 )
 
 $NasReadme = Join-Path $StageRoot "NAS-README.txt"
 Set-Content -LiteralPath $NasReadme -Encoding UTF8 -Value @(
     "TradingView A-share backend NAS package",
     "",
-    "1. Review deploy/.env or deploy/backend.env and adjust POSTGRES_PASSWORD, API_TOKEN, ADMIN_API_TOKEN, CORS_ORIGINS, and host paths if needed.",
+    "1. Copy deploy/backend.env.template to deploy/backend.env on the NAS and fill POSTGRES_PASSWORD, API_TOKEN, ADMIN_API_TOKEN, CORS_ORIGINS, and host paths.",
     "2. Put TDX history zips under work/tdx-csv or point TDX_CSV_HOST_ROOT at another NAS path.",
     "3. Start core services:",
     "   docker compose --env-file deploy/backend.env -f deploy/docker-compose.backend.yml up -d --build",
@@ -95,8 +99,6 @@ Set-Content -LiteralPath $NasReadme -Encoding UTF8 -Value @(
     "   http://<NAS-IP>:8080",
     "5. Put CLOUDFLARED_TOKEN into deploy/backend.env, then start the Cloudflare Tunnel:",
     "   docker compose --env-file deploy/backend.env -f deploy/docker-compose.backend.yml --profile tunnel up -d",
-    "6. Start workers:",
-    "   docker compose --env-file deploy/backend.env -f deploy/docker-compose.backend.yml --profile market-fill --profile history --profile chan-recompute --profile tdx-csv-import up -d --build",
     "",
     "Same-origin local website: http://<NAS-IP>:8080",
     "API endpoint for frontend devices: http://<NAS-IP>:8001"

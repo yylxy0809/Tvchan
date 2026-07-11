@@ -42,11 +42,11 @@ async def get_chart_window(
     request: Request,
     symbol: str = Query(..., min_length=6, max_length=16),
     timeframe: str = Query(default="5f"),
-    levels: str = Query(default="5f,30f,1d"),
+    levels: str = Query(default=""),
     modes: str = Query(default="confirmed,predictive"),
     from_ts: datetime | None = Query(default=None, alias="from"),
     to_ts: datetime | None = Query(default=None, alias="to"),
-    limit: int = Query(default=300, ge=1),
+    limit: int = Query(default=300, ge=1, le=5000),
     settings: Settings = Depends(get_settings),
 ) -> ChartWindowResponse:
     return await build_chart_window(
@@ -92,6 +92,8 @@ async def get_chart_bundle_v3(
     request: Request,
     symbol: str = Query(..., min_length=6, max_length=16),
     timeframe: str = Query(default="5f"),
+    levels: str = Query(default="5f,30f,1d"),
+    modes: str = Query(default="confirmed,predictive"),
     from_ts: datetime | None = Query(default=None, alias="from"),
     to_ts: datetime | None = Query(default=None, alias="to"),
     limit: int = Query(default=300, ge=1),
@@ -101,10 +103,60 @@ async def get_chart_bundle_v3(
         request=request,
         symbol=symbol,
         timeframe=timeframe,
+        levels=levels,
+        modes=modes,
         from_ts=from_ts,
         to_ts=to_ts,
         limit=limit,
         settings=settings,
+    )
+
+
+@v3_router.get("/bars", response_model=BarsResponse)
+async def get_chart_bars_v3(
+    request: Request,
+    symbol: str = Query(..., min_length=6, max_length=16),
+    timeframe: str = Query(default="5f"),
+    from_ts: datetime | None = Query(default=None, alias="from"),
+    to_ts: datetime | None = Query(default=None, alias="to"),
+    limit: int = Query(default=300, ge=1, le=5000),
+    settings: Settings = Depends(get_settings),
+) -> BarsResponse:
+    return await build_bars_response(
+        request=request,
+        symbol=symbol,
+        timeframe=timeframe,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        limit=limit,
+        settings=settings,
+        end_exclusive=True,
+    )
+
+
+@v3_router.get("/overlay", response_model=ChanOverlayResponse)
+async def get_chart_overlay_v3(
+    request: Request,
+    symbol: str = Query(..., min_length=6, max_length=16),
+    timeframe: str = Query(default="5f"),
+    levels: str = Query(default=""),
+    modes: str = Query(default="confirmed,predictive"),
+    from_ts: datetime | None = Query(default=None, alias="from"),
+    to_ts: datetime | None = Query(default=None, alias="to"),
+    limit: int = Query(default=300, ge=1, le=5000),
+    settings: Settings = Depends(get_settings),
+) -> ChanOverlayResponse:
+    return await build_chan_overlay(
+        request=request,
+        symbol=symbol,
+        timeframe=timeframe,
+        levels=levels,
+        modes=modes,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        limit=limit,
+        settings=settings,
+        authoritative_window=True,
     )
 
 
@@ -154,6 +206,7 @@ async def build_chart_bundle(
         to_ts=to_ts,
         limit=limit,
         settings=settings,
+        legacy_bundle=True,
     )
     return ChartBundleResponse(schema_version="chart-bundle.v2", **payload)
 
@@ -162,6 +215,8 @@ async def build_chart_bundle_v3(
     request: Request,
     symbol: str,
     timeframe: str,
+    levels: str,
+    modes: str,
     from_ts: datetime | None,
     to_ts: datetime | None,
     limit: int,
@@ -171,31 +226,28 @@ async def build_chart_bundle_v3(
         request=request,
         symbol=symbol,
         timeframe=timeframe,
-        levels=",".join(DEFAULT_ANALYSIS_LEVELS),
-        modes=",".join(DEFAULT_CHAN_MODES),
+        levels=levels,
+        modes=modes,
         from_ts=from_ts,
         to_ts=to_ts,
         limit=limit,
         settings=settings,
+        legacy_bundle=True,
     )
     view_bars = payload["bars"]
     chan = payload["chan"]
     chart_timeframe = str(payload["chart_timeframe"])
     if not isinstance(chan, ChanOverlayResponse):
         raise TypeError("chart payload chan must be a ChanOverlayResponse")
-    if chart_timeframe == "5f":
-        canonical_5f_bars = view_bars
-    else:
-        canonical_5f = await build_bars_response(
-            request=request,
-            symbol=str(payload["symbol"]),
-            timeframe="5f",
-            from_ts=from_ts,
-            to_ts=to_ts,
-            limit=limit,
-            settings=settings,
-        )
-        canonical_5f_bars = canonical_5f.bars
+    canonical_5f_bars = (await build_bars_response(
+        request=request,
+        symbol=str(payload["symbol"]),
+        timeframe="5f",
+        from_ts=from_ts,
+        to_ts=to_ts,
+        limit=limit,
+        settings=settings,
+    )).bars
 
     return ChartBundleV3Response(
         schema_version="chart-bundle.v3",
@@ -206,7 +258,7 @@ async def build_chart_bundle_v3(
         base_timeframe=chan.base_timeframe,
         bar_time_semantics=chan.base_ts_semantics,
         range=payload["range"],
-        analysis_levels=list(DEFAULT_ANALYSIS_LEVELS),
+        analysis_levels=list(chan.levels),
         bars=view_bars,
         chan=_group_chan_by_level(chan, view_bars),
         source_watermarks=_source_watermarks(
@@ -231,6 +283,7 @@ async def _build_chart_payload(
     to_ts: datetime | None,
     limit: int,
     settings: Settings,
+    legacy_bundle: bool = False,
 ) -> dict[str, object]:
     bars = await build_bars_response(
         request=request,
@@ -251,6 +304,7 @@ async def _build_chart_payload(
         to_ts=to_ts,
         limit=limit,
         settings=settings,
+        legacy_bundle=legacy_bundle,
     )
     return {
         "snapshot_id": _snapshot_id(bars, chan.engine, chan.snapshot_version),
@@ -272,7 +326,7 @@ def _group_chan_by_level(
 ) -> ChartBundleChanResponse:
     range_start, range_end = _chan_view_range(view_bars or [])
     grouped = {}
-    for level in DEFAULT_ANALYSIS_LEVELS:
+    for level in chan.levels:
         strokes = [item for item in chan.strokes if item.level == level]
         segments = [item for item in chan.segments if item.level == level]
         centers = [item for item in chan.centers if item.level == level]
@@ -375,8 +429,6 @@ def _last_complete_bar_end(bars: list[BarResponse]) -> int | None:
 def _analysis_source(engine: str) -> str:
     if engine.startswith("database:"):
         return "precomputed"
-    if engine.startswith("chan-service:"):
-        return "service"
     return "fallback"
 
 
@@ -416,6 +468,7 @@ async def build_bars_response(
     to_ts: datetime | None,
     limit: int,
     settings: Settings,
+    end_exclusive: bool = False,
 ) -> BarsResponse:
     try:
         normalized_timeframe = normalize_timeframe(timeframe)
@@ -428,7 +481,11 @@ async def build_bars_response(
             raise HTTPException(status_code=503, detail="Database pool is not ready")
         symbol_row = await resolve_symbol_db(pool, symbol)
         if symbol_row is None:
-            raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
+            return BarsResponse(
+                symbol=symbol.upper(),
+                timeframe=normalized_timeframe,
+                bars=[],
+            )
         bars = await get_bars_db(
             pool,
             symbol_row["symbol"],
@@ -436,6 +493,7 @@ async def build_bars_response(
             from_ts,
             to_ts,
             limit,
+            end_exclusive=end_exclusive,
         )
         return BarsResponse(
             symbol=symbol_row["symbol"],
@@ -454,6 +512,8 @@ async def build_bars_response(
         end=to_ts,
         limit=limit,
     )
+    if end_exclusive and to_ts is not None:
+        bars = [bar for bar in bars if bar.time < int(to_ts.timestamp())]
     return BarsResponse(
         symbol=symbol_info.symbol,
         timeframe=normalized_timeframe,

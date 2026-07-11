@@ -13,6 +13,7 @@ services:
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - ${POSTGRES_DATA_HOST_PATH:-tv_backend_pgdata}:/var/lib/postgresql/data
+      - ${POSTGRES_CHAN_C_TABLESPACE_HOST_PATH:-G:/tv-a-share-db/postgres-tablespaces}:/var/lib/postgresql/tablespaces_g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-tradingview_local}"]
       interval: 10s
@@ -67,27 +68,6 @@ services:
         done
     restart: "no"
 
-  chan-service:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.chan-service
-    container_name: tv_backend_chan_service
-    environment:
-      CHAN_ENGINE_MODE: ${CHAN_ENGINE_MODE:-module_b}
-      CHAN_PY_PATH: /opt/vendor/chan.py-main
-      CHAN_PY_RECURSION_LIMIT: ${CHAN_PY_RECURSION_LIMIT:-200000}
-    volumes:
-      - ${CHAN_PY_HOST_PATH:-../work/vendor/chan.py-main}:/opt/vendor/chan.py-main:ro
-    ports:
-      - "${CHAN_SERVICE_BIND:-127.0.0.1}:${CHAN_SERVICE_PORT:-8002}:8002"
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=5).read()\""]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-    restart: unless-stopped
-
   api:
     build:
       context: ..
@@ -100,8 +80,6 @@ services:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
-      chan-service:
-        condition: service_healthy
     environment:
       APP_ENV: ${APP_ENV:-production}
       API_TOKEN: ${API_TOKEN:-dev-local-token}
@@ -112,12 +90,15 @@ services:
       USE_SEED_DATA: "false"
       DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@timescaledb:5432/${POSTGRES_DB:-tradingview_local}
       REDIS_URL: redis://redis:6379/0
-      CHAN_SERVICE_URL: http://chan-service:8002
       LLM_ENABLED: ${LLM_ENABLED:-true}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.siliconflow.cn/v1}
       LLM_MODEL: ${LLM_MODEL:-deepseek-ai/DeepSeek-V3.2}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-20}
+      WENCAI_COOKIE: ${WENCAI_COOKIE:-}
+      WENCAI_USER_AGENT: ${WENCAI_USER_AGENT:-}
+      WENCAI_PRO: ${WENCAI_PRO:-false}
+      WENCAI_TIMEOUT_SECONDS: ${WENCAI_TIMEOUT_SECONDS:-20}
     ports:
       - "${API_BIND:-0.0.0.0}:${API_PORT:-8001}:8001"
     healthcheck:
@@ -161,7 +142,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.collector
     container_name: tv_backend_market_fill_worker
-    profiles: ["workers", "market-fill"]
+    profiles: ["manual-market-fill"]
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -169,17 +150,13 @@ services:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
-      chan-service:
-        condition: service_healthy
     environment: &collector_env
       DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@timescaledb:5432/${POSTGRES_DB:-tradingview_local}
       REDIS_URL: redis://redis:6379/0
-      CHAN_SERVICE_URL: http://chan-service:8002
       TDX_HOST: ${TDX_HOST:-}
       TDX_PORT: ${TDX_PORT:-7709}
       TDX_TIMEOUT: ${TDX_TIMEOUT:-10}
       TDX_RETRIES: ${TDX_RETRIES:-3}
-      CHAN_ANALYZE_TIMEOUT: ${CHAN_ANALYZE_TIMEOUT:-180}
       MARKET_FILL_PROVIDER: ${MARKET_FILL_PROVIDER:-pytdx}
       MARKET_FILL_SYMBOL_LIMIT: ${MARKET_FILL_SYMBOL_LIMIT:-10}
       MARKET_FILL_TIMEFRAMES: ${MARKET_FILL_TIMEFRAMES:-5f,15f,30f,1h,1d,1w,1m}
@@ -187,8 +164,6 @@ services:
       MARKET_FILL_SLEEP: ${MARKET_FILL_SLEEP:-0.25}
       MARKET_FILL_LOOP: ${MARKET_FILL_LOOP:-1}
       MARKET_FILL_LOOP_INTERVAL: ${MARKET_FILL_LOOP_INTERVAL:-60}
-      MARKET_FILL_CHAN_LEVELS: ${MARKET_FILL_CHAN_LEVELS:-5f,30f,1d}
-      MARKET_FILL_MODES: ${MARKET_FILL_MODES:-confirmed,predictive}
     command: ["python", "-m", "collector.worker", "market-fill"]
     restart: unless-stopped
 
@@ -197,14 +172,12 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.collector
     container_name: tv_backend_history_backfill_worker
-    profiles: ["history"]
+    profiles: ["batch-history"]
     depends_on:
       timescaledb:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
-      chan-service:
-        condition: service_healthy
     environment:
       <<: *collector_env
       HISTORY_BACKFILL_PROVIDER: ${HISTORY_BACKFILL_PROVIDER:-pytdx}
@@ -220,34 +193,35 @@ services:
     command: ["python", "-m", "collector.worker", "history-backfill"]
     restart: unless-stopped
 
-  chan-recompute-worker:
+  chan-c-stream-worker:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.collector
-    container_name: tv_backend_chan_recompute_worker
-    profiles: ["chan-recompute"]
+    profiles: ["workers", "realtime-pipeline", "realtime-chan-c"]
     depends_on:
       timescaledb:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
-      chan-service:
-        condition: service_healthy
     environment:
       <<: *collector_env
-      CHAN_RECOMPUTE_SYMBOL_LIMIT: ${CHAN_RECOMPUTE_SYMBOL_LIMIT:-10}
-      CHAN_RECOMPUTE_BASE_TIMEFRAME: ${CHAN_RECOMPUTE_BASE_TIMEFRAME:-5f}
-      CHAN_RECOMPUTE_LEVELS: ${CHAN_RECOMPUTE_LEVELS:-5f,30f,1d}
-      CHAN_RECOMPUTE_MODES: ${CHAN_RECOMPUTE_MODES:-confirmed,predictive}
-      CHAN_RECOMPUTE_TASK_LIMIT: ${CHAN_RECOMPUTE_TASK_LIMIT:-3}
-      CHAN_RECOMPUTE_CONCURRENCY: ${CHAN_RECOMPUTE_CONCURRENCY:-1}
-      CHAN_RECOMPUTE_LOOP: ${CHAN_RECOMPUTE_LOOP:-1}
-      CHAN_RECOMPUTE_LOOP_INTERVAL: ${CHAN_RECOMPUTE_LOOP_INTERVAL:-60}
-      CHAN_RECOMPUTE_RESET_RUNNING: ${CHAN_RECOMPUTE_RESET_RUNNING:-1}
+      CHAN_C_STREAM_LEVELS: ${CHAN_C_STREAM_LEVELS:-5f,30f,1d,1w,1m}
+      CHAN_C_STREAM_MODES: ${CHAN_C_STREAM_MODES:-confirmed,predictive}
+      CHAN_C_STREAM_TASK_LIMIT: ${CHAN_C_STREAM_TASK_LIMIT:-100}
+      CHAN_C_STREAM_DISCOVERY_LIMIT: ${CHAN_C_STREAM_DISCOVERY_LIMIT:-500}
+      CHAN_C_STREAM_CONCURRENCY: ${CHAN_C_STREAM_CONCURRENCY:-1}
+      CHAN_C_STREAM_DB_POOL_MAX_SIZE: ${CHAN_C_STREAM_DB_POOL_MAX_SIZE:-2}
+      CHAN_C_STREAM_TAIL_BAR_LIMIT: ${CHAN_C_STREAM_TAIL_BAR_LIMIT:-2000}
+      CHAN_C_STREAM_CONTEXT_BARS: ${CHAN_C_STREAM_CONTEXT_BARS:-64}
+      CHAN_C_STREAM_LEASE_SECONDS: ${CHAN_C_STREAM_LEASE_SECONDS:-600}
+      CHAN_C_STREAM_LOOP: "1"
+      CHAN_C_STREAM_LOOP_INTERVAL: ${CHAN_C_STREAM_LOOP_INTERVAL:-5}
       CHAN_PY_PATH: /opt/vendor/chan.py-main
     volumes:
       - ${CHAN_PY_HOST_PATH:-../work/vendor/chan.py-main}:/opt/vendor/chan.py-main:ro
-    command: ["python", "-m", "collector.worker", "chan-recompute"]
+    command: ["python", "-m", "collector.worker", "chan-c-stream"]
     restart: unless-stopped
 
   tdx-csv-import-worker:
@@ -255,7 +229,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.collector
     container_name: tv_backend_tdx_csv_import_worker
-    profiles: ["tdx-csv-import"]
+    profiles: ["batch-tdx-csv-import"]
     depends_on:
       timescaledb:
         condition: service_healthy

@@ -11,7 +11,7 @@ class HealthResponse(BaseModel):
     db: str
     redis: str
     collector: str
-    chan: str
+    module_c: dict[str, Any] = Field(default_factory=dict)
     server_time: str
     seed_data: bool
     data_source: str = "seed"
@@ -57,6 +57,7 @@ class ChanPointResponse(BaseModel):
 
 class ChanStrokeResponse(BaseModel):
     id: str
+    seq: int | None = None
     level: str
     mode: str
     start: ChanPointResponse
@@ -71,6 +72,7 @@ class ChanStrokeResponse(BaseModel):
 
 class ChanCenterResponse(BaseModel):
     id: str
+    seq: int | None = None
     level: str
     mode: str
     start_time: int
@@ -86,6 +88,7 @@ class ChanCenterResponse(BaseModel):
 
 class ChanSignalResponse(BaseModel):
     id: str
+    seq: int | None = None
     level: str
     mode: str
     time: int
@@ -252,6 +255,55 @@ class RuntimeConfigUpdateRequest(BaseModel):
     value: Any
 
 
+class WencaiConfigResponse(BaseModel):
+    base_url: str = "https://openapi.iwencai.com"
+    api_key: str = ""
+    cookie: str = ""
+    user_agent: str | None = None
+    pro: bool = False
+    timeout_seconds: float = 20
+
+
+class WencaiConfigUpdateRequest(BaseModel):
+    base_url: str | None = None
+    api_key: str | None = None
+    cookie: str | None = None
+    user_agent: str | None = None
+    pro: bool = False
+    timeout_seconds: float = 20
+
+
+class ConnectivityTestResponse(BaseModel):
+    ok: bool
+    latency_ms: int
+    message: str
+    sample_count: int = 0
+
+
+class LlmProviderResponse(BaseModel):
+    id: str
+    name: str
+    base_url: str
+    api_key: str = ""
+    models: list[str] = Field(default_factory=list)
+    active_model: str = ""
+    enabled: bool = True
+    timeout_seconds: float = 20
+
+
+class LlmProvidersResponse(BaseModel):
+    active_provider_id: str | None = None
+    providers: list[LlmProviderResponse] = Field(default_factory=list)
+
+
+class LlmProviderTestResponse(BaseModel):
+    ok: bool
+    latency_ms: int
+    provider: str
+    model: str
+    message: str
+
+
 class UserSettingResponse(BaseModel):
     bucket: str
     value: Any
@@ -319,3 +371,29 @@ class ChanScreenerResponse(BaseModel):
     conditions: list[ChanScreenerConditionResponse]
     unsupported: list[str] = Field(default_factory=list)
     items: list[ChanScreenerItemResponse]
+
+
+class WencaiScreenerItemResponse(BaseModel):
+    symbol: str
+    code: str
+    exchange: str
+    name: str
+    price: float | None = None
+    change_percent: float | None = None
+    buy_signal: str = ""
+    technical_shape: str = ""
+    reason: str = ""
+    high_break_reason: str = ""
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class WencaiScreenerResponse(BaseModel):
+    query: str
+    total: int
+    page: int
+    page_size: int
+    source: str = "wencai"
+    fetched_at: datetime
+    conditions: list[str] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+    items: list[WencaiScreenerItemResponse]

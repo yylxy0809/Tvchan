@@ -1,0 +1,238 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import UTC, datetime
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.core.config import Settings, get_settings
+from app.main import create_app
+
+
+class FakeRuntimeConfigPool:
+    def __init__(self, rows: dict[str, dict] | None = None) -> None:
+        self.rows = rows or {}
+
+    async def fetchrow(self, query: str, *args):
+        normalized = " ".join(query.lower().split())
+        if normalized.startswith("select key, value, version, updated_at from runtime_config"):
+            return self.rows.get(args[0])
+        if normalized.startswith("insert into runtime_config"):
+            key, raw_value = args
+            existing = self.rows.get(key)
+            row = {
+                "key": key,
+                "value": json.loads(raw_value),
+                "version": 1 if existing is None else existing["version"] + 1,
+                "updated_at": datetime.now(UTC),
+            }
+            self.rows[key] = row
+            return row
+        raise AssertionError(f"unexpected fetchrow query: {query}")
+
+
+def _client(settings: Settings, pool: FakeRuntimeConfigPool | None = None) -> TestClient:
+    api_app = create_app()
+    api_app.dependency_overrides[get_settings] = lambda: settings
+    client = TestClient(api_app)
+    if pool is not None:
+        api_app.state.db_pool = pool
+    return client
+
+
+def test_wencai_service_requires_auth_config() -> None:
+    from app.services.wencai_client import WencaiConfig, WencaiConfigError, query_wencai
+
+    with pytest.raises(WencaiConfigError, match="IWENCAI_API_KEY|cookie"):
+        asyncio.run(
+            query_wencai(
+                query="今日涨停",
+                page=1,
+                page_size=50,
+                config=WencaiConfig(cookie=""),
+            )
+        )
+
+
+def test_wencai_service_prefers_openapi_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import wencai_client
+    from app.services.wencai_client import WencaiConfig, query_wencai
+
+    captured: dict[str, object] = {}
+
+    def fake_openapi(**kwargs):
+        captured.update(kwargs)
+        return {
+            "code_count": 3,
+            "datas": [
+                {"股票代码": "600001.SH", "股票简称": "甲公司", "最新价": 10.5, "涨跌幅": 9.99},
+                {"股票代码": "000002.SZ", "股票简称": "乙公司", "最新价": 8.2, "涨跌幅": -1.25},
+            ],
+        }
+
+    monkeypatch.setattr(wencai_client, "_call_iwencai_openapi", fake_openapi)
+
+    result = asyncio.run(
+        query_wencai(
+            query="今日涨停",
+            page=2,
+            page_size=2,
+            config=WencaiConfig(
+                base_url="https://openapi.iwencai.com",
+                api_key="api-key",
+                cookie="cookie=value",
+                timeout_seconds=6,
+            ),
+        )
+    )
+
+    assert captured["query"] == "今日涨停"
+    assert captured["page"] == "2"
+    assert captured["limit"] == "2"
+    assert captured["api_key"] == "api-key"
+    assert result.total == 3
+    assert [item.code for item in result.items] == ["600001", "000002"]
+
+
+def test_wencai_service_calls_live_provider_and_paginates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import wencai_client
+    from app.services.wencai_client import WencaiConfig, query_wencai
+
+    captured: dict[str, object] = {}
+
+    def fake_get(**kwargs):
+        captured.update(kwargs)
+        return [
+            {"股票代码": "600001", "股票简称": "甲公司", "最新价": 10.5, "涨跌幅": 9.99},
+            {"股票代码": "000002", "股票简称": "乙公司", "最新价": 8.2, "涨跌幅": -1.25},
+            {"股票代码": "300003", "股票简称": "丙公司", "最新价": 12, "涨跌幅": 3.5},
+        ]
+
+    monkeypatch.setattr(wencai_client, "_call_pywencai_get", fake_get)
+
+    result = asyncio.run(
+        query_wencai(
+            query="今日涨停",
+            page=2,
+            page_size=2,
+            config=WencaiConfig(cookie="cookie=value", user_agent="ua", pro=True, timeout_seconds=6),
+        )
+    )
+
+    assert captured["query"] == "今日涨停"
+    assert captured["cookie"] == "cookie=value"
+    assert captured["user_agent"] == "ua"
+    assert captured["pro"] is True
+    assert captured["loop"] is True
+    assert captured["perpage"] == 100
+    assert result.total == 3
+    assert [item.code for item in result.items] == ["300003"]
+
+
+def test_wencai_screener_endpoint_reads_config_and_returns_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import wencai_client
+
+    def fake_get(**_kwargs):
+        return [
+            {"股票代码": "600001", "股票简称": "甲公司", "最新价": 10.5, "涨跌幅": 9.99},
+            {"股票代码": "000002", "股票简称": "乙公司", "最新价": 8.2, "涨跌幅": -1.25},
+        ]
+
+    monkeypatch.setattr(wencai_client, "_call_pywencai_get", fake_get)
+    pool = FakeRuntimeConfigPool(
+        {
+            "wencai.config": {
+                "key": "wencai.config",
+                "value": {"cookie": "cookie=value", "timeout_seconds": 5},
+                "version": 1,
+                "updated_at": datetime(2026, 7, 2, tzinfo=UTC),
+            }
+        }
+    )
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"), pool)
+
+    response = client.get(
+        "/api/v1/screener/wencai",
+        params={"q": "今日涨停", "page": 1, "page_size": 50},
+        headers={"Authorization": "Bearer api-token"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["query"] == "今日涨停"
+    assert body["total"] == 2
+    assert body["page"] == 1
+    assert body["page_size"] == 50
+    assert [item["code"] for item in body["items"]] == ["600001", "000002"]
+
+
+def test_wencai_admin_test_uses_submitted_config_without_saving(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import wencai_client
+
+    def fake_openapi(**kwargs):
+        assert kwargs["api_key"] == "fresh-key"
+        return {"code_count": 1, "datas": [{"股票代码": "600001", "股票简称": "甲公司"}]}
+
+    monkeypatch.setattr(wencai_client, "_call_iwencai_openapi", fake_openapi)
+    pool = FakeRuntimeConfigPool()
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"), pool)
+
+    response = client.post(
+        "/api/v1/admin/wencai/test",
+        json={"api_key": "fresh-key", "timeout_seconds": 3},
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["sample_count"] == 1
+    assert "wencai.config" not in pool.rows
+
+
+def test_wencai_admin_config_masks_cookie_and_preserves_existing_secret() -> None:
+    pool = FakeRuntimeConfigPool(
+        {
+            "wencai.config": {
+                "key": "wencai.config",
+                "value": {
+                    "base_url": "https://openapi.iwencai.com",
+                    "api_key": "sk-test123456",
+                    "cookie": "abcdef123456",
+                    "user_agent": "ua",
+                    "pro": False,
+                },
+                "version": 1,
+                "updated_at": datetime(2026, 7, 2, tzinfo=UTC),
+            }
+        }
+    )
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"), pool)
+
+    get_response = client.get(
+        "/api/v1/admin/wencai/config",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    assert get_response.status_code == 200
+    assert get_response.json()["api_key"] == "sk-t...3456"
+    assert get_response.json()["cookie"] == "abcd...3456"
+
+    put_response = client.put(
+        "/api/v1/admin/wencai/config",
+        json={
+            "base_url": "https://openapi.iwencai.com",
+            "api_key": "sk-t...3456",
+            "cookie": "abcd...3456",
+            "user_agent": "new-ua",
+            "pro": True,
+        },
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    assert put_response.status_code == 200
+    assert pool.rows["wencai.config"]["value"]["api_key"] == "sk-test123456"
+    assert pool.rows["wencai.config"]["value"]["cookie"] == "abcdef123456"
+    assert pool.rows["wencai.config"]["value"]["user_agent"] == "new-ua"
