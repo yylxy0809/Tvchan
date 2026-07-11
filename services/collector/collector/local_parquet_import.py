@@ -128,6 +128,32 @@ def file_checksum(path: Path) -> str:
     return "sha256=" + digest.hexdigest()
 
 
+def active_symbols_from_master(root: str | Path) -> set[str]:
+    """Read the checked-in local active universe without relying on a DB seed.
+
+    A fresh database has no ``symbols`` rows yet.  In that bootstrap state the
+    local stock-basic parquet is the authoritative active universe: only
+    ``list_status == 'L'`` is eligible.  Read it in batches so this remains
+    bounded if the master grows.
+    """
+    import pyarrow.parquet as pq
+
+    path = Path(root) / "stock_basic_data.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(f"active-only requires database symbols or local master: {path}")
+    parquet = pq.ParquetFile(path)
+    required = {"ts_code", "list_status"}
+    missing = required - set(parquet.schema_arrow.names)
+    if missing:
+        raise ValueError(f"active symbol master missing required columns: {','.join(sorted(missing))}")
+    active: set[str] = set()
+    for batch in parquet.iter_batches(batch_size=65_536, columns=["ts_code", "list_status"]):
+        for symbol, status in zip(batch.column(0).to_pylist(), batch.column(1).to_pylist()):
+            if status == "L" and symbol:
+                active.add(normalize_symbol(str(symbol)))
+    return active
+
+
 def discover_tasks(root: str | Path, *, timeframes: Iterable[str], symbols: Iterable[str],
                    exclude_bj_30f: bool = False) -> list[LocalTask]:
     root = Path(root)
@@ -273,14 +299,20 @@ async def run_once(args: argparse.Namespace) -> dict[str, Any]:
 
     # Explicit dry-runs remain fully local.  Active-only needs one read-only
     # lookup from the already-initialised symbol master before it can plan.
-    writer: NativeParquetWriter | None = None
+    active_symbol_source: str | None = None
     if active_only:
         writer = NativeParquetWriter(args.database_url)
         await writer.open()
         try:
-            requested_symbols = sorted(await writer.fetch_active_symbols())
+            database_symbols = await writer.fetch_active_symbols()
         finally:
             await writer.close()
+        if database_symbols:
+            requested_symbols = sorted(database_symbols)
+            active_symbol_source = "database"
+        else:
+            requested_symbols = sorted(active_symbols_from_master(args.root))
+            active_symbol_source = "master"
     symbols = static_shard(requested_symbols, shard_index=shard_index, shard_count=shard_count)
     tasks = discover_tasks(args.root, timeframes=timeframes, symbols=symbols, exclude_bj_30f=True)
     skipped_bj_30f = int("30f" in timeframes) * sum(symbol.endswith(".BJ") for symbol in symbols)
@@ -290,6 +322,8 @@ async def run_once(args: argparse.Namespace) -> dict[str, Any]:
         "selection_scope": scope, "shard_index": shard_index, "shard_count": shard_count,
         "excluded_bj_30f_tasks": skipped_bj_30f, "tasks": len(tasks), "dry_run": args.dry_run,
     }
+    if active_symbol_source is not None:
+        summary["active_symbol_source"] = active_symbol_source
     if args.dry_run:
         summary["sources"] = [task.source_ref for task in tasks]
         print(json.dumps(summary, ensure_ascii=False), flush=True)

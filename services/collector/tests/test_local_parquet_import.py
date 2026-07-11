@@ -31,6 +31,13 @@ def _write_daily(path: Path, symbol: str) -> None:
     }), path)
 
 
+def _write_symbol_master(path: Path, rows: list[tuple[str, str]]) -> None:
+    pq.write_table(pa.table({
+        "ts_code": [symbol for symbol, _status in rows],
+        "list_status": [status for _symbol, status in rows],
+    }), path)
+
+
 def test_adapter_parses_local_5f_daily_and_quarantines_bad_ohlc(tmp_path: Path) -> None:
     _write_intraday(tmp_path / "stock_5min" / "000001.SZ.parquet", "000001.SZ")
     _write_intraday(tmp_path / "stock_30min" / "000001.SZ.parquet", "000001.SZ", bad_ohlc=True)
@@ -178,5 +185,33 @@ def test_active_only_uses_symbol_master_then_static_shards(tmp_path: Path, monke
         "root": tmp_path, "database_url": "postgresql://unused", "shard_index": 1, "shard_count": 2,
     })()))
     assert result["selection_scope"] == "active_only"
+    assert result["active_symbol_source"] == "database"
     assert result["symbols"] == ["000002.SZ"]
     assert result["sources"] == ["stock_5min/000002.SZ.parquet"]
+
+
+def test_active_only_falls_back_to_local_master_for_fresh_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_intraday(tmp_path / "stock_5min" / "000001.SZ.parquet", "000001.SZ")
+    _write_symbol_master(tmp_path / "stock_basic_data.parquet", [
+        ("000001.SZ", "L"), ("000003.SZ", "D"), ("600000.SH", "L"),
+    ])
+
+    class FakeWriter:
+        async def open(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def fetch_active_symbols(self):
+            return set()
+
+    monkeypatch.setattr(import_module, "NativeParquetWriter", lambda *_args, **_kwargs: FakeWriter())
+    import asyncio
+    result = asyncio.run(run_once(type("Args", (), {
+        "timeframes": "5f", "symbols": None, "active_only": True, "dry_run": True,
+        "root": tmp_path, "database_url": "postgresql://unused", "shard_index": 0, "shard_count": 1,
+    })()))
+    assert result["active_symbol_source"] == "master"
+    assert result["symbols"] == ["000001.SZ", "600000.SH"]
+    assert result["sources"] == ["stock_5min/000001.SZ.parquet", "stock_5min/600000.SH.parquet"]
