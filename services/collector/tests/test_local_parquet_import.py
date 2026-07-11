@@ -215,3 +215,35 @@ def test_active_only_falls_back_to_local_master_for_fresh_database(tmp_path: Pat
     assert result["active_symbol_source"] == "master"
     assert result["symbols"] == ["000001.SZ", "600000.SH"]
     assert result["sources"] == ["stock_5min/000001.SZ.parquet", "stock_5min/600000.SH.parquet"]
+
+
+def test_active_only_prefers_complete_local_master_over_nonempty_database_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_intraday(tmp_path / "stock_5min" / "000001.SZ.parquet", "000001.SZ")
+    _write_symbol_master(tmp_path / "stock_basic_data.parquet", [
+        ("000001.SZ", "L"), ("000002.SZ", "L"), ("000003.SZ", "D"),
+    ])
+
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.fetch_called = False
+
+        async def open(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def fetch_active_symbols(self):
+            self.fetch_called = True
+            return {"000001.SZ"}  # migration seed, intentionally incomplete
+
+    writer = FakeWriter()
+    monkeypatch.setattr(import_module, "NativeParquetWriter", lambda *_args, **_kwargs: writer)
+    import asyncio
+    result = asyncio.run(run_once(type("Args", (), {
+        "timeframes": "5f", "symbols": None, "active_only": True, "dry_run": True,
+        "root": tmp_path, "database_url": "postgresql://unused", "shard_index": 0, "shard_count": 1,
+    })()))
+    assert result["active_symbol_source"] == "master"
+    assert result["symbols"] == ["000001.SZ", "000002.SZ"]
+    assert writer.fetch_called is False

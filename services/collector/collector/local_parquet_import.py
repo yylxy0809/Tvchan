@@ -297,22 +297,25 @@ async def run_once(args: argparse.Namespace) -> dict[str, Any]:
     scope = "active_only" if active_only else "explicit_symbols"
     shard_index, shard_count = getattr(args, "shard_index", 0), getattr(args, "shard_count", 1)
 
-    # Explicit dry-runs remain fully local.  Active-only needs one read-only
-    # lookup from the already-initialised symbol master before it can plan.
+    # The local master is the import-universe authority whenever it is present.
+    # A just-migrated DB intentionally contains only seed symbols; treating a
+    # non-empty seed set as authoritative would silently omit most history.
+    # Without a local master, fall back to the DB's active set for operational
+    # recovery installs.
     active_symbol_source: str | None = None
     if active_only:
-        writer = NativeParquetWriter(args.database_url)
-        await writer.open()
-        try:
-            database_symbols = await writer.fetch_active_symbols()
-        finally:
-            await writer.close()
-        if database_symbols:
-            requested_symbols = sorted(database_symbols)
-            active_symbol_source = "database"
-        else:
+        master_path = Path(args.root) / "stock_basic_data.parquet"
+        if master_path.is_file():
             requested_symbols = sorted(active_symbols_from_master(args.root))
             active_symbol_source = "master"
+        else:
+            writer = NativeParquetWriter(args.database_url)
+            await writer.open()
+            try:
+                requested_symbols = sorted(await writer.fetch_active_symbols())
+            finally:
+                await writer.close()
+            active_symbol_source = "database"
     symbols = static_shard(requested_symbols, shard_index=shard_index, shard_count=shard_count)
     tasks = discover_tasks(args.root, timeframes=timeframes, symbols=symbols, exclude_bj_30f=True)
     skipped_bj_30f = int("30f" in timeframes) * sum(symbol.endswith(".BJ") for symbol in symbols)
