@@ -68,6 +68,14 @@ Test-NetConnection 192.168.1.8 -Port 445
 
 如果失败，先让两台设备连接同一 SSID/同一子网，或配置双方都能访问的 Tailscale/现有虚拟网络；不要把 SMB 445 暴露到公网。
 
+审计时设备 A 的 WLAN `401-5G` 被 Windows 标记为 `Public`，文件共享防火墙规则同时对 Private/Public 启用。为避免在不可信网络暴露 SMB，迁移前应使用管理员 PowerShell 将可信家庭 WLAN 改为 Private：
+
+```powershell
+Set-NetConnectionProfile -InterfaceAlias WLAN -NetworkCategory Private
+```
+
+只在确认当前 Wi-Fi 是可信局域网时执行。迁移结束后若不再需要 SMB，应由管理员关闭 Public profile 的文件和打印机共享规则，或临时断开共享网络。
+
 ### B 设备迁移步骤
 
 在 B 的 PowerShell 中：
