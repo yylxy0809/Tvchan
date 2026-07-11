@@ -523,6 +523,14 @@ class NativeParquetWriter:
                 parameters=parameters,
             )
 
+    async def finalize_local_import_run(self, *, import_run_id: UUID) -> dict[str, Any]:
+        """Close a local static shard only after its task/checkpoint contract reconciles."""
+        from collector.kline_import_finalization import finalize_import_run
+
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            return await finalize_import_run(conn, import_run_id=import_run_id)
+
     async def upsert(self, *, symbols: Iterable[tuple], bars: list[tuple]) -> int:
         if not bars:
             return 0

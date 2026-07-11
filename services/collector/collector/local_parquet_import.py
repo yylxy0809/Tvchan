@@ -378,12 +378,22 @@ async def run_once(args: argparse.Namespace) -> dict[str, Any]:
                 symbols_preinitialized=True,
             )
             quarantined += len(parsed.quarantines)
+        # A real writer closes only a fully reconciled static shard.  Keep the
+        # small fake writers used by parse/resume unit tests compatible.
+        finalizer = getattr(writer, "finalize_local_import_run", None)
+        finalization = await finalizer(import_run_id=run_id) if finalizer is not None else None
         summary.update(
             import_run_id=str(run_id),
             accepted_rows=accepted,
             quarantined_rows=quarantined,
             resumed_tasks=resumed_tasks,
         )
+        if finalization is not None:
+            summary["run_status"] = finalization["status"]
+            summary["run_finalization"] = {
+                key: finalization.get(key)
+                for key in ("expected_tasks", "checkpoint_tasks", "completed_tasks", "failed_tasks", "unfinished_tasks", "terminal_decision")
+            }
         print(json.dumps(summary, ensure_ascii=False), flush=True)
         return summary
     finally:
