@@ -21,6 +21,7 @@
 7. [07-前后端 API 合同](07-api-frontend-contracts.md)：设备 A 前端访问设备 B 的固定合同。
 8. [08-设备 B 启动清单](08-device-b-bootstrap-and-next-work.md)：按顺序执行的落地步骤和验收门。
 9. [09-策略生命周期推荐表结构](09-strategy-lifecycle-recommended-schema.md)：在 B 新库落地事件可见性和历史回放。
+10. [10-A/B Codex Agent 交接协议](10-agent-to-agent-handoff-protocol.md)：两台设备通过 Codex 线程或 SMB 邮箱完成双向确认。
 
 ## 不得混淆的事实
 
