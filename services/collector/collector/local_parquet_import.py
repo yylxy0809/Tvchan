@@ -109,6 +109,20 @@ def static_shard(symbols: Iterable[str], *, shard_index: int, shard_count: int) 
     return selected[shard_index::shard_count]
 
 
+def symbol_rows_for_symbols(symbols: Iterable[str]) -> list[tuple]:
+    """Build deterministic bootstrap rows once per static shard.
+
+    A production shard must register its symbols before parallel member writes.
+    That avoids every 5f/30f/1d task taking an ``ON CONFLICT DO UPDATE`` lock
+    on ``symbols`` while other import shards are committing data.
+    """
+    rows = []
+    for symbol in sorted({normalize_symbol(item) for item in symbols}):
+        code, exchange = symbol.split(".", 1)
+        rows.append((code, exchange, symbol, infer_asset_type(code), "A_SHARE", True))
+    return rows
+
+
 def deterministic_import_run_id(*, root: str | Path, timeframes: Iterable[str], scope: str,
                                 shard_index: int, shard_count: int) -> UUID:
     """A retry-stable run ID for one static shard when no ID is supplied."""
@@ -341,12 +355,35 @@ async def run_once(args: argparse.Namespace) -> dict[str, Any]:
                   deterministic_import_run_id(root=args.root, timeframes=timeframes, scope=scope,
                                                shard_index=shard_index, shard_count=shard_count))
         await writer.create_import_run(import_run_id=run_id, parameters={**summary, "adapter": "local_parquet_import"})
-        accepted = quarantined = 0
+        # Do this once, before task writes. Static shards are disjoint, so this
+        # keeps concurrent workers away from the same symbol row locks.
+        await writer.upsert_symbol_rows(symbol_rows_for_symbols(symbols))
+        accepted = quarantined = resumed_tasks = 0
         for task in tasks:
+            completed = await writer.completed_import_checkpoint(import_run_id=run_id, task=task)
+            if completed is not None:
+                prior_accepted, prior_quarantined = completed
+                accepted += prior_accepted
+                quarantined += prior_quarantined
+                resumed_tasks += 1
+                continue
             parsed = parse_task(task, batch_size=args.batch_size)
-            accepted += await writer.upsert_import_batch(import_run_id=run_id, task=task, symbols=parsed.symbols.values(), bars=parsed.bars, quarantines=parsed.quarantines, last_source_row=parsed.last_source_row)
+            accepted += await writer.upsert_import_batch(
+                import_run_id=run_id,
+                task=task,
+                symbols=parsed.symbols.values(),
+                bars=parsed.bars,
+                quarantines=parsed.quarantines,
+                last_source_row=parsed.last_source_row,
+                symbols_preinitialized=True,
+            )
             quarantined += len(parsed.quarantines)
-        summary.update(import_run_id=str(run_id), accepted_rows=accepted, quarantined_rows=quarantined)
+        summary.update(
+            import_run_id=str(run_id),
+            accepted_rows=accepted,
+            quarantined_rows=quarantined,
+            resumed_tasks=resumed_tasks,
+        )
         print(json.dumps(summary, ensure_ascii=False), flush=True)
         return summary
     finally:

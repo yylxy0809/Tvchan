@@ -112,3 +112,60 @@ def test_retry_is_idempotent_for_stable_quarantine_identity_and_advances_checkpo
     assert len(conn.checkpoints) == 2
     assert conn.checkpoints[-1][5] == 7
     assert conn.events[:3] == ["accepted", "quarantine", "checkpoint"]
+
+
+def test_retryable_deadlock_retries_the_entire_atomic_batch() -> None:
+    class Deadlock(Exception):
+        sqlstate = "40P01"
+
+    conn = FakeConnection()
+    attempts = 0
+
+    async def write_accepted(_conn):
+        nonlocal attempts
+        attempts += 1
+        conn.events.append("accepted")
+        conn.accepted.append("canonical-row")
+        if attempts == 1:
+            raise Deadlock("simulated deadlock")
+        return 1
+
+    assert asyncio.run(
+        commit_import_batch(
+            conn,
+            import_run_id=uuid4(),
+            checkpoint=ImportCheckpoint(_record().source_ref, "crc32=deadbeef", 7),
+            quarantines=[_record()],
+            write_accepted=write_accepted,
+            retry_attempts=2,
+            retry_base_delay_seconds=0,
+        )
+    ) == 1
+    assert attempts == 2
+    assert conn.accepted == ["canonical-row"]
+    assert len(conn.quarantines) == 1
+    assert len(conn.checkpoints) == 1
+
+
+def test_non_retryable_error_does_not_retry() -> None:
+    conn = FakeConnection()
+    attempts = 0
+
+    async def write_accepted(_conn):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("bad row")
+
+    with pytest.raises(RuntimeError, match="bad row"):
+        asyncio.run(
+            commit_import_batch(
+                conn,
+                import_run_id=uuid4(),
+                checkpoint=ImportCheckpoint(_record().source_ref, "crc32=deadbeef", 7),
+                quarantines=[],
+                write_accepted=write_accepted,
+                retry_attempts=5,
+                retry_base_delay_seconds=0,
+            )
+        )
+    assert attempts == 1

@@ -541,6 +541,7 @@ class NativeParquetWriter:
         bars: list[tuple],
         quarantines: list[QuarantineRecord],
         last_source_row: int | None,
+        symbols_preinitialized: bool = False,
     ) -> int:
         """Commit a source member's canonical rows and raw failures together.
 
@@ -565,15 +566,23 @@ class NativeParquetWriter:
                     transaction_conn,
                     symbols=symbol_rows,
                     bars=bars,
+                    upsert_symbol_rows=not symbols_preinitialized,
                 ),
             )
 
-    async def _upsert_on_connection(self, conn, *, symbols: Iterable[tuple], bars: list[tuple]) -> int:
+    async def _upsert_on_connection(
+        self,
+        conn,
+        *,
+        symbols: Iterable[tuple],
+        bars: list[tuple],
+        upsert_symbol_rows: bool = True,
+    ) -> int:
         if not bars:
             return 0
         await create_symbol_stage(conn)
         symbol_rows = list(symbols)
-        if symbol_rows:
+        if symbol_rows and upsert_symbol_rows:
             await conn.copy_records_to_table(
                 "_native_parquet_symbol_stage",
                 records=symbol_rows,
@@ -621,6 +630,37 @@ class NativeParquetWriter:
                 )
                 await upsert_symbols(conn)
         return len(symbol_rows)
+
+    async def completed_import_checkpoint(
+        self,
+        *,
+        import_run_id: UUID,
+        task: ImportTask,
+    ) -> tuple[int, int] | None:
+        """Return durable totals for a completed source member, if any.
+
+        The import run ID plus source checksum is the resume identity.  Reading
+        this before parsing a large member makes a restart after partial work
+        cheap while retaining the same transactional checkpoint contract.
+        """
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                select accepted_rows, quarantined_rows
+                from kline_import_checkpoints
+                where import_run_id = $1
+                  and source_ref = $2
+                  and source_checksum = $3
+                  and status = 'completed'
+                """,
+                import_run_id,
+                task.source_ref,
+                task.source_checksum,
+            )
+        if row is None:
+            return None
+        return int(row["accepted_rows"]), int(row["quarantined_rows"])
 
     async def fetch_watermarks(self, *, timeframes: list[str], symbols: set[str]) -> list[dict[str, Any]]:
         assert self.pool is not None

@@ -12,6 +12,7 @@ from collector.local_parquet_import import (
     parse_task,
     run_once,
     static_shard,
+    symbol_rows_for_symbols,
 )
 
 
@@ -120,6 +121,12 @@ def test_explicit_import_run_id_is_reused_across_cli_retries(tmp_path: Path, mon
         async def create_import_run(self, *, import_run_id, parameters) -> None:
             self.created_run_ids.append(import_run_id)
 
+        async def upsert_symbol_rows(self, rows) -> int:
+            return len(list(rows))
+
+        async def completed_import_checkpoint(self, **_kwargs):
+            return None
+
         async def upsert_import_batch(self, *, import_run_id, **_kwargs) -> int:
             self.batch_run_ids.append(import_run_id)
             return 1
@@ -138,6 +145,55 @@ def test_explicit_import_run_id_is_reused_across_cli_retries(tmp_path: Path, mon
     assert second["import_run_id"] == fixed_run_id
     assert {str(value) for value in FakeWriter.created_run_ids} == {fixed_run_id}
     assert {str(value) for value in FakeWriter.batch_run_ids} == {fixed_run_id}
+
+
+def test_symbol_rows_are_canonical_and_stably_sorted_for_parallel_preinitialization() -> None:
+    assert symbol_rows_for_symbols(["600000.SH", "000001.SZ", "000001.SZ"]) == [
+        ("000001", "SZ", "000001.SZ", "stock", "A_SHARE", True),
+        ("600000", "SH", "600000.SH", "stock", "A_SHARE", True),
+    ]
+
+
+def test_completed_checkpoint_skips_reparsing_and_rewriting_on_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_intraday(tmp_path / "stock_5min" / "000001.SZ.parquet", "000001.SZ")
+
+    class FakeWriter:
+        upserted = 0
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def open(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def create_import_run(self, **_kwargs) -> None:
+            pass
+
+        async def upsert_symbol_rows(self, _rows) -> int:
+            return 1
+
+        async def completed_import_checkpoint(self, **_kwargs):
+            return (12, 3)
+
+        async def upsert_import_batch(self, **_kwargs) -> int:
+            self.upserted += 1
+            return 1
+
+    monkeypatch.setattr(import_module, "NativeParquetWriter", FakeWriter)
+    import asyncio
+    result = asyncio.run(run_once(type("Args", (), {
+        "timeframes": "5f", "symbols": "000001.SZ", "active_only": False,
+        "dry_run": False, "root": tmp_path, "database_url": "postgresql://unused",
+        "batch_size": 10, "import_run_id": "90c79d5d-f75a-47e6-9b8c-85e3ed190140",
+        "shard_index": 0, "shard_count": 1,
+    })()))
+    assert result["accepted_rows"] == 12
+    assert result["quarantined_rows"] == 3
+    assert result["resumed_tasks"] == 1
+    assert FakeWriter.upserted == 0
 
 
 def test_static_symbol_shards_are_stable_disjoint_and_exhaustive() -> None:
