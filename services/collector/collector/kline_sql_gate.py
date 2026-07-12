@@ -64,6 +64,7 @@ def build_gate_sql(timeframe: int) -> str:
     if timeframe not in TIMEFRAMES:
         raise ValueError(f"unsupported timeframe: {timeframe}")
     higher = timeframe in (10080, 43200)
+    base_materialization = "MATERIALIZED" if higher else "NOT MATERIALIZED"
     bucket = "week" if timeframe == 10080 else "month"
     daily_ctes = ""
     higher_join = ""
@@ -118,7 +119,7 @@ def build_gate_sql(timeframe: int) -> str:
     ) duplicates GROUP BY symbol_id
 )"""
     return f"""
-WITH base AS NOT MATERIALIZED (
+WITH base AS {base_materialization} (
     SELECT k.*, k.ts AT TIME ZONE 'Asia/Shanghai' AS lts
     FROM klines k
     JOIN symbols s ON s.id = k.symbol_id AND s.is_active AND s.market = 'A_SHARE'
@@ -239,7 +240,11 @@ async def _worker(database_url: str, snapshot: str, run_id: str, timeframe: int)
         await connection.close()
 
 
-async def run_gate(database_url: str, run_id: str | None = None) -> tuple[str, dict[str, int]]:
+async def run_gate(
+    database_url: str,
+    run_id: str | None = None,
+    timeframes: Sequence[int] = TIMEFRAMES,
+) -> tuple[str, dict[str, Any]]:
     run_id = run_id or str(uuid.uuid4())
     run_uuid = uuid.UUID(run_id)
     setup = await asyncpg.connect(database_url)
@@ -251,8 +256,8 @@ async def run_gate(database_url: str, run_id: str | None = None) -> tuple[str, d
             "INSERT INTO kline_audit_runs(audit_run_id,status,apply_mode,parameters) "
             "VALUES($1,'running',false,$2::jsonb) "
             "ON CONFLICT (audit_run_id) DO UPDATE SET status='running',completed_at=NULL,"
-            "failure=NULL,summary=NULL,parameters=excluded.parameters",
-            run_uuid, json.dumps({"engine": "sql_gate", "timeframes": TIMEFRAMES}),
+            "failure=NULL,summary='{}'::jsonb,parameters=excluded.parameters",
+            run_uuid, json.dumps({"engine": "sql_gate", "timeframes": list(timeframes)}),
         )
     finally:
         await setup.close()
@@ -265,7 +270,7 @@ async def run_gate(database_url: str, run_id: str | None = None) -> tuple[str, d
         coordinator_open = True
         snapshot = await coordinator.fetchval("SELECT pg_export_snapshot()")
         async with asyncio.TaskGroup() as workers:
-            for timeframe in TIMEFRAMES:
+            for timeframe in timeframes:
                 workers.create_task(_worker(database_url, snapshot, run_id, timeframe))
         await coordinator_tx.commit()
         coordinator_open = False
@@ -303,6 +308,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fast database-side canonical K-line gate")
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
     parser.add_argument("--audit-run-id")
+    parser.add_argument("--timeframe", action="append", type=int, choices=TIMEFRAMES)
     args = parser.parse_args(argv)
     if not args.database_url:
         parser.error("--database-url or DATABASE_URL is required")
@@ -316,7 +322,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 async def _main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    run_id, summary = await run_gate(args.database_url, args.audit_run_id)
+    run_id, summary = await run_gate(
+        args.database_url,
+        args.audit_run_id,
+        tuple(args.timeframe) if args.timeframe else TIMEFRAMES,
+    )
     print(json.dumps({"audit_run_id": run_id, "summary": summary}, sort_keys=True))
     if not summary["gate_pass"]:
         raise SystemExit(2)
