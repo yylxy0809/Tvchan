@@ -85,6 +85,30 @@ export const DEFAULT_CHAN_STYLE_SETTINGS: ChanStyleSettings = {
       sellTextColor: "#fff0f5",
     },
   },
+  "1w": {
+    stroke: { color: "#ff922b", linewidth: 3 },
+    segment: { color: "#ff922b", linewidth: 4 },
+    center: { color: "#ff922b", linewidth: 3, transparency: 6 },
+    channel: { color: "#f08c00", linewidth: 1 },
+    signal: {
+      buyColor: "#ffc078",
+      buyTextColor: "#2b1700",
+      sellColor: "#e67700",
+      sellTextColor: "#fff4e6",
+    },
+  },
+  "1m": {
+    stroke: { color: "#4c6ef5", linewidth: 4 },
+    segment: { color: "#4c6ef5", linewidth: 5 },
+    center: { color: "#4c6ef5", linewidth: 4, transparency: 7 },
+    channel: { color: "#3b5bdb", linewidth: 1 },
+    signal: {
+      buyColor: "#91a7ff",
+      buyTextColor: "#06113a",
+      sellColor: "#364fc7",
+      sellTextColor: "#edf2ff",
+    },
+  },
 };
 
 export function cloneChanStyleSettings(
@@ -94,6 +118,8 @@ export function cloneChanStyleSettings(
     "5f": cloneLevelStyle(settings["5f"]),
     "30f": cloneLevelStyle(settings["30f"]),
     "1d": cloneLevelStyle(settings["1d"]),
+    "1w": cloneLevelStyle(settings["1w"]),
+    "1m": cloneLevelStyle(settings["1m"]),
   };
 }
 
@@ -103,6 +129,8 @@ export function mergeChanStyleSettings(value: unknown): ChanStyleSettings {
     "5f": mergeLevelStyle(DEFAULT_CHAN_STYLE_SETTINGS["5f"], incoming["5f"]),
     "30f": mergeLevelStyle(DEFAULT_CHAN_STYLE_SETTINGS["30f"], incoming["30f"]),
     "1d": mergeLevelStyle(DEFAULT_CHAN_STYLE_SETTINGS["1d"], incoming["1d"]),
+    "1w": mergeLevelStyle(DEFAULT_CHAN_STYLE_SETTINGS["1w"], incoming["1w"]),
+    "1m": mergeLevelStyle(DEFAULT_CHAN_STYLE_SETTINGS["1m"], incoming["1m"]),
   };
 }
 
@@ -194,7 +222,7 @@ function mergeSignalStyle(defaultStyle: ChanSignalStyle, value: unknown): ChanSi
 }
 
 function normalizeStyleLevel(level: string): ChanLevel {
-  if (level === "5f" || level === "30f" || level === "1d") {
+  if (level === "5f" || level === "30f" || level === "1d" || level === "1w" || level === "1m") {
     return level;
   }
   return "5f";

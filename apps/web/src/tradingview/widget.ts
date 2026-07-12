@@ -1,11 +1,12 @@
 ﻿import type { ApiBar, ChanOverlayResponse } from "../api/client";
+import { validateChanOverlayResponse } from "../api/chanOverlayManager";
 import { CHAN_STUDY_ENABLED, TRADINGVIEW_DEBUG } from "../config";
 import {
   buildChanStudyOverrides,
   CHAN_STUDY_DESCRIPTION,
   clearChanStudyOverlay,
   createChanCustomIndicators,
-  getChanStudyFallbackCenters,
+  projectChanPointToViewTime,
   setChanStudyOverlay,
 } from "./chanStudy";
 import {
@@ -42,6 +43,11 @@ type ShapePoint = {
   price: number;
 };
 
+type ProjectedCenterTimes = {
+  start: number;
+  end: number;
+};
+
 type TradingViewChart = {
   dataReady(callback?: () => void): boolean;
   resolution?(): string;
@@ -51,6 +57,11 @@ type TradingViewChart = {
   onSymbolChanged?(): {
     subscribe?(context: unknown, callback: (symbolInfo?: { ticker?: string }) => void): void;
     unsubscribe?(context: unknown, callback: (symbolInfo?: { ticker?: string }) => void): void;
+    unsubscribeAll?(context?: unknown): void;
+  };
+  onVisibleRangeChanged?(): {
+    subscribe?(context: unknown, callback: (range: { from: number; to: number }) => void): void;
+    unsubscribe?(context: unknown, callback: (range: { from: number; to: number }) => void): void;
     unsubscribeAll?(context?: unknown): void;
   };
   createStudy(
@@ -106,6 +117,8 @@ const DISABLED_PERSISTENCE_FEATURES = [
 ];
 
 const overlayShapeIds = new WeakMap<TradingViewWidget, ShapeId[]>();
+const overlayCenterShapeIds = new WeakMap<TradingViewWidget, Map<string, ShapeId[]>>();
+const overlayStrokeShapeIds = new WeakMap<TradingViewWidget, Map<string, ShapeId[]>>();
 const studyIds = new WeakMap<TradingViewWidget, ShapeId>();
 const studyDatasetKeys = new WeakMap<TradingViewWidget, string>();
 const studySettingsSyncTimers = new WeakMap<TradingViewWidget, number>();
@@ -185,7 +198,9 @@ export async function createTradingViewWidget(
     tvReady: String(ready),
   });
   if (options.onToggleTheme) {
-    await installThemeButton(widget, theme, options.onToggleTheme);
+    // Header readiness can lag the usable chart API indefinitely in some
+    // local TradingView builds. Do not block bars or Chan overlay startup.
+    void installThemeButton(widget, theme, options.onToggleTheme);
   }
   patchTvDebug("widget", {
     ready,
@@ -247,6 +262,8 @@ export async function clearChanOverlay(widget: TradingViewWidget): Promise<void>
     chart.removeEntity(id);
   }
   overlayShapeIds.set(widget, []);
+  overlayCenterShapeIds.delete(widget);
+  overlayStrokeShapeIds.delete(widget);
 }
 
 export function getWidgetTimeframe(widget: TradingViewWidget | null): string | null {
@@ -371,6 +388,23 @@ export async function subscribeWidgetSymbolChanges(
   };
 }
 
+export async function subscribeWidgetVisibleRangeChanges(
+  widget: TradingViewWidget | null,
+  onRangeChange: (range: { from: number; to: number }) => void,
+): Promise<() => void> {
+  if (!widget) return () => {};
+  const chart = await getActiveChart(widget);
+  const subscription = chart?.onVisibleRangeChanged?.();
+  if (!subscription?.subscribe) return () => {};
+  const handler = (range: { from: number; to: number }) => {
+    if (Number.isFinite(range?.from) && Number.isFinite(range?.to)) onRangeChange(range);
+  };
+  subscription.subscribe(null, handler);
+  return () => {
+    try { subscription.unsubscribe?.(null, handler); } catch { subscription.unsubscribeAll?.(); }
+  };
+}
+
 export async function renderChanOverlay(
   widget: TradingViewWidget,
   overlay: ChanOverlayResponse,
@@ -378,6 +412,12 @@ export async function renderChanOverlay(
   options: { isCurrent?: () => boolean; chartBars?: ApiBar[] } = {},
 ): Promise<void> {
   const isCurrent = options.isCurrent ?? (() => true);
+  const validationError = validateChanOverlayResponse(overlay);
+  if (validationError) {
+    patchTvDebug("overlay", { phase: "invalid", error: validationError });
+    if (TRADINGVIEW_DEBUG) console.warn("[chan-overlay-invalid]", validationError);
+    return;
+  }
   const activeTimeframe = getWidgetTimeframe(widget);
   if (!isCurrent() || (activeTimeframe && overlay.chart_timeframe !== activeTimeframe)) {
     if (TRADINGVIEW_DEBUG) {
@@ -418,21 +458,17 @@ export async function renderChanOverlay(
   if (!isCurrent()) {
     return;
   }
-  await clearDrawings(widget, chart);
-  const createdIds: ShapeId[] = [];
-  const cleanupCreated = () => {
-    for (const id of createdIds) {
-      chart.removeEntity(id);
-    }
-  };
-  const studyReady = await renderChanStudy(widget, overlay, settings, options.chartBars ?? []);
+  const studyReady = await renderChanStudy(widget, overlay, settings, options.chartBars ?? [], isCurrent);
   if (!isCurrent()) {
-    cleanupCreated();
     return;
   }
-  const strokeDrawings: ChanOverlayResponse["strokes"] = [];
+  const strokeDrawings = !studyReady && settings.parts.strokes
+    ? overlay.strokes.filter((item) => settings.levels[item.level as keyof typeof settings.levels] !== false)
+    : [];
   const segmentDrawings: ChanOverlayResponse["segments"] = [];
-  const centerDrawings = studyReady ? getChanStudyFallbackCenters() : overlay.centers;
+  const centerDrawings = !studyReady && settings.parts.centers
+    ? overlay.centers.filter((item) => settings.levels[item.level as keyof typeof settings.levels] !== false)
+    : [];
   const renderState = {
     engine: overlay.engine,
     chartTimeframe: overlay.chart_timeframe,
@@ -446,11 +482,11 @@ export async function renderChanOverlay(
     segmentDrawings: segmentDrawings.length,
     centerDrawings: centerDrawings.length,
     dataReady,
-    pineStrokes: overlay.strokes.length,
-    pineSegments: overlay.segments.length,
-    pineCenters: overlay.centers.length - centerDrawings.length,
+    pineStrokes: studyReady ? overlay.strokes.length : 0,
+    pineSegments: studyReady ? overlay.segments.length : 0,
+    pineCenters: studyReady ? overlay.centers.length : 0,
     pineSignals: overlay.signals.length,
-    lineRenderer: "pinejs",
+    lineRenderer: studyReady ? "pinejs" : "drawings",
     centerRenderer: studyReady ? "pinejs" : "drawings",
     signalRenderer: "pinejs",
     signals: overlay.signals.length,
@@ -464,23 +500,36 @@ export async function renderChanOverlay(
     console.info("[chan-overlay-render]", renderState);
   }
 
-  for (const center of centerDrawings) {
-    if (!isCurrent()) {
-      cleanupCreated();
-      return;
-    }
-    createdIds.push(...(await drawCenter(chart, center, settings, overlay.chart_timeframe)));
-  }
-
-  if (!isCurrent()) {
-    cleanupCreated();
+  const actualCenterIds = await reconcileCenterDrawings(
+    widget,
+    chart,
+    centerDrawings,
+    settings,
+    overlay.chart_timeframe,
+    options.chartBars ?? [],
+    isCurrent,
+  );
+  if (!actualCenterIds) {
     return;
   }
-  overlayShapeIds.set(widget, createdIds);
+  const actualStrokeIds = await reconcileStrokeDrawings(
+    widget,
+    chart,
+    strokeDrawings,
+    settings,
+    overlay.chart_timeframe,
+    options.chartBars ?? [],
+    isCurrent,
+  );
+  if (!actualStrokeIds) {
+    return;
+  }
+  const actualDrawingIds = [...actualCenterIds, ...actualStrokeIds];
+  overlayShapeIds.set(widget, actualDrawingIds);
   const completedState = {
     ...renderState,
-    actualDrawings: createdIds.length,
-    actualDrawingIds: createdIds.slice(0, 12).map(String),
+    actualDrawings: actualDrawingIds.length,
+    actualDrawingIds: actualDrawingIds.slice(0, 12).map(String),
     phase: "rendered",
   };
   window.__CHAN_OVERLAY_RENDER__ = completedState;
@@ -511,13 +560,15 @@ export async function waitForChartData(
 async function ensureChanStudy(
   widget: TradingViewWidget,
   settings: ChanOverlaySettings,
+  isCurrent: () => boolean,
 ): Promise<ShapeId | undefined> {
+  if (!isCurrent()) return undefined;
   const existingId = studyIds.get(widget);
   if (existingId !== undefined) {
     return existingId;
   }
   const chart = await getActiveChart(widget);
-  if (!chart) {
+  if (!chart || !isCurrent()) {
     return undefined;
   }
   const id = await chart.createStudy(
@@ -528,13 +579,43 @@ async function ensureChanStudy(
     buildChanStudyOverrides(settings),
   );
   if (id !== null) {
+    if (!isCurrent()) {
+      chart.removeEntity(id);
+      return undefined;
+    }
     studyIds.set(widget, id);
     const study = chart.getStudyById(id);
+    if (!isCurrent()) return undefined;
     study.applyOverrides?.(buildChanStudyOverrides(settings));
+    if (!isCurrent()) return undefined;
     study.setUserEditEnabled?.(true);
     return id;
   }
   return undefined;
+}
+
+function removeChanStudy(widget: TradingViewWidget, chart: TradingViewChart): void {
+  const existingId = studyIds.get(widget);
+  if (existingId === undefined) {
+    return;
+  }
+  stopChanStudySettingsSync(widget);
+  try {
+    chart.removeEntity(existingId);
+  } catch {
+    // TradingView may already have removed the study during symbol/interval changes.
+  }
+  studyIds.delete(widget);
+  studyDatasetKeys.delete(widget);
+}
+
+function hasChanStudy(chart: TradingViewChart, studyId: ShapeId): boolean {
+  try {
+    chart.getStudyById(studyId);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function readCurrentChanStudySettings(
@@ -616,16 +697,18 @@ async function renderChanStudy(
   overlay: ChanOverlayResponse,
   settings: ChanOverlaySettings,
   chartBars: ApiBar[] = [],
+  isCurrent: () => boolean = () => true,
 ): Promise<boolean> {
   if (!CHAN_STUDY_ENABLED) {
-    clearChanStudyOverlay();
+    if (isCurrent()) clearChanStudyOverlay();
     return false;
   }
   try {
     const chart = await getActiveChart(widget);
-    if (!chart) {
+    if (!chart || !isCurrent()) {
       return false;
     }
+    if (!isCurrent()) return false;
     setChanStudyOverlay(overlay, chartBars);
     const chartBarsFirst = chartBars[0]?.time ?? "";
     const chartBarsLast = chartBars[chartBars.length - 1]?.time ?? "";
@@ -641,29 +724,38 @@ async function renderChanStudy(
       chartBarsFirst,
       chartBarsLast,
     ].join("|");
-    const existingId = studyIds.get(widget);
-    const existingDatasetKey = studyDatasetKeys.get(widget);
+    let existingId = studyIds.get(widget);
+    if (existingId !== undefined && !hasChanStudy(chart, existingId)) {
+      if (!isCurrent()) return false;
+      stopChanStudySettingsSync(widget);
+      if (!isCurrent()) return false;
+      studyIds.delete(widget);
+      if (!isCurrent()) return false;
+      studyDatasetKeys.delete(widget);
+      existingId = undefined;
+    }
+    const existingDatasetKey = existingId === undefined ? undefined : studyDatasetKeys.get(widget);
     const effectiveSettings = existingId === undefined
       ? settings
       : readCurrentChanStudySettings(chart, existingId, settings);
-    if (existingId !== undefined && existingDatasetKey !== datasetKey) {
-      chart.removeEntity(existingId);
-      studyIds.delete(widget);
-      studyDatasetKeys.delete(widget);
-    }
-    const studyId = await ensureChanStudy(widget, effectiveSettings);
+    const studyId = await ensureChanStudy(widget, effectiveSettings, isCurrent);
     if (studyId !== undefined) {
+      if (!isCurrent()) return false;
       studyDatasetKeys.set(widget, datasetKey);
       const study = chart.getStudyById(studyId);
       const currentSettings = readCurrentChanStudySettings(chart, studyId, effectiveSettings);
+      if (!isCurrent()) return false;
       study.applyOverrides?.(buildChanStudyOverrides(currentSettings));
+      if (!isCurrent()) return false;
       studyInputSignatures.set(widget, studyInputSignature(study.getInputValues()));
+      if (!isCurrent()) return false;
       startChanStudySettingsSync(widget, currentSettings);
     }
     patchTvDebug("chanStudy", {
       ready: studyId !== undefined,
       studyId: studyId ?? null,
       datasetKey,
+      recreated: false,
       reused: existingId !== undefined && existingDatasetKey === datasetKey,
       settingsPreserved: existingId !== undefined,
     });
@@ -676,7 +768,6 @@ async function renderChanStudy(
     if (TRADINGVIEW_DEBUG) {
       console.warn("[chan-study-render-failed]", error);
     }
-    clearChanStudyOverlay();
     return false;
   }
 }
@@ -742,52 +833,250 @@ async function clearDrawings(widget: TradingViewWidget, chart?: TradingViewChart
     activeChart.removeEntity(id);
   }
   overlayShapeIds.set(widget, []);
+  overlayCenterShapeIds.delete(widget);
+  overlayStrokeShapeIds.delete(widget);
+}
+
+async function reconcileStrokeDrawings(
+  widget: TradingViewWidget,
+  chart: TradingViewChart,
+  strokes: ChanOverlayResponse["strokes"],
+  settings: ChanOverlaySettings,
+  timeframe: string,
+  chartBars: ApiBar[],
+  isCurrent: () => boolean,
+): Promise<ShapeId[] | null> {
+  const previous = overlayStrokeShapeIds.get(widget) ?? new Map<string, ShapeId[]>();
+  const next = new Map<string, ShapeId[]>();
+  const created: ShapeId[] = [];
+  for (const stroke of strokes) {
+    if (!isCurrent()) {
+      removeShapeIds(chart, created);
+      return null;
+    }
+    const projected = projectStrokePoints(stroke, timeframe, chartBars);
+    if (!projected || !isProjectedStrokeVisible(projected, chartBars)) {
+      continue;
+    }
+    const key = strokeDrawingKey(stroke, settings, timeframe, projected);
+    const existing = previous.get(key);
+    if (existing) {
+      next.set(key, existing);
+      continue;
+    }
+    const ids = await drawStroke(chart, stroke, settings, projected);
+    created.push(...ids);
+    next.set(key, ids);
+  }
+  if (!isCurrent()) {
+    removeShapeIds(chart, created);
+    return null;
+  }
+  for (const [key, ids] of previous) {
+    if (!next.has(key)) {
+      removeShapeIds(chart, ids);
+    }
+  }
+  const actual = Array.from(next.values()).flat();
+  overlayStrokeShapeIds.set(widget, next);
+  return actual;
+}
+
+async function reconcileCenterDrawings(
+  widget: TradingViewWidget,
+  chart: TradingViewChart,
+  centers: ChanOverlayResponse["centers"],
+  settings: ChanOverlaySettings,
+  timeframe: string,
+  chartBars: ApiBar[],
+  isCurrent: () => boolean,
+): Promise<ShapeId[] | null> {
+  const previous = overlayCenterShapeIds.get(widget) ?? new Map<string, ShapeId[]>();
+  const next = new Map<string, ShapeId[]>();
+  const created: ShapeId[] = [];
+  for (const center of centers) {
+    if (!isCurrent()) {
+      removeShapeIds(chart, created);
+      return null;
+    }
+    const projected = projectCenterTimes(center, timeframe, chartBars);
+    if (!projected || !isProjectedCenterVisible(projected, chartBars)) {
+      continue;
+    }
+    const key = centerDrawingKey(center, settings, timeframe, projected);
+    const existing = previous.get(key);
+    if (existing) {
+      next.set(key, existing);
+      continue;
+    }
+    const ids = await drawCenter(chart, center, settings, projected);
+    created.push(...ids);
+    next.set(key, ids);
+  }
+  if (!isCurrent()) {
+    removeShapeIds(chart, created);
+    return null;
+  }
+  for (const [key, ids] of previous) {
+    if (!next.has(key)) {
+      removeShapeIds(chart, ids);
+    }
+  }
+  const actual = Array.from(next.values()).flat();
+  overlayCenterShapeIds.set(widget, next);
+  overlayShapeIds.set(widget, actual);
+  return actual;
+}
+
+function removeShapeIds(chart: TradingViewChart, ids: ShapeId[]): void {
+  for (const id of ids) {
+    chart.removeEntity(id);
+  }
+}
+
+async function drawStroke(
+  chart: TradingViewChart,
+  stroke: ChanOverlayResponse["strokes"][number],
+  settings: ChanOverlaySettings,
+  projected: { start: ShapePoint; end: ShapePoint },
+): Promise<ShapeId[]> {
+  const style = strokeStyle(stroke, settings);
+  if (
+    !Number.isFinite(projected.start.time) ||
+    !Number.isFinite(projected.end.time) ||
+    !Number.isFinite(projected.start.price) ||
+    !Number.isFinite(projected.end.price) ||
+    projected.end.time <= projected.start.time
+  ) {
+    return [];
+  }
+  const id = await chart.createMultipointShape(
+    [projected.start, projected.end],
+    {
+      shape: "trend_line",
+      lock: true,
+      disableSelection: true,
+      disableSave: true,
+      disableUndo: true,
+      text: `${stroke.level} stroke`,
+      overrides: trendLineOverrides(style),
+    },
+  );
+  return [id];
 }
 
 async function drawCenter(
   chart: TradingViewChart,
   center: ChanOverlayResponse["centers"][number],
   settings: ChanOverlaySettings,
-  timeframe = "5f",
+  projected: ProjectedCenterTimes,
 ): Promise<ShapeId[]> {
-  const style = getChanLineStyle(
+  const style = centerStyle(center, settings);
+  const high = Math.max(center.high, center.low);
+  const low = Math.min(center.high, center.low);
+  if (
+    !Number.isFinite(projected.start) ||
+    !Number.isFinite(projected.end) ||
+    !Number.isFinite(high) ||
+    !Number.isFinite(low) ||
+    projected.end <= projected.start
+  ) {
+    return [];
+  }
+  const common = {
+    shape: "rectangle",
+    lock: true,
+    disableSelection: true,
+    disableSave: true,
+    disableUndo: true,
+    overrides: rectangleOverrides(style),
+  };
+
+  const rectangle = await chart.createMultipointShape(
+    [
+      { time: projected.start, price: high },
+      { time: projected.end, price: low },
+    ],
+    {
+      ...common,
+      text: `${center.level} center`,
+    },
+  );
+
+  return [rectangle];
+}
+
+function strokeDrawingKey(
+  stroke: ChanOverlayResponse["strokes"][number],
+  settings: ChanOverlaySettings,
+  timeframe: string,
+  projected: { start: ShapePoint; end: ShapePoint },
+): string {
+  const style = strokeStyle(stroke, settings);
+  return [
+    stroke.id,
+    stroke.level,
+    stroke.mode,
+    timeframe,
+    projected.start.time,
+    projected.start.price,
+    projected.end.time,
+    projected.end.price,
+    stroke.direction,
+    stroke.confirmed ? 1 : 0,
+    style.color,
+    style.linewidth,
+    style.linestyle,
+  ].join("|");
+}
+
+function centerDrawingKey(
+  center: ChanOverlayResponse["centers"][number],
+  settings: ChanOverlaySettings,
+  timeframe: string,
+  projected: ProjectedCenterTimes,
+): string {
+  const style = centerStyle(center, settings);
+  return [
+    center.id,
+    center.level,
+    center.mode,
+    timeframe,
+    projected.start,
+    projected.end,
+    center.high,
+    center.low,
+    center.confirmed ? 1 : 0,
+    style.color,
+    style.linewidth,
+    style.linestyle,
+  ].join("|");
+}
+
+function strokeStyle(
+  stroke: ChanOverlayResponse["strokes"][number],
+  settings: ChanOverlaySettings,
+): ReturnType<typeof getChanLineStyle> {
+  return getChanLineStyle(
+    settings.styles,
+    stroke.level,
+    "stroke",
+    stroke.confirmed,
+    settings.lineStyles,
+  );
+}
+
+function centerStyle(
+  center: ChanOverlayResponse["centers"][number],
+  settings: ChanOverlaySettings,
+): ReturnType<typeof getChanLineStyle> {
+  return getChanLineStyle(
     settings.styles,
     center.level,
     "center",
     center.confirmed,
     settings.lineStyles,
   );
-  const common = {
-    shape: "trend_line",
-    lock: true,
-    disableSelection: true,
-    disableSave: true,
-    disableUndo: true,
-    overrides: trendLineOverrides(style),
-  };
-
-  const lowLine = await chart.createMultipointShape(
-    [
-      { time: mapOverlayTimeToChartTime(center.start_time, timeframe), price: center.low },
-      { time: mapOverlayTimeToChartTime(center.end_time, timeframe), price: center.low },
-    ],
-    {
-      ...common,
-      text: `${center.level} center low`,
-    },
-  );
-  const highLine = await chart.createMultipointShape(
-    [
-      { time: mapOverlayTimeToChartTime(center.start_time, timeframe), price: center.high },
-      { time: mapOverlayTimeToChartTime(center.end_time, timeframe), price: center.high },
-    ],
-    {
-      ...common,
-      text: `${center.level} center high`,
-    },
-  );
-
-  return [lowLine, highLine];
 }
 
 function trendLineOverrides(style: {
@@ -800,6 +1089,7 @@ function trendLineOverrides(style: {
     linecolor: style.color,
     linewidth: style.linewidth,
     linestyle: style.linestyle,
+    transparency: 0,
     textcolor: style.color,
     extendLeft: false,
     extendRight: false,
@@ -832,17 +1122,150 @@ function trendLineOverrides(style: {
   };
 }
 
-function mapOverlayTimeToChartTime(epochSeconds: number, timeframe: string): number {
+function rectangleOverrides(style: {
+  color: string;
+  linewidth: number;
+  linestyle: number;
+}): Record<string, unknown> {
+  return {
+    color: style.color,
+    linecolor: style.color,
+    backgroundColor: style.color,
+    linewidth: style.linewidth,
+    linestyle: style.linestyle,
+    transparency: 80,
+    textcolor: style.color,
+    showLabel: false,
+    showPriceLabels: false,
+    "linetoolrectangle.color": style.color,
+    "linetoolrectangle.linecolor": style.color,
+    "linetoolrectangle.backgroundColor": style.color,
+    "linetoolrectangle.linewidth": style.linewidth,
+    "linetoolrectangle.linestyle": style.linestyle,
+    "linetoolrectangle.transparency": 80,
+    "linetoolrectangle.fillBackground": true,
+    "linetoolrectangle.showLabel": false,
+    "linetoolrectangle.showPriceLabels": false,
+  };
+}
+
+function projectStrokePoints(
+  stroke: ChanOverlayResponse["strokes"][number],
+  timeframe: string,
+  chartBars: ApiBar[],
+): { start: ShapePoint; end: ShapePoint } | null {
+  const startTime = Number(stroke.start?.base_ts ?? stroke.begin_base_ts ?? stroke.start?.time);
+  const endTime = Number(stroke.end?.base_ts ?? stroke.end_base_ts ?? stroke.end?.time);
+  const startPrice = Number(stroke.start?.price);
+  const endPrice = Number(stroke.end?.price);
+  if (
+    !Number.isFinite(startTime) ||
+    !Number.isFinite(endTime) ||
+    !Number.isFinite(startPrice) ||
+    !Number.isFinite(endPrice) ||
+    endTime <= startTime
+  ) {
+    return null;
+  }
+  const start = projectOverlayPointToChartTime(startTime, startPrice, stroke.level, timeframe, chartBars);
+  const end = projectOverlayPointToChartTime(endTime, endPrice, stroke.level, timeframe, chartBars);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return null;
+  }
+  return {
+    start: { time: start, price: startPrice },
+    end: { time: end, price: endPrice },
+  };
+}
+
+function isProjectedStrokeVisible(
+  projected: { start: ShapePoint; end: ShapePoint },
+  chartBars: ApiBar[],
+): boolean {
+  if (chartBars.length === 0) {
+    return true;
+  }
+  const first = chartBars[0]?.time;
+  const last = chartBars[chartBars.length - 1]?.time;
+  if (!Number.isFinite(first) || !Number.isFinite(last)) {
+    return true;
+  }
+  return projected.end.time >= first && projected.start.time <= last;
+}
+
+function projectCenterTimes(
+  center: ChanOverlayResponse["centers"][number],
+  timeframe: string,
+  chartBars: ApiBar[],
+): ProjectedCenterTimes | null {
+  const startTime = Number(center.begin_base_ts ?? center.start_time);
+  const endTime = Number(center.end_base_ts ?? center.end_time);
+  if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || endTime <= startTime) {
+    return null;
+  }
+  const start = projectOverlayTimeToChartTime(startTime, timeframe, chartBars);
+  const end = projectOverlayTimeToChartTime(endTime, timeframe, chartBars);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return null;
+  }
+  return { start, end };
+}
+
+function isProjectedCenterVisible(
+  projected: ProjectedCenterTimes,
+  chartBars: ApiBar[],
+): boolean {
+  if (chartBars.length === 0) {
+    return true;
+  }
+  const first = chartBars[0]?.time;
+  const last = chartBars[chartBars.length - 1]?.time;
+  if (!Number.isFinite(first) || !Number.isFinite(last)) {
+    return true;
+  }
+  return projected.end >= first && projected.start <= last;
+}
+
+function projectOverlayTimeToChartTime(
+  epochSeconds: number,
+  timeframe: string,
+  chartBars: ApiBar[],
+): number {
+  const visibleBar = chartBars.find((bar) => bar.time >= epochSeconds);
+  if (visibleBar) {
+    return visibleBar.time;
+  }
   const interval = INTERVAL_BY_TIMEFRAME[timeframe] ?? timeframe;
   const normalized = interval.toUpperCase();
   const minuteResolution = Number.parseInt(normalized, 10);
   if (Number.isFinite(minuteResolution) && minuteResolution > 0) {
     const rawMs = epochSeconds * 1000;
     const intervalMs = minuteResolution * 60 * 1000;
-    return Math.floor(rawMs / intervalMs) * intervalMs / 1000;
+    return Math.ceil(rawMs / intervalMs) * intervalMs / 1000;
   }
   return toTradingViewTime(epochSeconds, interval) / 1000;
 }
+
+function projectOverlayPointToChartTime(
+  epochSeconds: number,
+  price: number,
+  level: string,
+  timeframe: string,
+  chartBars: ApiBar[],
+): number {
+  const resolution = INTERVAL_BY_TIMEFRAME[timeframe] ?? timeframe;
+  const projected = projectChanPointToViewTime(
+    epochSeconds * 1000,
+    price,
+    level,
+    resolution,
+    chartBars.map((bar) => toTradingViewTime(bar.time, resolution)),
+    chartBars,
+  );
+  return projected / 1000;
+}
+
+export const __CHAN_WIDGET_TESTING__ = { projectOverlayPointToChartTime };
 
 async function ensureTradingViewScript(): Promise<boolean> {
   if (window.TradingView?.widget) {
@@ -861,11 +1284,27 @@ async function ensureTradingViewScript(): Promise<boolean> {
 
 function whenChartReady(widget: TradingViewWidget, timeoutMs = 10000): Promise<boolean> {
   return new Promise((resolve) => {
-    const timeout = window.setTimeout(() => resolve(false), timeoutMs);
-    widget.onChartReady(() => {
+    let settled = false;
+    const finish = (ready: boolean) => {
+      if (settled) return;
+      settled = true;
       window.clearTimeout(timeout);
-      resolve(true);
+      window.clearInterval(probe);
+      resolve(ready);
+    };
+    const probeActiveChart = () => {
+      try {
+        if (widget.activeChart()) finish(true);
+      } catch {
+        // TradingView throws until the chart API is usable.
+      }
+    };
+    const probe = window.setInterval(probeActiveChart, 100);
+    const timeout = window.setTimeout(() => finish(false), timeoutMs);
+    widget.onChartReady(() => {
+      finish(true);
     });
+    probeActiveChart();
   });
 }
 
@@ -966,3 +1405,13 @@ function getChartDataset(): DOMStringMap | null {
 function toTradingViewTheme(theme: ChartTheme): "Dark" | "Light" {
   return theme === "light" ? "Light" : "Dark";
 }
+
+export const __CHAN_WIDGET_RENDER_TESTING__ = {
+  centerDrawingKey,
+  ensureChanStudy,
+  whenChartReady,
+  reconcileStrokeDrawings,
+  renderChanStudy,
+  strokeDrawingKey,
+  validateChanOverlay: validateChanOverlayResponse,
+};

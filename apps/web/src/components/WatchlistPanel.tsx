@@ -25,8 +25,6 @@ import {
   type ProfileTheme,
   type StrategySignal,
   type SymbolProfile,
-  getMarketQuote,
-  getSymbolProfile,
   searchSymbolCatalog,
 } from "../api/marketData";
 import {
@@ -44,8 +42,10 @@ import { useLocalStorageState } from "../hooks/useLocalStorageState";
 
 type Props = {
   activeSymbol: string;
-  timeframe: string;
   onSelectSymbol(symbol: string): void;
+  onWatchlistSymbolsChange(symbols: string[]): void;
+  quotes: Record<string, MarketQuote>;
+  profile: SymbolProfile | null;
   authToken?: string;
 };
 
@@ -55,8 +55,10 @@ const MIN_PROFILE_HEIGHT = 238;
 
 export function WatchlistPanel({
   activeSymbol,
-  timeframe,
   onSelectSymbol,
+  onWatchlistSymbolsChange,
+  quotes,
+  profile,
   authToken,
 }: Props) {
   const [groups, setGroups] = useLocalStorageState<WatchlistGroup[]>(
@@ -67,16 +69,12 @@ export function WatchlistPanel({
   const [activeGroupId, setActiveGroupId] = useState(
     () => groups[0]?.id ?? FAVORITES_GROUP_ID,
   );
-  const [expandedGroupIds, setExpandedGroupIds] = useState<string[]>(() =>
-    groups.map((group) => group.id),
-  );
+  const [expandedGroupIds, setExpandedGroupIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<ApiSymbol[]>([]);
   const [searching, setSearching] = useState(false);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
-  const [quotes, setQuotes] = useState<Record<string, MarketQuote>>({});
-  const [profile, setProfile] = useState<SymbolProfile | null>(null);
   const [listHeight, setListHeight] = useLocalStorageState<number>(
     SPLIT_STORAGE_KEY,
     356,
@@ -100,18 +98,9 @@ export function WatchlistPanel({
     return Array.from(items.values());
   }, [groups]);
 
-  const selectedProfileItem = useMemo(() => {
-    if (activeSymbol) {
-      return (
-        watchlistItems.find((item) => item.symbol === activeSymbol) ??
-        createProfileItemFromSymbol(activeSymbol)
-      );
-    }
-    return (
-      activeGroup?.items[0] ??
-      watchlistItems[0]
-    );
-  }, [activeGroup?.items, activeSymbol, watchlistItems]);
+  useEffect(() => {
+    onWatchlistSymbolsChange(watchlistItems.map((item) => item.symbol));
+  }, [onWatchlistSymbolsChange, watchlistItems]);
 
   useEffect(() => {
     if (!authToken) {
@@ -132,7 +121,7 @@ export function WatchlistPanel({
           suppressNextWatchlistSyncRef.current = true;
           setGroups(remoteGroups);
           setActiveGroupId(remoteGroups[0]?.id ?? FAVORITES_GROUP_ID);
-          setExpandedGroupIds(remoteGroups.map((group) => group.id));
+          setExpandedGroupIds([]);
         } else {
           void saveUserSetting(authToken, "watchlist", { groups }).catch(() => {
             // Local watchlist remains authoritative when server sync fails.
@@ -167,12 +156,15 @@ export function WatchlistPanel({
       const detail = (event as CustomEvent<{ groups?: unknown }>).detail;
       if (detail?.groups) {
         const next = reviveWatchlistGroups(detail.groups);
+        const currentGroupIds = new Set(groups.map((group) => group.id));
+        const addedGroup = next.find((group) => !currentGroupIds.has(group.id));
+        const targetGroupId = addedGroup?.id ?? activeGroupId ?? FAVORITES_GROUP_ID;
         setGroups(next);
-        setActiveGroupId(FAVORITES_GROUP_ID);
+        setActiveGroupId(targetGroupId);
         setExpandedGroupIds((current) =>
-          current.includes(FAVORITES_GROUP_ID)
+          current.includes(targetGroupId)
             ? current
-            : [FAVORITES_GROUP_ID, ...current],
+            : [targetGroupId, ...current],
         );
       }
     };
@@ -180,7 +172,7 @@ export function WatchlistPanel({
     return () => {
       window.removeEventListener(WATCHLIST_UPDATED_EVENT, handleExternalUpdate);
     };
-  }, [setGroups]);
+  }, [activeGroupId, groups, setGroups]);
 
   useEffect(() => {
     if (groups.length === 0) {
@@ -194,11 +186,7 @@ export function WatchlistPanel({
   useEffect(() => {
     setExpandedGroupIds((current) => {
       const validIds = new Set(groups.map((group) => group.id));
-      const next = current.filter((id) => validIds.has(id));
-      if (next.length === 0 && groups[0]) {
-        next.push(groups[0].id);
-      }
-      return next;
+      return current.filter((id) => validIds.has(id));
     });
   }, [groups]);
 
@@ -235,41 +223,6 @@ export function WatchlistPanel({
       controller.abort();
     };
   }, [groups, query]);
-
-  useEffect(() => {
-    if (watchlistItems.length === 0) {
-      return;
-    }
-    const controller = new AbortController();
-    watchlistItems.forEach((item) => {
-      void getMarketQuote(toApiSymbol(item), timeframe, controller.signal).then(
-        (quote) => {
-          if (!controller.signal.aborted) {
-            setQuotes((current) => ({ ...current, [item.symbol]: quote }));
-          }
-        },
-      );
-    });
-    return () => controller.abort();
-  }, [timeframe, watchlistItems]);
-
-  useEffect(() => {
-    if (!selectedProfileItem) {
-      setProfile(null);
-      return;
-    }
-    const controller = new AbortController();
-    void getSymbolProfile(
-      toApiSymbol(selectedProfileItem),
-      timeframe,
-      controller.signal,
-    ).then((nextProfile) => {
-      if (!controller.signal.aborted) {
-        setProfile(nextProfile);
-      }
-    });
-    return () => controller.abort();
-  }, [selectedProfileItem, timeframe]);
 
   useEffect(() => {
     if (!resizing) {
@@ -848,16 +801,6 @@ function toApiSymbol(item: WatchlistItem): ApiSymbol {
   };
 }
 
-function createProfileItemFromSymbol(symbol: string): WatchlistItem {
-  const normalized = symbol.trim().toUpperCase();
-  const [code = normalized, suffix] = normalized.split(".");
-  return {
-    symbol: normalized,
-    name: code,
-    exchange: suffix ? suffix.toUpperCase() : inferExchangeFromCode(code),
-  };
-}
-
 function readRemoteWatchlistGroups(value: unknown): WatchlistGroup[] | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -889,13 +832,16 @@ function buildLocalSearchResults(
   if (codeMatch) {
     const code = codeMatch[1];
     const exchange = codeMatch[2] ?? inferExchangeFromCode(code);
-    results.push({
-      symbol: `${code}.${exchange}`,
-      code,
-      exchange,
-      name: knownItems.find((item) => item.symbol === `${code}.${exchange}`)?.name ?? code,
-      asset_type: "stock",
-    });
+    const knownItem = knownItems.find((item) => item.symbol === `${code}.${exchange}`);
+    if (knownItem) {
+      results.push({
+        symbol: knownItem.symbol,
+        code,
+        exchange,
+        name: knownItem.name,
+        asset_type: "stock",
+      });
+    }
   }
   return mergeSearchResults([], results);
 }

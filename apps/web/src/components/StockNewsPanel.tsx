@@ -1,26 +1,14 @@
 import { Newspaper, RefreshCcw } from "lucide-react";
-import { useEffect, useState } from "react";
-import { getMockStockNews, type NewsItem, type StockNewsFeed } from "../api/marketContracts";
+import { useState } from "react";
+import { type NewsItem, type StockNewsFeed } from "../api/marketContracts";
 
 type Props = {
   activeSymbol: string;
+  feed: StockNewsFeed | null;
 };
 
-export function StockNewsPanel({ activeSymbol }: Props) {
-  const [feed, setFeed] = useState<StockNewsFeed | null>(null);
+export function StockNewsPanel({ activeSymbol, feed }: Props) {
   const [activeTab, setActiveTab] = useState<"stock" | "global">("stock");
-
-  useEffect(() => {
-    let cancelled = false;
-    void getMockStockNews(activeSymbol).then((next) => {
-      if (!cancelled) {
-        setFeed(next);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeSymbol]);
 
   const items = activeTab === "stock" ? feed?.stockNews ?? [] : feed?.globalNews ?? [];
 
@@ -72,15 +60,49 @@ export function StockNewsPanel({ activeSymbol }: Props) {
 function NewsRow({ item }: { item: NewsItem }) {
   return (
     <article className="tv-news-row">
-      <div>
-        <strong>{item.title}</strong>
-        {item.summary ? <p>{item.summary}</p> : null}
-      </div>
+      {item.url ? (
+        <a className="tv-news-row-title" href={item.url} target="_blank" rel="noopener noreferrer">
+          {item.title}
+        </a>
+      ) : (
+        <strong className="tv-news-row-title">{item.title}</strong>
+      )}
+      {item.relatedSymbols?.length ? (
+        <div className="tv-news-related-symbols" aria-label="相关新闻标的">
+          {item.relatedSymbols.map((related) => (
+            <span
+              className="tv-news-symbol-chip"
+              data-direction={related.changePercent === null ? "flat" : related.changePercent >= 0 ? "up" : "down"}
+              key={related.symbol}
+            >
+              <b>{related.symbol}</b>
+              <span>{formatChangePercent(related.changePercent)}</span>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <footer>
         <span>{item.source}</span>
-        <span>{item.time}</span>
-        {item.tags?.slice(0, 2).map((tag) => <em key={tag}>{tag}</em>)}
+        <time dateTime={item.time}>{formatNewsTime(item.time)}</time>
       </footer>
     </article>
   );
+}
+
+function formatChangePercent(value: number | null): string {
+  if (value === null) return "--";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function formatNewsTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
 }

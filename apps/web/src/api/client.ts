@@ -1,4 +1,4 @@
-import { apiUrl, getApiToken } from "../config";
+import { ALLOW_CHART_V2_FALLBACK, apiUrl, getApiToken } from "../config";
 
 export type ApiSymbol = {
   symbol: string;
@@ -35,6 +35,7 @@ export type ChanPoint = {
 
 export type ChanStroke = {
   id: string;
+  seq?: number | null;
   level: string;
   mode: string;
   start: ChanPoint;
@@ -49,6 +50,7 @@ export type ChanStroke = {
 
 export type ChanCenter = {
   id: string;
+  seq?: number | null;
   level: string;
   mode: string;
   start_time: number;
@@ -64,6 +66,7 @@ export type ChanCenter = {
 
 export type ChanSignal = {
   id: string;
+  seq?: number | null;
   level: string;
   mode: string;
   time: number;
@@ -131,12 +134,18 @@ export type ApiChartBundleResponse = {
   bars: ApiBar[];
   chan: ChanOverlayResponse;
   source_watermarks?: Record<string, unknown>;
-  warnings?: string[];
+  warnings?: ChartBundleWarning[];
 };
 
 export type ApiChartWindowResponse = ApiChartBundleResponse;
 
-export const DEFAULT_CHAN_LEVELS = ["5f", "30f", "1d"] as const;
+export type ChartBundleWarning = {
+  code: string;
+  message: string;
+  details?: Record<string, unknown>;
+};
+
+export const DEFAULT_CHAN_LEVELS = ["5f", "30f", "1d", "1w", "1m"] as const;
 export const DEFAULT_CHAN_MODES = ["confirmed", "predictive"] as const;
 
 function headers(): HeadersInit {
@@ -181,12 +190,10 @@ export async function getBars(
   to?: number,
   signal?: AbortSignal,
 ): Promise<BarsResponse> {
-  const bundle = await getChartBundle(symbol, timeframe, limit, from, to, signal);
-  return {
-    symbol: bundle.symbol,
-    timeframe: bundle.chart_timeframe,
-    bars: bundle.bars,
-  };
+  return getJson<BarsResponse>(
+    chartBarsPath(symbol, timeframe, limit, from, to),
+    signal,
+  );
 }
 
 export async function getChartBundle(
@@ -216,8 +223,12 @@ export async function getChartBundle(
     if (v3Bundle) {
       return v3Bundle;
     }
+    throw new Error("Invalid chart-bundle.v3 response");
   } catch (error) {
     if (isAbortError(error)) {
+      throw error;
+    }
+    if (!ALLOW_CHART_V2_FALLBACK) {
       throw error;
     }
   }
@@ -252,6 +263,36 @@ export async function getChartWindow(
   modes: readonly string[] = DEFAULT_CHAN_MODES,
 ): Promise<ApiChartWindowResponse> {
   return getChartBundle(symbol, timeframe, limit, from, to, signal, levels, modes);
+}
+
+export async function getChanOverlay(
+  symbol: string,
+  timeframe: string,
+  limit = 300,
+  from?: number,
+  to?: number,
+  signal?: AbortSignal,
+  levels: readonly string[] = DEFAULT_CHAN_LEVELS,
+  modes: readonly string[] = DEFAULT_CHAN_MODES,
+): Promise<ChanOverlayResponse> {
+  const path = chartOverlayPath(symbol, timeframe, limit, from, to, levels, modes);
+  const overlay = normalizeStandaloneChanOverlayForFrontend(
+    await getJson<unknown>(
+      path,
+      signal,
+    ),
+    {
+      symbol,
+      chartTimeframe: timeframe,
+      levels,
+      modes,
+      requestedBarCount: limit,
+    },
+  );
+  if (!overlay) {
+    throw new Error("Invalid chart overlay response");
+  }
+  return overlay;
 }
 
 export function normalizeChartBundleForFrontend(
@@ -318,7 +359,46 @@ export function normalizeChartBundleForFrontend(
     bars,
     chan,
     source_watermarks: asRecord(bundle.source_watermarks) ?? undefined,
-    warnings: readStringArray(bundle.warnings) ?? undefined,
+    warnings: readWarnings(bundle.warnings),
+  };
+}
+
+export function normalizeStandaloneChanOverlayForFrontend(
+  payload: unknown,
+  fallback: {
+    symbol: string;
+    chartTimeframe: string;
+    levels: readonly string[];
+    modes?: readonly string[];
+    requestedBarCount: number;
+  },
+): ChanOverlayResponse | null {
+  const rawChan = asRecord(payload);
+  if (!rawChan) {
+    return null;
+  }
+  const symbol = readString(rawChan.symbol) ?? fallback.symbol;
+  const chartTimeframe = readString(rawChan.chart_timeframe) ?? fallback.chartTimeframe;
+  const analysisLevels = readStringArray(rawChan.levels) ?? [...fallback.levels];
+  const snapshotVersion = readString(rawChan.snapshot_version) ?? "";
+  const overlay = normalizeChanOverlayForFrontend(rawChan, {
+    symbol,
+    chartTimeframe,
+    snapshotVersion,
+    baseTimeframe: readString(rawChan.base_timeframe) ?? "5f",
+    baseTsSemantics: readString(rawChan.base_ts_semantics) ?? "bar_end",
+    analysisLevels,
+    requestedBarCount:
+      readNumber(rawChan.requested_bar_count) ?? fallback.requestedBarCount,
+  });
+  if (!overlay) {
+    return null;
+  }
+  return {
+    ...overlay,
+    modes: overlay.modes.length
+      ? overlay.modes
+      : [...(fallback.modes ?? DEFAULT_CHAN_MODES)],
   };
 }
 
@@ -347,20 +427,56 @@ function chartBundlePath(
     timeframe,
     limit: String(limit),
   });
-  if (version === "v2") {
-    params.set("levels", levels.join(","));
-    params.set("modes", modes.join(","));
-  }
+  params.set("levels", levels.join(","));
+  params.set("modes", modes.join(","));
   if (from !== undefined) params.set("from", new Date(from * 1000).toISOString());
   if (to !== undefined) params.set("to", new Date(to * 1000).toISOString());
   return `/api/${version}/chart/bundle?${params.toString()}`;
+}
+
+function chartBarsPath(
+  symbol: string,
+  timeframe: string,
+  limit: number,
+  from: number | undefined,
+  to: number | undefined,
+): string {
+  const params = new URLSearchParams({
+    symbol,
+    timeframe,
+    limit: String(limit),
+  });
+  if (from !== undefined) params.set("from", new Date(from * 1000).toISOString());
+  if (to !== undefined) params.set("to", new Date(to * 1000).toISOString());
+  return `/api/v3/chart/bars?${params.toString()}`;
+}
+
+function chartOverlayPath(
+  symbol: string,
+  timeframe: string,
+  limit: number,
+  from: number | undefined,
+  to: number | undefined,
+  levels: readonly string[],
+  modes: readonly string[],
+): string {
+  const params = new URLSearchParams({
+    symbol,
+    timeframe,
+    limit: String(limit),
+    levels: levels.join(","),
+    modes: modes.join(","),
+  });
+  if (from !== undefined) params.set("from", new Date(from * 1000).toISOString());
+  if (to !== undefined) params.set("to", new Date(to * 1000).toISOString());
+  return `/api/v3/chart/overlay?${params.toString()}`;
 }
 
 function normalizeChanOverlayForFrontend(
   rawChan: Record<string, unknown>,
   context: ChanNormalizeContext,
 ): ChanOverlayResponse | null {
-  const nestedLevels = asRecord(rawChan.levels);
+  const nestedLevels = Array.isArray(rawChan.levels) ? null : asRecord(rawChan.levels);
   const flatStrokes = Array.isArray(rawChan.strokes);
   if (nestedLevels) {
     return normalizeNestedChanOverlay(rawChan, nestedLevels, context);
@@ -485,6 +601,7 @@ function normalizeStroke(value: unknown, fallbackLevel: string): ChanStroke | nu
   return {
     ...(item as Partial<ChanStroke>),
     id: readString(item.id) ?? `${fallbackLevel}:${beginBaseTs}:${endBaseTs}`,
+    seq: readNumber(item.seq),
     level: readString(item.level) ?? fallbackLevel,
     mode: readString(item.mode) ?? "confirmed",
     start: {
@@ -534,6 +651,7 @@ function normalizeCenter(value: unknown, fallbackLevel: string): ChanCenter | nu
   return {
     ...(item as Partial<ChanCenter>),
     id: readString(item.id) ?? `${fallbackLevel}:center:${beginBaseTs}:${endBaseTs}`,
+    seq: readNumber(item.seq),
     level: readString(item.level) ?? fallbackLevel,
     mode: readString(item.mode) ?? "confirmed",
     start_time: readNumber(item.start_time) ?? beginBaseTs,
@@ -570,6 +688,7 @@ function normalizeSignal(value: unknown, fallbackLevel: string): ChanSignal | nu
   return {
     ...(item as Partial<ChanSignal>),
     id: readString(item.id) ?? `${fallbackLevel}:signal:${baseTs}:${price}`,
+    seq: readNumber(item.seq),
     level: readString(item.level) ?? fallbackLevel,
     mode: readString(item.mode) ?? "confirmed",
     time: readNumber(item.time) ?? baseTs,
@@ -689,6 +808,31 @@ function readStringArray(value: unknown): string[] | null {
     return null;
   }
   return value.filter((item): item is string => typeof item === "string");
+}
+
+function readWarnings(value: unknown): ChartBundleWarning[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const warnings = value
+    .map((item): ChartBundleWarning | null => {
+      if (typeof item === "string" && item.trim()) {
+        return { code: item.trim(), message: item.trim() };
+      }
+      const record = asRecord(item);
+      const code = readString(record?.code);
+      const message = readString(record?.message) ?? code;
+      if (!code || !message) {
+        return null;
+      }
+      return {
+        code,
+        message,
+        details: asRecord(record?.details) ?? undefined,
+      };
+    })
+    .filter((item): item is ChartBundleWarning => item !== null);
+  return warnings.length ? warnings : undefined;
 }
 
 function readString(value: unknown): string | null {

@@ -15,6 +15,10 @@ export function createChartSocket(): WebSocket {
   return createSocket("/ws/v2/chart");
 }
 
+export function createRealtimeSocket(): WebSocket {
+  return createSocket("/ws/v1/realtime");
+}
+
 function createSocket(path: string): WebSocket {
   const url = new URL(webSocketUrl(path));
   url.searchParams.set("token", getApiToken());

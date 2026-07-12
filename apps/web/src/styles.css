@@ -20,6 +20,21 @@
   --amber: #e5b95c;
 }
 
+body[data-app-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f7fa;
+  --panel: #ffffff;
+  --panel-strong: #edf2f7;
+  --line: #cbd5df;
+  --line-bright: #8ba4b8;
+  --text: #17212b;
+  --muted: #526473;
+  --cyan: #087ca7;
+  --green: #07865b;
+  --red: #c9384d;
+  --amber: #9b6400;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -44,7 +59,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -58,7 +74,8 @@ button:disabled {
 }
 
 input,
-select {
+select,
+textarea {
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: 5px;
@@ -68,9 +85,15 @@ select {
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   border-color: var(--cyan);
   box-shadow: 0 0 0 3px rgba(79, 195, 247, 0.14);
+}
+
+textarea {
+  resize: vertical;
+  padding: 9px 10px;
 }
 
 .terminal-shell {
@@ -314,6 +337,37 @@ select:focus {
 
 body[data-app-theme="light"] .chart-frame {
   background: #ffffff;
+}
+
+body[data-app-theme="light"] .terminal-shell,
+body[data-app-theme="light"] .terminal-shell--chart {
+  background: rgba(244, 247, 250, 0.92);
+}
+
+body[data-app-theme="light"] input,
+body[data-app-theme="light"] select,
+body[data-app-theme="light"] textarea,
+body[data-app-theme="light"] .shell-header,
+body[data-app-theme="light"] .token-create,
+body[data-app-theme="light"] .token-table,
+body[data-app-theme="light"] .admin-feature-panel,
+body[data-app-theme="light"] .admin-test-result,
+body[data-app-theme="light"] .llm-provider-card {
+  background: #ffffff;
+  color: #17212b;
+}
+
+body[data-app-theme="light"] .view-tabs,
+body[data-app-theme="light"] .ghost-button,
+body[data-app-theme="light"] .admin-config-actions button,
+body[data-app-theme="light"] .llm-provider-head button {
+  background: #edf2f7;
+  color: #17212b;
+}
+
+body[data-app-theme="light"] .view-tabs button[data-active="true"] {
+  background: #d8ecf5;
+  color: #10384a;
 }
 
 .screener-dock {
@@ -912,6 +966,121 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
   font-size: 11px;
 }
 
+.admin-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.admin-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.admin-field-wide {
+  grid-column: 1 / -1;
+}
+
+.admin-field span,
+.admin-check span {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.admin-field input,
+.admin-field select,
+.admin-field textarea {
+  width: 100%;
+}
+
+.admin-field input,
+.admin-field select {
+  height: 38px;
+  padding: 0 10px;
+}
+
+.admin-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  color: var(--text);
+}
+
+.admin-config-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.admin-config-actions button,
+.llm-provider-head button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  border: 1px solid var(--line-bright);
+  border-radius: 5px;
+  background: #111b25;
+  color: var(--text);
+  padding: 0 11px;
+}
+
+.admin-config-actions button:hover,
+.llm-provider-head button:hover {
+  border-color: var(--cyan);
+}
+
+.admin-test-result {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 5px;
+  padding: 6px 10px;
+  color: var(--muted);
+  background: rgba(8, 12, 16, 0.72);
+  font-size: 12px;
+}
+
+.admin-test-result[data-ok="true"] {
+  border-color: rgba(57, 217, 138, 0.44);
+  color: #d8f6e8;
+  background: rgba(19, 51, 38, 0.5);
+}
+
+.admin-test-result[data-ok="false"] {
+  border-color: rgba(255, 111, 111, 0.44);
+  color: #ffd7d7;
+  background: rgba(70, 23, 23, 0.42);
+}
+
+.llm-provider-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.llm-provider-card {
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 6px;
+  background: rgba(16, 23, 32, 0.58);
+  padding: 12px;
+}
+
+.llm-provider-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
 .token-row {
   display: grid;
   grid-template-columns: minmax(180px, 1.2fr) 110px 120px 190px 96px;
@@ -1010,6 +1179,15 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
 
   .token-create {
     grid-template-columns: 1fr;
+  }
+
+  .admin-form-grid,
+  .admin-feature-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-field-wide {
+    grid-column: auto;
   }
 }
 
@@ -1666,6 +1844,46 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
   box-shadow: inset 0 0 0 1px #e0e3eb;
 }
 
+body[data-app-theme="dark"] .tv-right-sidebar {
+  color: #dce6ef;
+}
+
+body[data-app-theme="dark"] .tv-side-panel,
+body[data-app-theme="dark"] .tv-right-rail,
+body[data-app-theme="dark"] .tv-watchlist-panel,
+body[data-app-theme="dark"] .tv-alerts-panel,
+body[data-app-theme="dark"] .tv-utility-panel {
+  border-color: #273745;
+  background: #101720;
+  color: #dce6ef;
+}
+
+body[data-app-theme="dark"] .tv-right-rail button,
+body[data-app-theme="dark"] .tv-panel-title-button,
+body[data-app-theme="dark"] .tv-watchlist-group-header {
+  color: #dce6ef;
+}
+
+body[data-app-theme="dark"] .tv-right-rail button:hover,
+body[data-app-theme="dark"] .tv-right-rail button[data-active="true"],
+body[data-app-theme="dark"] .tv-watchlist-group-header:hover {
+  background: #1c2b38;
+}
+
+body[data-app-theme="dark"] .tv-panel-toolbar,
+body[data-app-theme="dark"] .tv-watchlist-group-section,
+body[data-app-theme="dark"] .tv-watchlist-table-head,
+body[data-app-theme="dark"] .tv-symbol-profile-section {
+  border-color: #273745;
+}
+
+body[data-app-theme="dark"] .tv-watchlist-search input,
+body[data-app-theme="dark"] .tv-watchlist-group-edit input {
+  border-color: #334756;
+  background: #0b1118;
+  color: #e8edf2;
+}
+
 .tv-panel-toolbar,
 .tv-panel-actions,
 .tv-watchlist-table-head,
@@ -1989,8 +2207,8 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
 
 .tv-news-row {
   display: grid;
-  gap: 6px;
-  padding: 10px 12px;
+  gap: 5px;
+  padding: 9px 12px;
   border-bottom: 1px solid #f0f3fa;
 }
 
@@ -2000,18 +2218,46 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
   background: #f7f8fb;
 }
 
-.tv-news-row strong {
+.tv-news-row-title {
   display: block;
   color: #131722;
   font-size: 13px;
   font-weight: 600;
   line-height: 1.35;
+  text-decoration: none;
 }
 
-.tv-news-row p {
-  margin: 4px 0 0;
+.tv-news-row a.tv-news-row-title:hover {
+  color: #2962ff;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.tv-news-related-symbols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.tv-news-symbol-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px;
+  border: 1px solid #e0e3eb;
+  border-radius: 4px;
+  background: #f7f8fb;
   color: #50535e;
-  line-height: 1.45;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tv-news-symbol-chip[data-direction="up"] span {
+  color: #089981;
+}
+
+.tv-news-symbol-chip[data-direction="down"] span {
+  color: #f23645;
 }
 
 .tv-news-row footer {
@@ -2057,12 +2303,24 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
   font-weight: 600;
 }
 
+.tv-market-block > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 6px 8px 9px;
+}
+
 .tv-strength-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 3px 10px;
-  padding: 8px 12px;
-  border-top: 1px solid #f7f8fb;
+  align-items: center;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 7px 8px;
+  border: 1px solid #e8eaef;
+  border-left: 3px solid #2962ff;
+  border-radius: 5px;
+  background: #fafbfc;
 }
 
 .tv-strength-row div {
@@ -2072,7 +2330,7 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
 }
 
 .tv-strength-row div:last-of-type {
-  justify-items: end;
+  justify-items: start;
 }
 
 .tv-strength-row strong,
@@ -2084,10 +2342,21 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
   white-space: nowrap;
 }
 
+.tv-strength-row strong {
+  max-width: 100%;
+  font-size: 12px;
+}
+
 .tv-strength-row span,
 .tv-strength-row small {
   color: #787b86;
   font-size: 11px;
+}
+
+.tv-strength-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tv-strength-row em,
@@ -2095,6 +2364,24 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
 .tv-compact-row small {
   font-style: normal;
   font-variant-numeric: tabular-nums;
+}
+
+.tv-strength-row em {
+  padding: 2px 5px;
+  border-radius: 3px;
+  background: #f0f3fa;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.tv-strength-row em[data-direction="up"] {
+  color: #089981;
+  background: rgb(8 153 129 / 10%);
+}
+
+.tv-strength-row em[data-direction="down"] {
+  color: #f23645;
+  background: rgb(242 54 69 / 10%);
 }
 
 .tv-strength-row p {
@@ -2865,4 +3152,439 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
     width: min(332px, calc(100vw - 52px));
     min-width: 0;
   }
+}
+
+.chart-theme-toggle {
+  position: absolute;
+  top: 4px;
+  left: 416px;
+  z-index: 29;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 30px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #b2b5be;
+}
+
+.chart-theme-toggle:hover {
+  background: rgba(120, 123, 134, 0.16);
+  color: #ffffff;
+}
+
+body[data-app-theme="light"] .chart-theme-toggle {
+  color: #434651;
+}
+
+body[data-app-theme="light"] .chart-theme-toggle:hover {
+  background: rgba(42, 46, 57, 0.08);
+  color: #131722;
+}
+
+/* Sidebar components historically used literal light colors. Keep this final
+   theme layer after those rules so the whole panel follows the app theme. */
+body[data-app-theme="dark"] :where(
+  .tv-side-panel,
+  .tv-right-rail,
+  .tv-watchlist-panel,
+  .tv-alerts-panel,
+  .tv-utility-panel,
+  .tv-watchlist-search-zone,
+  .tv-watchlist-groups-list,
+  .tv-watchlist-group-section,
+  .tv-watchlist-group-body,
+  .tv-symbol-card,
+  .tv-symbol-profile-section,
+  .tv-symbol-theme-pill,
+  .tv-chan-state-pill,
+  .tv-strategy-signal-row,
+  .tv-more-panel,
+  .tv-more-panel > div,
+  .tv-alert-row,
+  .tv-alert-dialog
+) {
+  border-color: #273745;
+  background: #101720;
+  color: #e8edf2;
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-panel-toolbar,
+  .tv-watchlist-group-header,
+  .tv-watchlist-table-head,
+  .tv-watchlist-row,
+  .tv-symbol-card-head,
+  .tv-symbol-price-line,
+  .tv-symbol-profile-section h3,
+  .tv-symbol-profile-section dt,
+  .tv-symbol-profile-section dd,
+  .tv-symbol-theme-pill span,
+  .tv-symbol-theme-pill strong,
+  .tv-chan-state-pill,
+  .tv-strategy-signal-row,
+  .tv-more-panel strong,
+  .tv-more-panel small,
+  .tv-more-kicker,
+  .tv-alert-row,
+  .tv-alert-row-head strong,
+  .tv-alert-row p,
+  .tv-utility-panel header
+) {
+  border-color: #273745;
+  color: #dce6ef;
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-watchlist-search input,
+  .tv-watchlist-group-edit input,
+  .tv-alert-dialog input,
+  .tv-alert-dialog select,
+  .tv-alert-dialog textarea,
+  .tv-more-panel button
+) {
+  border-color: #334756;
+  background: #0b1118;
+  color: #e8edf2;
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-watchlist-group-header:hover,
+  .tv-watchlist-row:hover,
+  .tv-right-rail button:hover,
+  .tv-right-rail button[data-active="true"],
+  .tv-more-panel button:hover
+) {
+  background: #1c2b38;
+}
+
+body[data-app-theme="dark"] [data-direction="up"] {
+  color: #26a69a;
+}
+
+body[data-app-theme="dark"] [data-direction="down"] {
+  color: #ef5350;
+}
+
+body[data-app-theme="dark"] .tv-right-sidebar {
+  --sidebar-bg: #0d1721;
+  --sidebar-surface: #142230;
+  --sidebar-surface-hover: #1c3041;
+  --sidebar-surface-active: #243b4d;
+  --sidebar-border: #344b5d;
+  --sidebar-text: #f1f6fa;
+  --sidebar-muted: #a9bac8;
+  --sidebar-accent: #58bce8;
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-side-panel,
+  .tv-right-rail,
+  .tv-watchlist-panel,
+  .tv-alerts-panel,
+  .tv-utility-panel,
+  .tv-market-panel,
+  .tv-watchlist-content,
+  .tv-watchlist-search-zone,
+  .tv-watchlist-groups-list,
+  .tv-watchlist-group-section,
+  .tv-watchlist-group-body,
+  .tv-watchlist-table-head,
+  .tv-watchlist-row,
+  .tv-symbol-card,
+  .tv-symbol-profile-section,
+  .tv-alert-tabs,
+  .tv-alert-toolbar,
+  .tv-alert-list,
+  .tv-panel-empty,
+  .tv-market-panel-header,
+  .tv-market-meta,
+  .tv-strength-summary,
+  .tv-market-block,
+  .tv-news-list,
+  .tv-news-row,
+  .tv-strength-row,
+  .tv-compact-row,
+  .tv-utility-empty,
+  .tv-more-panel
+) {
+  border-color: var(--sidebar-border);
+  background: var(--sidebar-bg);
+  color: var(--sidebar-text);
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-watchlist-search,
+  .tv-watchlist-search input,
+  .tv-symbol-results,
+  .tv-symbol-theme-pill,
+  .tv-chan-state-pill,
+  .tv-strategy-signal-row,
+  .tv-alert-dialog,
+  .tv-alert-dialog input,
+  .tv-alert-dialog select,
+  .tv-alert-dialog textarea,
+  .tv-more-panel > div,
+  .tv-more-panel button
+) {
+  border-color: var(--sidebar-border);
+  background: var(--sidebar-surface);
+  color: var(--sidebar-text);
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-panel-title-button,
+  .tv-panel-actions button,
+  .tv-watchlist-group-header,
+  .tv-watchlist-group-edit button,
+  .tv-watchlist-row,
+  .tv-watchlist-row strong,
+  .tv-symbol-card-head strong,
+  .tv-symbol-price-line strong,
+  .tv-symbol-card dd,
+  .tv-symbol-theme-pill strong,
+  .tv-chan-state-pill strong,
+  .tv-strategy-signal-row strong,
+  .tv-alert-tabs button,
+  .tv-alert-toolbar button,
+  .tv-alert-row,
+  .tv-alert-row-head strong,
+  .tv-alert-row p,
+  .tv-panel-empty,
+  .tv-panel-empty p,
+  .tv-market-panel-header,
+  .tv-market-panel-header strong,
+  .tv-news-row strong,
+  .tv-news-row-title,
+  .tv-strength-row strong,
+  .tv-compact-row span,
+  .tv-market-block h3,
+  .tv-utility-panel header,
+  .tv-more-panel strong,
+  .tv-more-panel button
+) {
+  color: var(--sidebar-text);
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-watchlist-table-head,
+  .tv-watchlist-row > button:first-child strong,
+  .tv-symbol-card-head span,
+  .tv-symbol-profile-section h3,
+  .tv-symbol-card dt,
+  .tv-symbol-theme-pill span,
+  .tv-symbol-theme-pill em,
+  .tv-chan-state-pill span,
+  .tv-chan-state-pill em,
+  .tv-strategy-signal-row span,
+  .tv-alert-toolbar span,
+  .tv-alert-row-head span,
+  .tv-alert-row small,
+  .tv-alert-row time,
+  .tv-panel-empty.compact,
+  .tv-market-panel-header span,
+  .tv-market-meta,
+  .tv-news-row p,
+  .tv-news-row footer,
+  .tv-strength-row span,
+  .tv-strength-row small,
+  .tv-strength-row p,
+  .tv-compact-row small,
+  .tv-utility-empty,
+  .tv-more-panel small,
+  .tv-more-kicker
+) {
+  color: var(--sidebar-muted);
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-watchlist-group-section[data-active="true"] > .tv-watchlist-group-header,
+  .tv-watchlist-group-section:has(.tv-watchlist-group-edit),
+  .tv-watchlist-row[data-active="true"],
+  .tv-alert-tabs button[data-active="true"],
+  .tv-market-tabs button[data-active="true"],
+  .tv-right-rail button[data-active="true"]
+) {
+  border-color: var(--sidebar-border);
+  background: var(--sidebar-surface-active);
+  color: var(--sidebar-text);
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-panel-actions button:hover,
+  .tv-alert-toolbar button:hover,
+  .tv-mini-icon-button:hover,
+  .tv-watchlist-group-header:hover,
+  .tv-watchlist-row:hover,
+  .tv-alert-row:hover,
+  .tv-news-row:hover,
+  .tv-strength-row:hover,
+  .tv-compact-row:hover,
+  .tv-more-panel button:hover,
+  .tv-right-rail button:hover
+) {
+  background: var(--sidebar-surface-hover);
+  color: var(--sidebar-text);
+}
+
+body[data-app-theme="dark"] :where(
+  .tv-watchlist-group-header small,
+  .tv-alert-toggle,
+  .tv-market-tabs button
+) {
+  border-color: var(--sidebar-border);
+  background: var(--sidebar-surface);
+  color: var(--sidebar-muted);
+}
+
+body[data-app-theme="dark"] .tv-watchlist-fixed-label {
+  background: rgb(88 188 232 / 16%);
+  color: var(--sidebar-accent);
+}
+
+body[data-app-theme="dark"] .tv-watchlist-resizer {
+  border-color: var(--sidebar-border);
+  background: #1a2936;
+}
+
+body[data-app-theme="dark"] .tv-watchlist-resizer span {
+  background: #6f8799;
+}
+
+body[data-app-theme="dark"] .tv-news-row em {
+  color: var(--sidebar-accent);
+}
+
+body[data-app-theme="dark"] .tv-news-symbol-chip {
+  border-color: var(--sidebar-border);
+  background: var(--sidebar-surface);
+  color: var(--sidebar-text-muted);
+}
+
+body[data-app-theme="dark"] .tv-news-row a.tv-news-row-title:hover {
+  color: var(--sidebar-accent);
+}
+
+body[data-app-theme="dark"] .tv-strength-row {
+  border-color: var(--sidebar-border);
+  border-left-color: var(--sidebar-accent);
+  background: var(--sidebar-surface);
+}
+
+body[data-app-theme="dark"] .tv-strength-row em {
+  background: var(--sidebar-surface-hover);
+}
+
+body[data-app-theme="dark"] .tv-side-panel,
+body[data-app-theme="dark"] .tv-right-rail,
+body[data-app-theme="dark"] .tv-watchlist-panel,
+body[data-app-theme="dark"] .tv-alerts-panel,
+body[data-app-theme="dark"] .tv-utility-panel {
+  border-color: var(--sidebar-border);
+  background: var(--sidebar-bg);
+  color: var(--sidebar-text);
+}
+
+body[data-app-theme="dark"] .tv-watchlist-group-section[data-active="true"] > .tv-watchlist-group-header,
+body[data-app-theme="dark"] .tv-watchlist-group-section:has(.tv-watchlist-group-edit),
+body[data-app-theme="dark"] .tv-watchlist-row[data-active="true"],
+body[data-app-theme="dark"] .tv-alert-tabs button[data-active="true"],
+body[data-app-theme="dark"] .tv-market-tabs button[data-active="true"] {
+  border-color: var(--sidebar-border);
+  background: var(--sidebar-surface-active);
+  color: var(--sidebar-text);
+}
+
+body[data-app-theme="dark"] .tv-chan-state-pill strong[data-direction="flat"],
+body[data-app-theme="dark"] .tv-strategy-signal-row > strong {
+  color: var(--sidebar-text);
+  font-weight: 650;
+}
+
+body[data-app-theme="dark"] .tv-chan-state-pill > span,
+body[data-app-theme="dark"] .tv-chan-state-pill > em,
+body[data-app-theme="dark"] .tv-strategy-signal-row > span {
+  color: var(--sidebar-muted);
+}
+
+/* Keep every application-owned surface aligned with the chart canvas. */
+body[data-app-theme="dark"] {
+  --app-canvas: #191919;
+  --app-canvas-border: #2a2e39;
+  background: var(--app-canvas);
+}
+
+body[data-app-theme="light"] {
+  --app-canvas: #ffffff;
+  --app-canvas-border: #d1d4dc;
+  background: var(--app-canvas);
+}
+
+body[data-app-theme] :is(
+  .terminal-shell,
+  .terminal-shell--chart,
+  .shell-header,
+  .chart-workspace,
+  .chart-frame,
+  .screener-tabs,
+  .screener-body,
+  .screener-panel-content,
+  .wencai-head,
+  .wencai-conditions,
+  .wencai-result-toolbar,
+  .wencai-table,
+  .chan-screener-table,
+  .admin-workspace,
+  .admin-feature-panel,
+  .admin-feature-card,
+  .tv-right-sidebar,
+  .tv-side-panel,
+  .tv-right-rail,
+  .tv-watchlist-panel,
+  .tv-alerts-panel,
+  .tv-utility-panel,
+  .tv-market-panel,
+  .tv-watchlist-content,
+  .tv-watchlist-search-zone,
+  .tv-watchlist-groups-list,
+  .tv-watchlist-group-section,
+  .tv-watchlist-group-body,
+  .tv-symbol-card,
+  .tv-symbol-profile-section,
+  .tv-alert-tabs,
+  .tv-alert-toolbar,
+  .tv-alert-list,
+  .tv-alert-dialog,
+  .tv-panel-empty,
+  .tv-market-panel-header,
+  .tv-market-meta,
+  .tv-strength-summary,
+  .tv-market-block,
+  .tv-news-list,
+  .tv-news-row,
+  .tv-strength-row,
+  .tv-compact-row,
+  .tv-utility-empty,
+  .tv-more-panel,
+  .tv-more-panel > div
+) {
+  border-color: var(--app-canvas-border);
+  background: var(--app-canvas);
+}
+
+body[data-app-theme="dark"] .tv-right-sidebar {
+  --sidebar-bg: var(--app-canvas);
+}
+
+body[data-app-theme="light"] .tv-right-sidebar {
+  --sidebar-bg: var(--app-canvas);
+}
+
+@media (max-width: 760px) {
+  .chart-theme-toggle {
+    left: auto;
+    right: 164px;
+  }
+
 }

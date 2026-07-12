@@ -1,5 +1,6 @@
 import { CircleEllipsis, LogOut, Mountain, Shield } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { MarketSidebarSnapshot } from "../api/marketSidebar";
 import {
   getRightSidebarFeature,
   type RightSidebarFeature,
@@ -14,7 +15,10 @@ import { WatchlistPanel } from "./WatchlistPanel";
 type Props = {
   activeSymbol: string;
   timeframe: string;
+  collapseSignal?: number;
   onSelectSymbol(symbol: string): void;
+  marketSnapshot: MarketSidebarSnapshot;
+  onWatchlistSymbolsChange(symbols: string[]): void;
   authToken?: string;
   isAdmin?: boolean;
   onOpenAdmin?(): void;
@@ -24,15 +28,19 @@ type Props = {
 export function RightSidebar({
   activeSymbol,
   timeframe,
+  collapseSignal,
   onSelectSymbol,
+  marketSnapshot,
+  onWatchlistSymbolsChange,
   authToken,
   isAdmin = false,
   onOpenAdmin,
   onLogout,
 }: Props) {
   const [activePanel, setActivePanel] = useState<RightSidebarPanelId | null>(
-    "watchlist",
+    null,
   );
+  const lastCollapseSignalRef = useRef(collapseSignal);
   const sidebarFeatures = useRightSidebarFeatures();
   const topTools = sidebarFeatures.filter((tool) => tool.dock !== "bottom");
   const bottomTools = sidebarFeatures.filter((tool) => tool.dock === "bottom");
@@ -45,6 +53,14 @@ export function RightSidebar({
       setActivePanel(null);
     }
   }, [activePanel, sidebarFeatures]);
+
+  useEffect(() => {
+    if (collapseSignal === undefined || lastCollapseSignalRef.current === collapseSignal) {
+      return;
+    }
+    lastCollapseSignalRef.current = collapseSignal;
+    setActivePanel(null);
+  }, [collapseSignal]);
 
   function togglePanel(panel: RightSidebarPanelId) {
     setActivePanel((current) => (current === panel ? null : panel));
@@ -59,6 +75,8 @@ export function RightSidebar({
             activeSymbol,
             timeframe,
             onSelectSymbol,
+            marketSnapshot,
+            onWatchlistSymbolsChange,
             authToken,
             isAdmin,
             onOpenAdmin,
@@ -121,6 +139,8 @@ function renderPanel(
   activeSymbol: string,
   timeframe: string,
   onSelectSymbol: (symbol: string) => void,
+  marketSnapshot: MarketSidebarSnapshot,
+  onWatchlistSymbolsChange: (symbols: string[]) => void,
   authToken: string | undefined,
   isAdmin: boolean,
   onOpenAdmin: (() => void) | undefined,
@@ -130,8 +150,10 @@ function renderPanel(
     return (
       <WatchlistPanel
         activeSymbol={activeSymbol}
-        timeframe={timeframe}
         onSelectSymbol={onSelectSymbol}
+        onWatchlistSymbolsChange={onWatchlistSymbolsChange}
+        quotes={marketSnapshot.quotesBySymbol}
+        profile={marketSnapshot.profileBySymbol[activeSymbol] ?? null}
         authToken={authToken}
       />
     );
@@ -140,10 +162,10 @@ function renderPanel(
     return <AlertsPanel activeSymbol={activeSymbol} />;
   }
   if (panel === "layers") {
-    return <StrongestTodayPanel />;
+    return <StrongestTodayPanel marketSnapshot={marketSnapshot} />;
   }
   if (panel === "ideas") {
-    return <StockNewsPanel activeSymbol={activeSymbol} />;
+    return <StockNewsPanel activeSymbol={activeSymbol} feed={marketSnapshot.newsBySymbol[activeSymbol] ?? null} />;
   }
   if (panel === "apps") {
     return (

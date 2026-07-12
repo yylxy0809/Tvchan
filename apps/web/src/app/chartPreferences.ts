@@ -54,8 +54,21 @@ export function normalizeChartSymbol(value: unknown, fallback: string): string {
     return fallback;
   }
   const normalized = value.trim().toUpperCase();
-  if (normalized.includes(".")) {
-    return normalized;
+  const match = normalized.match(/^(\d{6})(?:\.(SH|SZ|BJ))?$/);
+  if (match) {
+    const code = match[1];
+    if (/^(4|8|920)/.test(code)) {
+      return `${code}.BJ`;
+    }
+    if (/^6\d{5}$/.test(code)) {
+      return `${code}.SH`;
+    }
+    if (/^[03]\d{5}$/.test(code)) {
+      return `${code}.SZ`;
+    }
+  }
+  if (/^(4|8|920)/.test(normalized)) {
+    return `${normalized}.BJ`;
   }
   if (/^6\d{5}$/.test(normalized)) {
     return `${normalized}.SH`;

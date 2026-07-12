@@ -1,29 +1,16 @@
 import { Flame, TrendingUp } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
-import {
-  getMockStrongestToday,
-  type DragonTigerItem,
-  type IndustryCompareItem,
-  type StrongStock,
-  type StrongestToday,
-  type StrongTheme,
-} from "../api/marketContracts";
+import type { MarketSidebarSnapshot } from "../api/marketSidebar";
 
-export function StrongestTodayPanel() {
-  const [data, setData] = useState<StrongestToday | null>(null);
+type StrengthFreshness = "live" | "delayed" | "stale" | "unavailable";
 
-  useEffect(() => {
-    let cancelled = false;
-    void getMockStrongestToday().then((next) => {
-      if (!cancelled) {
-        setData(next);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+export function StrongestTodayPanel({
+  marketSnapshot,
+}: {
+  marketSnapshot: Pick<MarketSidebarSnapshot, "strength">;
+}) {
+  const strength = marketSnapshot.strength;
+  const status = strength?.freshness ?? "unavailable";
 
   return (
     <section className="tv-market-panel" aria-label="今日最强">
@@ -37,39 +24,34 @@ export function StrongestTodayPanel() {
 
       <div className="tv-strength-summary">
         <div>
-          <span>北向净流入</span>
-          <strong data-direction={directionOf(data?.northbound.netInflow ?? null)}>
-            {formatMoney(data?.northbound.netInflow ?? null, true)}
-          </strong>
+          <span>强度评分</span>
+          <strong>{strength?.score ?? "--"}</strong>
         </div>
         <div>
-          <span>更新时间</span>
-          <strong>{data?.asOf.slice(11, 16) ?? "--"}</strong>
+          <span>数据状态</span>
+          <strong data-freshness={status}>{statusLabel(status)}</strong>
         </div>
       </div>
 
-      <PanelBlock title="强势股" icon={<TrendingUp size={15} />}>
-        {(data?.hotStocks ?? []).slice(0, 5).map((item) => (
-          <HotStockRow key={item.symbol} item={item} />
-        ))}
+      <PanelBlock title="强势标的" icon={<TrendingUp size={15} />}>
+        {strength?.leaders.length
+          ? strength.leaders.map((leader) => (
+            <StrengthRow key={leader.name} label={leader.name} changePercent={leader.changePercent} />
+          ))
+          : <EmptyState status={status} />}
       </PanelBlock>
 
-      <PanelBlock title="题材归因">
-        {(data?.themes ?? []).slice(0, 4).map((item) => (
-          <ThemeRow key={item.name} item={item} />
-        ))}
-      </PanelBlock>
-
-      <PanelBlock title="龙虎榜">
-        {(data?.dragonTiger ?? []).slice(0, 4).map((item) => (
-          <DragonTigerRow key={`${item.symbol}-${item.reason}`} item={item} />
-        ))}
-      </PanelBlock>
-
-      <PanelBlock title="行业对比">
-        {(data?.industryCompare ?? []).slice(0, 5).map((item) => (
-          <IndustryRow key={item.industry} item={item} />
-        ))}
+      <PanelBlock title="市场主题">
+        {strength?.themes.length
+          ? strength.themes.map((theme) => (
+            <StrengthRow
+              key={theme.name}
+              label={theme.name}
+              changePercent={theme.changePercent}
+              netInflowWan={theme.mainNetInflowWan}
+            />
+          ))
+          : <EmptyState status={status} />}
       </PanelBlock>
     </section>
   );
@@ -95,83 +77,45 @@ function PanelBlock({
   );
 }
 
-function HotStockRow({ item }: { item: StrongStock }) {
+function StrengthRow({
+  label,
+  changePercent,
+  netInflowWan,
+}: {
+  label: string;
+  changePercent: number | null;
+  netInflowWan?: number | null;
+}) {
+  const direction = changePercent === null ? "flat" : changePercent >= 0 ? "up" : "down";
   return (
     <div className="tv-strength-row">
       <div>
-        <strong>{item.symbol}</strong>
-        <span>{item.name}</span>
+        <strong>{label}</strong>
+        {netInflowWan !== undefined ? <small>主力净流入 {formatNetInflow(netInflowWan)}</small> : null}
       </div>
-      <div>
-        <em data-direction={directionOf(item.changePercent)}>
-          {formatPercent(item.changePercent)}
-        </em>
-        <small>{item.theme}</small>
-      </div>
-      <p>{item.reason}</p>
+      <em data-direction={direction}>{formatPercent(changePercent)}</em>
     </div>
   );
-}
-
-function ThemeRow({ item }: { item: StrongTheme }) {
-  return (
-    <div className="tv-compact-row">
-      <span>{item.name}</span>
-      <strong data-direction={directionOf(item.changePercent)}>
-        {formatPercent(item.changePercent)}
-      </strong>
-      <small>{formatMoney(item.netInflow, true)}</small>
-    </div>
-  );
-}
-
-function DragonTigerRow({ item }: { item: DragonTigerItem }) {
-  return (
-    <div className="tv-compact-row">
-      <span>{item.name}</span>
-      <strong>{item.reason}</strong>
-      <small data-direction={directionOf(item.netBuy)}>{formatMoney(item.netBuy, true)}</small>
-    </div>
-  );
-}
-
-function IndustryRow({ item }: { item: IndustryCompareItem }) {
-  return (
-    <div className="tv-compact-row">
-      <span>{item.industry}</span>
-      <strong data-direction={directionOf(item.changePercent)}>
-        {formatPercent(item.changePercent)}
-      </strong>
-      <small>{item.strongCount} 只</small>
-    </div>
-  );
-}
-
-function directionOf(value: number | null): "up" | "down" | "flat" {
-  if (typeof value !== "number" || value === 0) {
-    return "flat";
-  }
-  return value > 0 ? "up" : "down";
 }
 
 function formatPercent(value: number | null): string {
-  if (typeof value !== "number") {
-    return "--";
-  }
-  return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+  if (value === null) return "--";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
-function formatMoney(value: number | null, signed = false): string {
-  if (typeof value !== "number") {
-    return "--";
-  }
-  const sign = signed && value > 0 ? "+" : value < 0 ? "-" : "";
-  const abs = Math.abs(value);
-  if (abs >= 100_000_000) {
-    return `${sign}${(abs / 100_000_000).toFixed(2)}亿`;
-  }
-  if (abs >= 10_000) {
-    return `${sign}${(abs / 10_000).toFixed(1)}万`;
-  }
-  return `${sign}${abs.toFixed(0)}`;
+function formatNetInflow(value: number | null): string {
+  if (value === null) return "--";
+  if (Math.abs(value) >= 10_000) return `${value >= 0 ? "+" : ""}${(value / 10_000).toFixed(2)}亿`;
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}万`;
+}
+
+function EmptyState({ status }: { status: StrengthFreshness }) {
+  return <div className="tv-compact-row"><span>{statusLabel(status)}</span></div>;
+}
+
+function statusLabel(status: StrengthFreshness) {
+  if (status === "unavailable") return "Unavailable";
+  if (status === "stale") return "Stale";
+  if (status === "delayed") return "Delayed";
+  return "Live";
 }
