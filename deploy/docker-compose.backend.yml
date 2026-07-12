@@ -13,7 +13,6 @@ services:
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - ${POSTGRES_DATA_HOST_PATH:-tv_backend_pgdata}:/var/lib/postgresql/data
-      - ${POSTGRES_CHAN_C_TABLESPACE_HOST_PATH:-G:/tv-a-share-db/postgres-tablespaces}:/var/lib/postgresql/tablespaces_g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-tradingview_local}"]
       interval: 10s
@@ -82,7 +81,7 @@ services:
         condition: service_completed_successfully
     environment:
       APP_ENV: ${APP_ENV:-production}
-      API_TOKEN: ${API_TOKEN:-dev-local-token}
+      API_TOKEN: ${API_TOKEN:-}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       CORS_ORIGIN_REGEX: ${CORS_ORIGIN_REGEX:-}
@@ -99,6 +98,19 @@ services:
       WENCAI_USER_AGENT: ${WENCAI_USER_AGENT:-}
       WENCAI_PRO: ${WENCAI_PRO:-false}
       WENCAI_TIMEOUT_SECONDS: ${WENCAI_TIMEOUT_SECONDS:-20}
+    command:
+      - sh
+      - -ec
+      - |
+        if [ "$$APP_ENV" = "production" ]; then
+          case "$$API_TOKEN" in
+            ""|dev-local-token|change-me|change-me-before-long-running|replace-me|your-api-token)
+              echo "API_TOKEN must be a non-placeholder secret when APP_ENV=production" >&2
+              exit 1
+              ;;
+          esac
+        fi
+        exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
     ports:
       - "${API_BIND:-0.0.0.0}:${API_PORT:-8001}:8001"
     healthcheck:
@@ -166,6 +178,72 @@ services:
       MARKET_FILL_LOOP_INTERVAL: ${MARKET_FILL_LOOP_INTERVAL:-60}
     command: ["python", "-m", "collector.worker", "market-fill"]
     restart: unless-stopped
+
+  market-data-provider:
+    profiles: ["market-data"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.collector
+    container_name: tv_backend_market_data_provider
+    cap_drop: ["ALL"]
+    cap_add: ["SETUID", "SETGID"]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 2.0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *collector_env
+      MARKET_DATA_PROVIDER_FACTORY: ${MARKET_DATA_PROVIDER_FACTORY:-collector.market_data.factory:create_market_data_provider}
+      MARKET_DATA_DEMAND_REPOSITORY_FACTORY: ${MARKET_DATA_DEMAND_REPOSITORY_FACTORY:-}
+      MARKET_DATA_ACTIVE_SYMBOL: ${MARKET_DATA_ACTIVE_SYMBOL:-}
+      MARKET_DATA_WATCHLIST: ${MARKET_DATA_WATCHLIST:-}
+      MARKET_DATA_MAX_CONTEXTS: ${MARKET_DATA_MAX_CONTEXTS:-1000}
+      MARKET_DATA_INTERVAL_SECONDS: ${MARKET_DATA_INTERVAL_SECONDS:-5}
+      MARKET_DATA_TIMEOUT_SECONDS: ${MARKET_DATA_TIMEOUT_SECONDS:-12}
+      MARKET_DATA_MAX_PROVIDER_CONCURRENCY: ${MARKET_DATA_MAX_PROVIDER_CONCURRENCY:-16}
+      MARKET_DATA_MAX_STRUCTURED_SYMBOLS_PER_REFRESH: ${MARKET_DATA_MAX_STRUCTURED_SYMBOLS_PER_REFRESH:-2}
+      IWENCAI_BASE_URL: ${IWENCAI_BASE_URL:-}
+      IWENCAI_API_KEY: ${IWENCAI_API_KEY:-}
+      IWENCAI_ALLOWED_HOSTS: ${IWENCAI_ALLOWED_HOSTS:-openapi.iwencai.com}
+      IWENCAI_TIMEOUT_SECONDS: ${IWENCAI_TIMEOUT_SECONDS:-5}
+      IWENCAI_MASTER_DATA_RESOLVER_FACTORY: ${IWENCAI_MASTER_DATA_RESOLVER_FACTORY:-}
+      IWENCAI_TRANSPORT_FACTORY: ${IWENCAI_TRANSPORT_FACTORY:-}
+      IWENCAI_REQUEST_BUILDER_FACTORY: ${IWENCAI_REQUEST_BUILDER_FACTORY:-}
+      IWENCAI_RESPONSE_PARSER_FACTORY: ${IWENCAI_RESPONSE_PARSER_FACTORY:-}
+      WESTOCK_NORMALIZER_FACTORY: ${WESTOCK_NORMALIZER_FACTORY:-collector.market_data.westock_normalizer:create_westock_normalizer}
+      WESTOCK_BRIDGE_MODULE: ${WESTOCK_BRIDGE_MODULE:-/opt/westock/provider.mjs}
+      WESTOCK_BRIDGE_MODULE_VERSION: westock-data@1.0.4
+      WESTOCK_BRIDGE_SHA256: ${WESTOCK_BRIDGE_SHA256:-4e3e0d99a17903c864a880f4f6d378676437221609363f298d137021e684cd8a}
+      WESTOCK_TIMEOUT_SECONDS: ${WESTOCK_TIMEOUT_SECONDS:-10}
+      WESTOCK_MAX_OUTPUT_BYTES: ${WESTOCK_MAX_OUTPUT_BYTES:-1048576}
+      WESTOCK_BATCH_SIZE: ${WESTOCK_BATCH_SIZE:-100}
+      WESTOCK_MAX_TRANSPORT_CONCURRENCY: ${WESTOCK_MAX_TRANSPORT_CONCURRENCY:-16}
+      WESTOCK_PROCESS_POOL_SIZE: ${WESTOCK_PROCESS_POOL_SIZE:-5}
+    command:
+      - python
+      - -c
+      - |
+        import hashlib, os, runpy
+        path = os.environ["WESTOCK_BRIDGE_MODULE"]
+        expected = os.environ.get("WESTOCK_BRIDGE_SHA256", "")
+        if len(expected) != 64 or not os.path.isfile(path):
+            raise SystemExit("the image-bundled WeStock bridge module and pinned WESTOCK_BRIDGE_SHA256 are required")
+        with open(path, "rb") as bridge:
+            actual = hashlib.sha256(bridge.read()).hexdigest()
+        if actual != expected:
+            raise SystemExit("WeStock bridge module integrity check failed")
+        runpy.run_module("collector.market_data_provider", run_name="__main__")
+    restart: "no"
 
   history-backfill-worker:
     build:

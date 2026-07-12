@@ -1,0 +1,4 @@
+services:
+  timescaledb:
+    volumes:
+      - ${POSTGRES_CHAN_C_TABLESPACE_HOST_PATH:?set POSTGRES_CHAN_C_TABLESPACE_HOST_PATH for the Windows tablespace override}:/var/lib/postgresql/tablespaces_g
