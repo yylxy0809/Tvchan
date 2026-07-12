@@ -24,7 +24,7 @@ def hash_token(token: str) -> str:
 
 
 def effective_admin_token(settings: Settings) -> str:
-    return settings.admin_api_token or settings.api_token
+    return settings.admin_api_token
 
 
 def static_token_principal(token: str, settings: Settings) -> TokenPrincipal | None:

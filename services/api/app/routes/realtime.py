@@ -5,17 +5,27 @@ import hashlib
 import json
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.config import get_settings
 from app.core.security import authenticate_token_value
+from app.market_sidebar.dto import SetSidebarContext
+from app.market_sidebar.service import (
+    SidebarAggregator,
+    SidebarContext,
+    sidebar_stream_id,
+)
 from app.repositories.bars import generate_seed_bars, resolve_symbol
 from app.repositories.postgres import get_bars_db, resolve_symbol_db
 from trading_protocol import normalize_timeframe
 
 router = APIRouter(tags=["realtime"])
 UPDATE_INTERVAL_SECONDS = 3.0
+SIDEBAR_POLL_INTERVAL_SECONDS = 0.5
+SIDEBAR_DEMAND_REFRESH_SECONDS = 10.0
+SIDEBAR_DEMAND_TTL_SECONDS = 30
 REDIS_BAR_UPDATE_CHANNEL = "market:bar_updates"
 
 
@@ -37,8 +47,12 @@ async def realtime_ws(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
+    connection_id = uuid4().hex
     subscriptions: dict[str, dict[str, Any]] = {}
     producer_task = await _create_producer_task(websocket, subscriptions)
+    sidebar_task: asyncio.Task | None = None
+    sidebar_context: SidebarContext | None = None
+    sidebar_demand_key: str | None = None
     try:
         while True:
             message = await websocket.receive_json()
@@ -58,7 +72,83 @@ async def realtime_ws(websocket: WebSocket) -> None:
             elif msg_type == "unsubscribe":
                 sub_id = str(message.get("id") or "")
                 subscriptions.pop(sub_id, None)
+                if sidebar_context is not None and sidebar_context.subscription_id == sub_id:
+                    await _cancel_task(sidebar_task)
+                    await websocket.scope["app"].state.market_sidebar_aggregator.unsubscribe(
+                        connection_id, sub_id
+                    )
+                    await _safe_delete_demand(
+                        websocket.scope["app"].state.market_sidebar_repository,
+                        sidebar_demand_key,
+                    )
+                    sidebar_task = None
+                    sidebar_context = None
+                    sidebar_demand_key = None
                 await websocket.send_json({"type": "unsubscribed", "id": sub_id})
+            elif msg_type == "set_sidebar_context":
+                try:
+                    sidebar_message = SetSidebarContext.model_validate(message)
+                except ValueError as exc:
+                    await websocket.send_json(
+                        {"type": "error", "message": f"Invalid sidebar context: {exc}"}
+                    )
+                    continue
+                app = websocket.scope["app"]
+                repository = app.state.market_sidebar_repository
+                aggregator = app.state.market_sidebar_aggregator
+                if aggregator.repository is not repository:
+                    aggregator = SidebarAggregator(repository)
+                    app.state.market_sidebar_aggregator = aggregator
+                context = SidebarContext(
+                    connection_id=connection_id,
+                    subscription_id=sidebar_message.subscription_id,
+                    chart_symbol=sidebar_message.chart_symbol,
+                    chart_epoch=sidebar_message.chart_epoch,
+                    watchlist_symbols=tuple(sidebar_message.watchlist_symbols),
+                    channels=frozenset(sidebar_message.channels),
+                    watchlist_id=sidebar_message.watchlist_id,
+                    watchlist_revision=sidebar_message.watchlist_revision,
+                )
+                await _cancel_task(sidebar_task)
+                if (
+                    sidebar_context is not None
+                    and sidebar_stream_id(sidebar_context) != sidebar_stream_id(context)
+                ):
+                    await aggregator.unsubscribe(connection_id, sidebar_context.subscription_id)
+                next_demand_key = _sidebar_demand_key(
+                    connection_id,
+                    context.subscription_id,
+                )
+                if sidebar_demand_key is not None and sidebar_demand_key != next_demand_key:
+                    await _safe_delete_demand(repository, sidebar_demand_key)
+                sidebar_demand_key = next_demand_key
+                await _safe_set_demand(repository, sidebar_demand_key, context)
+                sidebar_context = context
+                await websocket.send_json(
+                    {
+                        "type": "sidebar_context_set",
+                        "subscription_id": context.subscription_id,
+                        "chart_symbol": context.chart_symbol,
+                        "chart_epoch": context.chart_epoch,
+                        "watchlist_id": context.watchlist_id,
+                        "watchlist_revision": context.watchlist_revision,
+                        "stream_id": sidebar_stream_id(context),
+                        "sequence": 0,
+                        "snapshot_version": 0,
+                        "cursor": {"sequence": 0, "snapshot_version": 0},
+                    }
+                )
+                sidebar_task = asyncio.create_task(
+                    _send_sidebar_updates(
+                        websocket,
+                        context,
+                        aggregator,
+                        repository,
+                        sidebar_demand_key,
+                        after_sequence=sidebar_message.after_sequence,
+                        snapshot_version=sidebar_message.snapshot_version,
+                    )
+                )
             else:
                 await websocket.send_json(
                     {"type": "error", "message": f"Unsupported message type: {msg_type}"}
@@ -67,6 +157,80 @@ async def realtime_ws(websocket: WebSocket) -> None:
         return
     finally:
         producer_task.cancel()
+        await _cancel_task(sidebar_task)
+        repository = getattr(websocket.scope["app"].state, "market_sidebar_repository", None)
+        await _safe_delete_demand(repository, sidebar_demand_key)
+        aggregator = getattr(websocket.scope["app"].state, "market_sidebar_aggregator", None)
+        if aggregator is not None:
+            await aggregator.disconnect(connection_id)
+
+
+async def _send_sidebar_updates(
+    websocket: WebSocket,
+    context: SidebarContext,
+    aggregator: SidebarAggregator,
+    repository,
+    demand_key: str,
+    *,
+    after_sequence: int,
+    snapshot_version: int,
+) -> None:
+    sequence = after_sequence
+    version = snapshot_version
+    loop = asyncio.get_running_loop()
+    next_demand_refresh = loop.time() + SIDEBAR_DEMAND_REFRESH_SECONDS
+    while True:
+        events = await aggregator.delta_events(context, sequence, version)
+        for event in events:
+            await websocket.send_json(event)
+            sequence = event["sequence"]
+            version = event["snapshot_version"]
+        if loop.time() >= next_demand_refresh:
+            await _safe_set_demand(repository, demand_key, context)
+            next_demand_refresh = loop.time() + SIDEBAR_DEMAND_REFRESH_SECONDS
+        await asyncio.sleep(SIDEBAR_POLL_INTERVAL_SECONDS)
+
+
+def _sidebar_demand_key(connection_id: str, subscription_id: str) -> str:
+    return f"market:sidebar:demand:{connection_id}:{subscription_id}"
+
+
+def _sidebar_demand_payload(context: SidebarContext) -> dict[str, Any]:
+    return {
+        "chart_symbol": context.chart_symbol,
+        "watchlist_symbols": list(context.watchlist_symbols),
+        "updated_at": datetime.now().astimezone().isoformat(),
+    }
+
+
+async def _safe_set_demand(repository, key: str, context: SidebarContext) -> None:
+    try:
+        await repository.set_demand(
+            key,
+            _sidebar_demand_payload(context),
+            SIDEBAR_DEMAND_TTL_SECONDS,
+        )
+    except Exception:
+        pass
+
+
+async def _safe_delete_demand(repository, key: str | None) -> None:
+    if repository is None or key is None:
+        return
+    try:
+        await repository.delete_demand(key)
+    except Exception:
+        pass
+
+
+async def _cancel_task(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def _create_producer_task(websocket: WebSocket, subscriptions):
