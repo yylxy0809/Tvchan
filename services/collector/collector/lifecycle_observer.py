@@ -413,15 +413,15 @@ class LifecycleObserver:
                     provenance, updated_at
                 ) values (
                     $1, $2,
-                    case when $3 = 'first_seen' then $4 else null end,
-                    case when $3 = 'confirmed' then $4 else null end,
-                    case when $3 = 'disappeared' then $4 else null end,
-                    case $3 when 'baseline_observed' then 'baseline_observed'
+                    case when $3::text = 'first_seen' then $4::timestamptz else null end,
+                    case when $3::text = 'confirmed' then $4::timestamptz else null end,
+                    case when $3::text = 'disappeared' then $4::timestamptz else null end,
+                    case $3::text when 'baseline_observed' then 'baseline_observed'
                             when 'disappeared' then 'disappeared' else 'visible' end,
-                    $5,
-                    case when $3 = 'first_seen' then $6 else null end,
-                    case when $3 = 'confirmed' then $6 else null end,
-                    $6, $7::jsonb, clock_timestamp()
+                    $5::varchar,
+                    case when $3::text = 'first_seen' then $6::bigint else null end,
+                    case when $3::text = 'confirmed' then $6::bigint else null end,
+                    $6::bigint, $7::jsonb, clock_timestamp()
                 )
                 on conflict (fingerprint) do update
                 set point_time = excluded.point_time,
