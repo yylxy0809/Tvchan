@@ -1,0 +1,17 @@
+{
+  "status_code": 0,
+  "status_msg": "success",
+  "data": [
+    {
+      "id": "news-20260712-001",
+      "title": "平安银行发布半年度业绩快报",
+      "summary": "平安银行披露半年度业绩快报。",
+      "url": "https://finance.example.cn/news/20260712/001",
+      "publish_time": "2026-07-12 09:30:00",
+      "extra": {
+        "real_publish_source": "证券时报",
+        "publish_source": "同花顺财经"
+      }
+    }
+  ]
+}

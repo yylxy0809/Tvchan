@@ -1,0 +1,3 @@
+| code | BlockNetFlow | BlockTradingInfos | ClosePrice | EndDate | FwdClosePrice | JumboNetFlow | LastestTradedPrice | LhbTradingDetails | MainInFlow | MainInflowCircRate | MainInflowIndustryRank | MainInflowRank | MainNetFlow | MainNetFlow10D | MainNetFlow20D | MainNetFlow5D | MainOutFlow | MarginTradeInfos | MidNetFlow | RetailInFlow | RetailOutFlow | SecuCode | SmallNetFlow |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| sz000001 | 1.00 | [] | 10.45 | 2026-07-10 | 10.45 | -2.00 | 10.45 |  | 4.00 | 0.04 | 0 | 1 | -3.00 | 0.00 | 0.00 | 0.00 | 7.00 | {} | 5.00 | 6.00 | 7.00 | sz000001 | 8.00 |
