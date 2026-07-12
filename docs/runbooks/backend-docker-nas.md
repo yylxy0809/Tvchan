@@ -11,16 +11,13 @@ Always-on services:
 - TimescaleDB/PostgreSQL
 - Redis
 - one-shot database migration container
-- chan-service
 - FastAPI API gateway
 - web-gateway
-- realtime-pipeline fetch worker
-- realtime-pipeline Chan worker
+- realtime Module C stream worker
 
-Do not run `market-fill`, standalone `chan-tail-publisher`, or full
-`chan-recompute` together with realtime pipeline tail publishing. They can write
-overlapping K-line or Chan state and should be used only as explicit rollback or
-batch maintenance tools.
+Do not run the full Module C recompute together with realtime Chan stream
+publishing. They write overlapping Module C state; use recompute only in an
+explicit batch maintenance window after the coverage/audit gate passes.
 
 ## Prepare Env
 
@@ -28,7 +25,7 @@ Copy the template and fill secrets on the deployment host. Deployment packages
 must not contain a filled `deploy/backend.env`.
 
 ```powershell
-Copy-Item deploy\backend.env.template deploy\backend.env
+Copy-Item deploy\backend.env.example deploy\backend.env
 notepad deploy\backend.env
 ```
 
@@ -79,18 +76,31 @@ explicitly accepted the overlap risk.
 ```powershell
 docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml --profile manual-market-fill up -d --build
 docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml --profile batch-history up -d --build
-docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml --profile batch-chan-recompute up -d --build
-docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml --profile manual-chan-tail-publisher up -d --build
 docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml --profile batch-tdx-csv-import up -d --build
 ```
 
 Rules:
 
 - `manual-market-fill` is a rollback fetch path.
-- `manual-chan-tail-publisher` is a rollback Chan tail path.
-- `batch-chan-recompute` is for full recompute windows; stop realtime Chan
-  workers first.
 - `batch-history` and `batch-tdx-csv-import` are batch recovery/import paths.
+
+### Full Module C recompute
+
+Run this only after the data coverage/audit decision is recorded and the
+realtime Chan stream worker is stopped. The profile is one-shot and has no
+automatic restart. Its defaults cover all eligible symbols, native five levels,
+both modes, and one database connection per process.
+
+```powershell
+docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml stop chan-c-stream-worker
+docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml --profile batch-chan-module-c-recompute run --rm chan-module-c-recompute-worker
+```
+
+For static shards, run separate invocations with a distinct
+`CHAN_MODULE_C_SHARD_INDEX` for every value from `0` through
+`CHAN_MODULE_C_SHARD_COUNT - 1`; keep `CHAN_MODULE_C_CONCURRENCY=1` and the
+database pool at one until capacity has been measured. Do not use this profile
+to bypass the coverage/audit gate.
 
 ## Progress SQL
 
@@ -107,9 +117,7 @@ docker exec tv_backend_timescaledb psql -U trader -d tradingview_local -c "selec
 
 ```powershell
 docker logs --tail 100 tv_backend_api
-docker logs --tail 100 tv_backend_chan_service
-docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml logs --tail 100 realtime-pipeline-fetch-worker
-docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml logs --tail 100 realtime-pipeline-chan-worker
+docker compose --env-file deploy\backend.env -f deploy\docker-compose.backend.yml logs --tail 100 chan-c-stream-worker
 ```
 
 Manual worker logs:
@@ -117,8 +125,6 @@ Manual worker logs:
 ```powershell
 docker logs --tail 100 tv_backend_market_fill_worker
 docker logs --tail 100 tv_backend_history_backfill_worker
-docker logs --tail 100 tv_backend_chan_recompute_worker
-docker logs --tail 100 tv_backend_chan_tail_publisher_worker
 docker logs --tail 100 tv_backend_tdx_csv_import_worker
 ```
 

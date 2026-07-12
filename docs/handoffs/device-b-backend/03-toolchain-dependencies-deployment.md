@@ -60,9 +60,10 @@ profile 服务：
 - `manual-market-fill`: `market-fill-worker`
 - `batch-history`: `history-backfill-worker`
 - `workers/realtime-pipeline/realtime-chan-c`: `chan-c-stream-worker`
+- `batch-chan-module-c-recompute`: 一次性 `chan-module-c-recompute-worker`
 - `batch-tdx-csv-import`: `tdx-csv-import-worker`
 
-注意：全量 Module C 重算目前通过命令行/PowerShell 启动，未在 Compose 中定义固定服务；B 端应新增专用 batch profile，而不是临时进入其他容器手工执行。
+全量 Module C 重算使用显式的一次性 Compose batch profile，不属于无人值守 profile。仅在 coverage/audit 门通过且已停止 realtime Chan stream worker 后启动；它固定使用原生 `5f,30f,1d,1w,1m`、双 mode、只读 chan.py 挂载，且不允许用聚合补齐替代原生周期。
 
 ## 5. B 端目录建议
 
