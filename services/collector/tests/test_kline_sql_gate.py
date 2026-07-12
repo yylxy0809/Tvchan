@@ -9,7 +9,8 @@ def test_gate_has_five_database_side_checkpoint_workers() -> None:
         sql = build_gate_sql(timeframe).lower()
         assert "insert into kline_audit_checkpoints" in sql
         assert "join symbols" in sql
-        assert "base as not materialized" in sql
+        expected_materialization = "materialized" if timeframe in (10080, 43200) else "not materialized"
+        assert f"base as {expected_materialization}" in sql
         assert "jsonb_build_object" in sql
         assert "on conflict" in sql
         assert "select k.*" in sql
