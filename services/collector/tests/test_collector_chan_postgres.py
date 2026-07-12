@@ -146,7 +146,8 @@ def test_replace_analysis_defaults_to_module_c_tables() -> (
         run_insert_query, run_insert_args = conn.fetchval_calls[1]
         assert "insert into chan_c_runs" in run_insert_query
         assert "snapshot_version" in run_insert_query
-        assert run_insert_args[-1] == "snapshot-write-001"
+        assert run_insert_args[7] == "snapshot-write-001"
+        assert run_insert_args[8] == "online"
 
         stroke_insert = next(
             call for call in conn.copy_calls if call[0] == "chan_c_strokes"
@@ -174,19 +175,24 @@ def test_replace_analysis_defaults_to_module_c_tables() -> (
         assert signal_row[9] == 3007
 
         published_upserts = [
-            rows
-            for query, rows in conn.executemany_calls
+            args
+            for query, args in conn.execute_calls
             if "insert into scheme2_chan_c_published_heads" in query
         ]
-        assert len(published_upserts) == 1
-        published_rows = published_upserts[0]
-        assert len(published_rows) == 2
-        assert all(row[8] == "published" for row in published_rows)
+        assert len(published_upserts) == 2
+        assert all(row[9] == "published" for row in published_upserts)
 
         assert any(
             "update chan_c_runs" in query and args[0] == 99
             for query, args in conn.execute_calls
         )
+        outbox_writes = [
+            (query, args)
+            for query, args in conn.execute_calls
+            if "insert into chan_c_head_outbox" in query
+        ]
+        assert len(outbox_writes) == 2
+        assert all(args[8] == 99 for _query, args in outbox_writes)
 
     asyncio.run(scenario())
 
@@ -236,12 +242,12 @@ def test_module_c_writer_uses_module_c_tables_and_native_base_timeframe() -> Non
         assert "insert into chan_c_runs" in run_insert_query
         assert run_insert_args[3] == "module-c:chan.py-native-levels-v2-bi-strict-false"
         published_upserts = [
-            rows
-            for query, rows in conn.executemany_calls
+            args
+            for query, args in conn.execute_calls
             if "insert into scheme2_chan_c_published_heads" in query
         ]
         assert len(published_upserts) == 1
-        assert published_upserts[-1][0][3] == 30
+        assert published_upserts[-1][3] == 30
         assert any(
             table == "chan_c_strokes" for table, _columns, _rows in conn.copy_calls
         )
@@ -276,5 +282,31 @@ def test_publish_heads_cas_returns_only_the_winning_committed_identity() -> None
 
         with pytest.raises(StaleChanHeadError, match="CAS failed"):
             await writer._publish_heads_cas(CasConn("UPDATE 0"), **kwargs)
+
+    asyncio.run(scenario())
+
+
+def test_full_publish_does_not_emit_outbox_when_head_upsert_loses() -> None:
+    class Conn:
+        def __init__(self) -> None:
+            self.queries = []
+        async def fetchrow(self, *_args):
+            return {"run_id": 7, "base_to_bar_end": datetime.fromtimestamp(200, UTC)}
+        async def execute(self, query, *_args):
+            self.queries.append(query)
+            if "insert into scheme2_chan_c_published_heads" in query:
+                return "INSERT 0 0"
+            return "OK"
+
+    async def scenario() -> None:
+        conn = Conn()
+        writer = PostgresChanWriter("postgresql://unused")
+        await writer._upsert_published_heads(
+            conn, symbol_id=1, level_code=5, modes=["confirmed"],
+            base_timeframe_code=5, bar_from=datetime.fromtimestamp(100, UTC),
+            bar_until=datetime.fromtimestamp(200, UTC), bar_count=20,
+            snapshot_version="same", run_id=8, status="published", last_error=None,
+        )
+        assert not any("insert into chan_c_head_outbox" in query for query in conn.queries)
 
     asyncio.run(scenario())
