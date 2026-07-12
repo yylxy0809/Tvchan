@@ -62,6 +62,8 @@ def test_defaults_and_apply_guard() -> None:
     assert args.concurrency == 2
     assert args.statement_timeout_seconds == 20
     assert args.lock_timeout_seconds == 1
+    assert args.single_window is False
+    assert parse_args(["--single-window"]).single_window is True
     with pytest.raises(SystemExit):
         parse_args(["--apply"])
 

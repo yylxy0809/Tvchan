@@ -96,6 +96,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--statement-timeout-seconds", type=int, default=20)
     parser.add_argument("--lock-timeout-seconds", type=int, default=1)
     parser.add_argument("--transaction-group-cap", type=int, default=500)
+    parser.add_argument(
+        "--single-window",
+        action="store_true",
+        help="Audit each symbol/timeframe in one indexed range scan instead of calendar shards.",
+    )
     parser.add_argument("--output-dir", default="outputs/kline-canonical-audit")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--audit-run-id")
@@ -763,7 +768,12 @@ async def run_audit(args: argparse.Namespace) -> dict[str, Any]:
                 if effective_start > effective_end:
                     return
                 coverage = await connection.fetchval(COVERAGE_SQL, symbol_id, TIMEFRAME_CODES[timeframe], timeout=args.statement_timeout_seconds)
-                for shard_start, shard_end in aligned_windows(effective_start, effective_end, timeframe):
+                windows = (
+                    [(effective_start, effective_end)]
+                    if args.single_window
+                    else aligned_windows(effective_start, effective_end, timeframe)
+                )
+                for shard_start, shard_end in windows:
                     key = (symbol_id, timeframe, shard_start.isoformat(), shard_end.isoformat())
                     if key in runner.completed_shards:
                         continue
