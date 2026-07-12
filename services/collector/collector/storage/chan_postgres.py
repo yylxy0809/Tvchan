@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -266,6 +267,7 @@ class PostgresChanWriter:
                     run_kind,
                     run_group_id,
                     cutoff_bar_end,
+                    base_timeframe,
                     batch_id,
                     publication_namespace,
                     profile_id,
@@ -273,7 +275,7 @@ class PostgresChanWriter:
                     provenance
                 )
                 values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6,
-                        $11, $12, $13, $14, jsonb_build_object('source',$15::text,'profile',$13::text))
+                        $11, $12, $13, $14, $15, jsonb_build_object('source',$16::text,'profile',$14::varchar))
                 returning id
                 """,
                 symbol_id,
@@ -286,10 +288,13 @@ class PostgresChanWriter:
                 snapshot_version,
                 self.run_kind,
                 self.run_group_id,
+                base_timeframe_code,
                 self.batch_id,
                 self.publication_namespace,
                 self.profile_id,
-                f"{self.run_group_id}:{symbol}:{level}:{snapshot_version}",
+                hashlib.sha256(
+                    f"{self.run_group_id}|{symbol}|{level}|{snapshot_version}".encode("utf-8")
+                ).hexdigest(),
                 self.publication_source,
             )
 
@@ -862,7 +867,7 @@ class PostgresChanWriter:
                 ) values (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
                     $10, $11, $12, $13, $14, $15,
-                    jsonb_build_object('publication_profile', $6::text, 'run_group_id', $7::text)
+                    jsonb_build_object('publication_profile', $6::varchar, 'run_group_id', $7::varchar)
                 )
                 on conflict (symbol_id, chan_level, mode, base_timeframe, new_run_id)
                 do nothing
