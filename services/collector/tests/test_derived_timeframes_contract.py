@@ -38,6 +38,12 @@ def test_derived_period_repair_deletes_only_stale_source8_rows_and_updates_same_
     assert "is_complete is distinct from excluded.is_complete" in sql
 
 
+def test_first_build_can_skip_stale_period_delete() -> None:
+    sql = _build_aggregate_sql(BUCKET_EXPRESSIONS["1w"], repair_stale_periods=False).lower()
+
+    assert "delete from klines existing" not in sql
+
+
 def test_skip_complete_batches_requires_target_watermark_and_daily_freshness() -> None:
     sql = BATCH_WATERMARK_COUNT_SQL.lower()
 

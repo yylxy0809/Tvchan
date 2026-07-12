@@ -63,9 +63,20 @@ def _chunks(values: Sequence[int], size: int) -> Iterable[tuple[int, list[int]]]
         yield start // size + 1, list(values[start : start + size])
 
 
-def _build_aggregate_sql(bucket_expr: str) -> str:
+def _build_aggregate_sql(bucket_expr: str, *, repair_stale_periods: bool = True) -> str:
     period = "week" if "week" in bucket_expr else "month"
     existing_bucket_expr = bucket_expr.replace("canonical_ts", "existing.ts")
+    delete_stale_periods = f"""
+, deleted as (
+    DELETE FROM klines existing
+    USING agg
+    WHERE existing.symbol_id = agg.symbol_id
+      AND existing.timeframe = $1::integer
+      AND existing.source = $2::smallint
+      AND existing.ts <> agg.ts
+      AND {existing_bucket_expr} = agg.bucket
+)
+""" if repair_stale_periods else ""
     return f"""
 WITH daily_candidates AS (
     SELECT
@@ -132,15 +143,7 @@ agg AS (
     FROM daily
     WHERE bucket < date_trunc('{period}', now() AT TIME ZONE 'Asia/Shanghai')
     GROUP BY symbol_id, bucket
-), deleted as (
-    DELETE FROM klines existing
-    USING agg
-    WHERE existing.symbol_id = agg.symbol_id
-      AND existing.timeframe = $1::integer
-      AND existing.source = $2::smallint
-      AND existing.ts <> agg.ts
-      AND {existing_bucket_expr} = agg.bucket
-)
+){delete_stale_periods}
 INSERT INTO klines (
     symbol_id,
     timeframe,
@@ -285,9 +288,10 @@ async def _aggregate_one(
     batch_size: int,
     concurrency: int,
     skip_complete_batches: bool,
+    repair_stale_periods: bool,
 ) -> None:
     target_code = TIMEFRAME_CODES[name]
-    sql = _build_aggregate_sql(BUCKET_EXPRESSIONS[name])
+    sql = _build_aggregate_sql(BUCKET_EXPRESSIONS[name], repair_stale_periods=repair_stale_periods)
 
     started = time.perf_counter()
     total_batches = (len(symbol_ids) + batch_size - 1) // batch_size
@@ -433,6 +437,11 @@ async def _main(argv: Iterable[str]) -> int:
         action="store_true",
         help="Skip a batch when every active symbol in it already has a target timeframe watermark.",
     )
+    parser.add_argument(
+        "--skip-stale-period-delete",
+        action="store_true",
+        help="First-build optimization: skip deleting old derived bars; only safe when no target source rows exist.",
+    )
     args = parser.parse_args(list(argv))
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
@@ -468,6 +477,7 @@ async def _main(argv: Iterable[str]) -> int:
                 args.batch_size,
                 args.concurrency,
                 args.skip_complete_batches,
+                not args.skip_stale_period_delete,
             )
     finally:
         await pool.close()
