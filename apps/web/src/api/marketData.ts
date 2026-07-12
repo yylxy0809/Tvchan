@@ -1,5 +1,11 @@
 import { chartDataManager } from "./chartDataManager";
-import { type ApiSymbol, type ChanStroke, getBars, searchSymbols } from "./client";
+import {
+  type ApiBar,
+  type ApiSymbol,
+  type ChanStroke,
+  getBars,
+  searchSymbols,
+} from "./client";
 
 export type SymbolSearchResult = ApiSymbol;
 
@@ -89,7 +95,7 @@ export async function searchSymbolCatalog(
 
 export async function getMarketQuote(
   symbol: ApiSymbol | string,
-  timeframe = DEFAULT_TIMEFRAME,
+  _timeframe = DEFAULT_TIMEFRAME,
   signal?: AbortSignal,
 ): Promise<MarketQuote> {
   const symbolInfo = typeof symbol === "string" ? null : symbol;
@@ -97,39 +103,46 @@ export async function getMarketQuote(
   try {
     const response = await getBars(
       symbolCode,
-      timeframe,
-      64,
+      "1d",
+      2,
       undefined,
       undefined,
       signal,
     );
-    const last = response.bars[response.bars.length - 1];
-    const first = response.bars[0];
-    if (!last) {
-      return createPlaceholderQuote(symbolCode, symbolInfo);
-    }
-    const previousClose = first?.open ?? last.open ?? null;
-    const change =
-      previousClose !== null ? roundPrice(last.close - previousClose) : null;
-    return {
-      symbol: symbolCode,
-      name: symbolInfo?.name ?? symbolCode,
-      exchange: symbolInfo?.exchange ?? inferExchange(symbolCode),
-      price: last.close,
-      previousClose,
-      change,
-      changePercent:
-        previousClose && previousClose !== 0
-          ? roundPercent(((last.close - previousClose) / previousClose) * 100)
-          : null,
-      volume: last.volume ?? null,
-      amount: last.amount ?? null,
-      time: last.time ?? null,
-      source: "bundle-adapter",
-    };
+    return buildMarketQuoteFromDailyBars(symbolCode, symbolInfo, response.bars);
   } catch {
     return createPlaceholderQuote(symbolCode, symbolInfo);
   }
+}
+
+export function buildMarketQuoteFromDailyBars(
+  symbol: string,
+  info: ApiSymbol | null,
+  bars: ApiBar[],
+): MarketQuote {
+  const last = bars[bars.length - 1];
+  if (!last) {
+    return createPlaceholderQuote(symbol, info);
+  }
+  const previous = bars[bars.length - 2];
+  const previousClose = previous?.close ?? last.open ?? null;
+  const change = previousClose !== null ? roundPrice(last.close - previousClose) : null;
+  return {
+    symbol,
+    name: info?.name ?? symbol,
+    exchange: info?.exchange ?? inferExchange(symbol),
+    price: last.close,
+    previousClose,
+    change,
+    changePercent:
+      previousClose && previousClose !== 0
+        ? roundPercent(((last.close - previousClose) / previousClose) * 100)
+        : null,
+    volume: last.volume ?? null,
+    amount: last.amount ?? null,
+    time: last.time ?? null,
+    source: "bundle-adapter",
+  };
 }
 
 export async function getSymbolProfile(
@@ -169,7 +182,7 @@ export async function getSymbolProfile(
     strategySignals: intelligence.strategySignals,
     dataSource:
       quote.source === "bundle-adapter"
-        ? "chart bundle latest close"
+        ? "chart bars latest close"
         : "placeholder until quote API is available",
   };
 }
@@ -178,7 +191,12 @@ export async function getSymbolProfileMarketFields(
   symbol: ApiSymbol | string,
   fallbackName?: string,
 ): Promise<SymbolProfileMarketFields> {
-  const info = typeof symbol === "string" ? await resolveSymbolInfo(symbol) : symbol;
+  const info =
+    typeof symbol === "string"
+      ? fallbackName
+        ? null
+        : await resolveSymbolInfo(symbol)
+      : symbol;
   const symbolCode = typeof symbol === "string" ? symbol : symbol.symbol;
   const enrichment = buildProfileEnrichment(
     symbolCode,
@@ -198,7 +216,7 @@ async function getSymbolChanIntelligence(
   strategySignals: StrategySignal[];
 }> {
   const [windowResult, intradaySignal] = await Promise.allSettled([
-    chartDataManager.getChartWindow({
+    chartDataManager.getChanOverlay({
       symbol,
       timeframe: DEFAULT_TIMEFRAME,
       limit: 600,
@@ -211,7 +229,7 @@ async function getSymbolChanIntelligence(
   const chanStrokeStates =
     windowResult.status === "fulfilled"
       ? WATCHLIST_CHAN_LEVELS.map((level) =>
-          deriveCurrentStrokeState(windowResult.value.chan.strokes, level),
+          deriveCurrentStrokeState(windowResult.value.strokes, level),
         )
       : WATCHLIST_CHAN_LEVELS.map(createUnknownStrokeState);
   return {
@@ -282,7 +300,7 @@ async function getCurrentTradingDayIntradaySignal(
   symbol: string,
   signal?: AbortSignal,
 ): Promise<StrategySignal> {
-  const bars30f = await chartDataManager.getChartWindow({
+  const bars30f = await chartDataManager.getBars({
     symbol,
     timeframe: "30f",
     limit: 200,
@@ -639,6 +657,9 @@ function inferExchange(symbol: string): string {
   }
   if (upper.endsWith(".SZ")) {
     return "SZ";
+  }
+  if (upper.endsWith(".BJ")) {
+    return "BJ";
   }
   return "";
 }

@@ -7,10 +7,12 @@ import {
   ChanOverlayResponse,
   DEFAULT_CHAN_LEVELS,
   DEFAULT_CHAN_MODES,
+  getBars as getBarsHttp,
+  getChanOverlay as getChanOverlayHttp,
   getChartBundle as getChartBundleHttp,
   normalizeChartBundleForFrontend,
 } from "./client";
-import { createChartSocket } from "./realtime";
+import { createChartSocket, createRealtimeSocket } from "./realtime";
 
 export type ChartWindowRequest = {
   symbol: string;
@@ -21,6 +23,11 @@ export type ChartWindowRequest = {
   levels?: readonly string[];
   modes?: readonly string[];
   signal?: AbortSignal;
+};
+
+export type ChartBarsResponse = BarsResponse & {
+  /** True only when a request reached the beginning of available history. */
+  noData?: boolean;
 };
 
 export type ChartWindowResponse = {
@@ -84,8 +91,31 @@ type ChanSubscriptionReply = WebSocketReply & {
   symbol?: string;
   timeframe?: string;
   snapshot_version?: string;
-  bundle?: unknown;
-  chan?: ChanOverlayResponse;
+};
+
+export type ChanOverlayTransportStatus = "connected" | "disconnected" | "replayed";
+
+type RealtimeBarReply = {
+  type?: string;
+  id?: string;
+  seq?: number;
+  symbol?: string;
+  timeframe?: string;
+  snapshot_version?: string;
+  sessionGeneration?: number;
+  bar?: unknown;
+};
+
+export type RealtimeSidebarContext = {
+  subscriptionId: string;
+  chartSymbol: string;
+  chartEpoch: number;
+  watchlistId: string;
+  watchlistRevision: number;
+  watchlistSymbols: string[];
+  channels: string[];
+  afterSequence: number;
+  snapshotVersion: number;
 };
 
 const CACHE_TTL_MS = 90_000;
@@ -93,6 +123,30 @@ const WS_RETRY_COOLDOWN_MS = 30_000;
 const WS_REQUEST_TIMEOUT_MS = 8_000;
 const SESSION_HISTORY_MAX_BARS = 15_000;
 const SESSION_CHAN_MAX_ITEMS = 30_000;
+const BARS_HISTORY_MAX_SERIES = 24;
+const BARS_HISTORY_MAX_BARS = 15_000;
+const BARS_HTTP_MAX_LIMIT = 5_000;
+
+type CoveredInterval = { from?: number; to?: number };
+type BarsHistory = {
+  bars: ApiBar[];
+  covered: CoveredInterval[];
+  exhaustedBefore?: number;
+  touchedAt: number;
+};
+type PendingBarsRequest = {
+  request: ChartWindowRequest;
+  controller: AbortController;
+  consumers: number;
+  complete: boolean;
+  promise: Promise<BarsResponse>;
+};
+type RealtimeBarState = {
+  sessionGeneration: number;
+  revision: number;
+  seq?: number;
+  signature: string;
+};
 
 class ChartWebSocketClient {
   private socket: WebSocket | null = null;
@@ -109,7 +163,9 @@ class ChartWebSocketClient {
     string,
     {
       payload: Record<string, unknown>;
-      listeners: Set<(message: ChanSubscriptionReply) => void>;
+      unsubscribeType: string;
+      listeners: Set<(message: unknown) => void>;
+      statusListeners: Set<(status: ChanOverlayTransportStatus) => void>;
     }
   >();
   private reconnectTimer: number | null = null;
@@ -167,7 +223,8 @@ class ChartWebSocketClient {
   async subscribe(
     subscriptionId: string,
     payload: Record<string, unknown> & { type: string },
-    listener: (message: ChanSubscriptionReply) => void,
+    listener: (message: unknown) => void,
+    statusListener: (status: ChanOverlayTransportStatus) => void,
   ): Promise<() => void> {
     const normalizedPayload = {
       ...payload,
@@ -176,24 +233,37 @@ class ChartWebSocketClient {
     const existing = this.subscriptions.get(subscriptionId);
     if (existing) {
       existing.payload = normalizedPayload;
+      existing.unsubscribeType = unsubscribeTypeFor(payload.type);
       existing.listeners.add(listener);
+      existing.statusListeners.add(statusListener);
     } else {
       this.subscriptions.set(subscriptionId, {
         payload: normalizedPayload,
+        unsubscribeType: unsubscribeTypeFor(payload.type),
         listeners: new Set([listener]),
+        statusListeners: new Set([statusListener]),
       });
     }
 
-    try {
-      const socket = await this.connect();
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      const socket = this.socket;
       socket.send(JSON.stringify(normalizedPayload));
-    } catch (error) {
-      this.removeSubscriptionListener(subscriptionId, listener, false);
-      throw error;
+      statusListener("connected");
+    } else {
+      statusListener("disconnected");
+      void this.connect().catch(() => {
+        statusListener("disconnected");
+        this.scheduleReconnect();
+      });
     }
 
     return () => {
-      this.removeSubscriptionListener(subscriptionId, listener, true);
+      this.removeSubscriptionListener(
+        subscriptionId,
+        listener,
+        statusListener,
+        true,
+      );
     };
   }
 
@@ -206,34 +276,42 @@ class ChartWebSocketClient {
     }
     this.connectPromise = new Promise((resolve, reject) => {
       const socket = createChartSocket();
+      this.socket = socket;
       const timer = window.setTimeout(() => {
+        if (this.socket !== socket) return;
         socket.close();
         reject(new Error("WebSocket chart transport connect timeout"));
       }, 4_000);
       socket.onopen = () => {
+        if (this.socket !== socket) return;
         window.clearTimeout(timer);
-        this.socket = socket;
         this.connectPromise = null;
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
           this.reconnectTimer = null;
         }
+        this.notifyTransport("connected");
         this.replaySubscriptions(socket);
         resolve(socket);
       };
       socket.onerror = () => {
+        if (this.socket !== socket) return;
         window.clearTimeout(timer);
+        this.socket = null;
         this.connectPromise = null;
         reject(new Error("WebSocket chart transport failed"));
       };
       socket.onclose = () => {
+        if (this.socket !== socket) return;
         window.clearTimeout(timer);
         this.socket = null;
         this.connectPromise = null;
         this.rejectPending(new Error("WebSocket chart transport closed"));
+        this.notifyTransport("disconnected");
         this.scheduleReconnect();
       };
       socket.onmessage = (event) => {
+        if (this.socket !== socket) return;
         this.handleMessage(event.data);
       };
     });
@@ -282,7 +360,8 @@ class ChartWebSocketClient {
 
   private removeSubscriptionListener(
     subscriptionId: string,
-    listener: (message: ChanSubscriptionReply) => void,
+    listener: (message: unknown) => void,
+    statusListener: (status: ChanOverlayTransportStatus) => void,
     notifyServer: boolean,
   ): void {
     const subscription = this.subscriptions.get(subscriptionId);
@@ -290,6 +369,7 @@ class ChartWebSocketClient {
       return;
     }
     subscription.listeners.delete(listener);
+    subscription.statusListeners.delete(statusListener);
     if (subscription.listeners.size > 0) {
       return;
     }
@@ -299,7 +379,7 @@ class ChartWebSocketClient {
     }
     this.socket.send(
       JSON.stringify({
-        type: "unsubscribe_chart_bundle",
+        type: subscription.unsubscribeType,
         id: subscriptionId,
       }),
     );
@@ -308,6 +388,13 @@ class ChartWebSocketClient {
   private replaySubscriptions(socket: WebSocket): void {
     for (const subscription of this.subscriptions.values()) {
       socket.send(JSON.stringify(subscription.payload));
+      for (const listener of subscription.statusListeners) listener("replayed");
+    }
+  }
+
+  private notifyTransport(status: ChanOverlayTransportStatus): void {
+    for (const subscription of this.subscriptions.values()) {
+      for (const listener of subscription.statusListeners) listener(status);
     }
   }
 
@@ -327,13 +414,283 @@ class ChartWebSocketClient {
   }
 }
 
-class ChartDataManager {
+class RealtimeBarSocketClient {
+  private socket: WebSocket | null = null;
+  private connectPromise: Promise<WebSocket> | null = null;
+  private subscriptions = new Map<
+    string,
+    {
+      symbol: string;
+      timeframe: string;
+      listeners: Set<(message: RealtimeBarReply) => void>;
+      sessionListeners: Set<(generation: number) => void>;
+    }
+  >();
+  private sidebarSubscriptions = new Map<string, {
+    context: RealtimeSidebarContext;
+    listeners: Set<(message: unknown) => void>;
+  }>();
+  private reconnectTimer: number | null = null;
+  private connectionGeneration = 0;
+  private activeGeneration = 0;
+
+  async subscribe(
+    subscriptionId: string,
+    symbol: string,
+    timeframe: string,
+    listener: (message: RealtimeBarReply) => void,
+    sessionListener: (generation: number) => void,
+  ): Promise<() => void> {
+    const normalizedSymbol = symbol.toUpperCase();
+    const existing = this.subscriptions.get(subscriptionId);
+    if (existing) {
+      existing.symbol = normalizedSymbol;
+      existing.timeframe = timeframe;
+      existing.listeners.add(listener);
+      existing.sessionListeners.add(sessionListener);
+    } else {
+      this.subscriptions.set(subscriptionId, {
+        symbol: normalizedSymbol,
+        timeframe,
+        listeners: new Set([listener]),
+        sessionListeners: new Set([sessionListener]),
+      });
+    }
+    try {
+      const socket = await this.connect();
+      this.sendSubscribe(socket, subscriptionId, normalizedSymbol, timeframe);
+      if (this.activeGeneration > 0) sessionListener(this.activeGeneration);
+    } catch (error) {
+      this.removeSubscriptionListener(subscriptionId, listener, sessionListener, false);
+      throw error;
+    }
+    return () => {
+      this.removeSubscriptionListener(subscriptionId, listener, sessionListener, true);
+    };
+  }
+
+  async subscribeSidebar(
+    context: RealtimeSidebarContext,
+    listener: (message: unknown) => void,
+  ): Promise<() => void> {
+    const existing = this.sidebarSubscriptions.get(context.subscriptionId);
+    if (existing) {
+      existing.context = context;
+      existing.listeners.add(listener);
+    } else {
+      this.sidebarSubscriptions.set(context.subscriptionId, { context, listeners: new Set([listener]) });
+    }
+    try {
+      const socket = await this.connect();
+      this.sendSidebarContext(socket, context);
+    } catch (error) {
+      this.removeSidebarListener(context.subscriptionId, listener, false);
+      throw error;
+    }
+    return () => this.removeSidebarListener(context.subscriptionId, listener, true);
+  }
+
+  updateSidebarContext(context: RealtimeSidebarContext): void {
+    const subscription = this.sidebarSubscriptions.get(context.subscriptionId);
+    if (!subscription) return;
+    subscription.context = context;
+    if (this.socket?.readyState === WebSocket.OPEN) this.sendSidebarContext(this.socket, context);
+  }
+
+  private async connect(): Promise<WebSocket> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return this.socket;
+    }
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+    this.connectPromise = new Promise((resolve, reject) => {
+      const socket = createRealtimeSocket();
+      let socketGeneration = 0;
+      const timer = window.setTimeout(() => {
+        socket.close();
+        reject(new Error("Realtime bar transport connect timeout"));
+      }, 4_000);
+      socket.onopen = () => {
+        window.clearTimeout(timer);
+        this.socket = socket;
+        socketGeneration = ++this.connectionGeneration;
+        this.activeGeneration = socketGeneration;
+        this.connectPromise = null;
+        if (this.reconnectTimer !== null) {
+          window.clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = null;
+        }
+        this.notifySessionGeneration(socketGeneration);
+        if (socketGeneration > 1) this.replaySubscriptions(socket);
+        resolve(socket);
+      };
+      socket.onerror = () => {
+        window.clearTimeout(timer);
+        this.connectPromise = null;
+        reject(new Error("Realtime bar transport failed"));
+      };
+      socket.onclose = () => {
+        window.clearTimeout(timer);
+        if (this.socket === socket) {
+          this.socket = null;
+          this.connectPromise = null;
+          this.scheduleReconnect();
+        }
+      };
+      socket.onmessage = (event) => {
+        this.handleMessage(event.data, socketGeneration);
+      };
+    });
+    return this.connectPromise;
+  }
+
+  private handleMessage(data: unknown, sessionGeneration: number): void {
+    let message: RealtimeBarReply & { subscription_id?: string; sequence?: number };
+    try {
+      message = JSON.parse(String(data)) as RealtimeBarReply;
+    } catch {
+      return;
+    }
+    if (message.subscription_id) {
+      const subscription = this.sidebarSubscriptions.get(message.subscription_id);
+      if (subscription) {
+        const sequence = message.sequence ?? message.seq;
+        if (Number.isSafeInteger(sequence)) subscription.context.afterSequence = sequence as number;
+        const snapshotVersion = (message as { snapshot_version?: unknown }).snapshot_version;
+        if (typeof snapshotVersion === "number" && Number.isSafeInteger(snapshotVersion)) {
+          subscription.context.snapshotVersion = snapshotVersion;
+        }
+      }
+      subscription?.listeners.forEach((listener) => listener(message));
+      return;
+    }
+    if (message.type !== "bar_update" || !message.bar) {
+      return;
+    }
+    message.sessionGeneration = sessionGeneration;
+    const symbol = String(message.symbol ?? "").toUpperCase();
+    const timeframe = String(message.timeframe ?? "");
+    for (const subscription of this.subscriptions.values()) {
+      if (subscription.symbol !== symbol || subscription.timeframe !== timeframe) {
+        continue;
+      }
+      for (const listener of subscription.listeners) {
+        listener(message);
+      }
+    }
+  }
+
+  private removeSidebarListener(subscriptionId: string, listener: (message: unknown) => void, notifyServer: boolean): void {
+    const subscription = this.sidebarSubscriptions.get(subscriptionId);
+    if (!subscription) return;
+    subscription.listeners.delete(listener);
+    if (subscription.listeners.size > 0) return;
+    this.sidebarSubscriptions.delete(subscriptionId);
+    if (notifyServer && this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({ type: "unsubscribe", id: subscriptionId }));
+    }
+  }
+
+  private removeSubscriptionListener(
+    subscriptionId: string,
+    listener: (message: RealtimeBarReply) => void,
+    sessionListener: (generation: number) => void,
+    notifyServer: boolean,
+  ): void {
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription) {
+      return;
+    }
+    subscription.listeners.delete(listener);
+    subscription.sessionListeners.delete(sessionListener);
+    if (subscription.listeners.size > 0 || subscription.sessionListeners.size > 0) {
+      return;
+    }
+    this.subscriptions.delete(subscriptionId);
+    if (!notifyServer || this.socket?.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    this.socket.send(
+      JSON.stringify({
+        type: "unsubscribe",
+        id: subscriptionId,
+      }),
+    );
+  }
+
+  private replaySubscriptions(socket: WebSocket): void {
+    for (const [subscriptionId, subscription] of this.subscriptions) {
+      this.sendSubscribe(socket, subscriptionId, subscription.symbol, subscription.timeframe);
+    }
+    for (const subscription of this.sidebarSubscriptions.values()) {
+      this.sendSidebarContext(socket, subscription.context);
+    }
+  }
+
+  private sendSidebarContext(socket: WebSocket, context: RealtimeSidebarContext): void {
+    socket.send(JSON.stringify({
+      type: "set_sidebar_context",
+      subscription_id: context.subscriptionId,
+      chart_symbol: context.chartSymbol,
+      chart_epoch: context.chartEpoch,
+      watchlist_id: context.watchlistId,
+      watchlist_revision: context.watchlistRevision,
+      watchlist_symbols: context.watchlistSymbols,
+      channels: context.channels,
+      after_sequence: context.afterSequence,
+      snapshot_version: context.snapshotVersion,
+    }));
+  }
+
+  private notifySessionGeneration(generation: number): void {
+    for (const subscription of this.subscriptions.values()) {
+      for (const listener of subscription.sessionListeners) listener(generation);
+    }
+  }
+
+  private sendSubscribe(
+    socket: WebSocket,
+    subscriptionId: string,
+    symbol: string,
+    timeframe: string,
+  ): void {
+    socket.send(
+      JSON.stringify({
+        type: "subscribe",
+        id: subscriptionId,
+        symbol,
+        timeframes: [timeframe],
+      }),
+    );
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer !== null || (this.subscriptions.size === 0 && this.sidebarSubscriptions.size === 0)) {
+      return;
+    }
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.socket || this.connectPromise || (this.subscriptions.size === 0 && this.sidebarSubscriptions.size === 0)) {
+        return;
+      }
+      void this.connect().catch(() => {
+        this.scheduleReconnect();
+      });
+    }, 1_000);
+  }
+}
+
+export class ChartDataManager {
   private barsCache = new Map<string, CacheRecord<BarsResponse>>();
   private chanCache = new Map<string, CacheRecord<ChanOverlayResponse>>();
   private windowCache = new Map<string, CacheRecord<ChartWindowResponse>>();
   private latestSnapshotVersions = new Map<string, string>();
   private latestRealtimeVersions = new Map<string, string>();
-  private pendingBars = new Map<string, Promise<BarsResponse>>();
+  private pendingBars = new Map<string, PendingBarsRequest>();
+  private barsHistory = new Map<string, BarsHistory>();
+  private realtimeBarStates = new Map<string, Map<number, RealtimeBarState>>();
+  private realtimeSessionGenerations = new Map<string, number>();
   private pendingChan = new Map<string, Promise<ChanOverlayResponse>>();
   private pendingWindow = new Map<string, Promise<ChartWindowResponse>>();
   private historyListeners = new Set<(event: ChartHistoryWindowEvent) => void>();
@@ -341,6 +698,7 @@ class ChartDataManager {
   private sessionChanOverlays = new Map<string, ChanOverlayResponse>();
   private snapshotListeners = new Set<(event: SnapshotUpdateEvent) => void>();
   private wsClient = new ChartWebSocketClient();
+  private realtimeClient = new RealtimeBarSocketClient();
   private wsDisabledUntil = 0;
 
   get transportMode(): string {
@@ -458,10 +816,11 @@ class ChartDataManager {
   }
 
   private mergeSessionChartWindow(response: ChartWindowResponse): ChartWindowResponse {
-    const key = sessionHistoryKey(response.symbol, response.chart_timeframe);
-    const previous = this.sessionChanOverlays.get(key);
-    const chan = previous ? mergeChanOverlay(previous, response.chan) : response.chan;
-    this.sessionChanOverlays.set(key, chan);
+    const chan = this.mergeSessionChanOverlay(
+      response.symbol,
+      response.chart_timeframe,
+      response.chan,
+    );
     patchTvDebug("overlay", {
       sessionChan: {
         symbol: response.symbol,
@@ -478,23 +837,62 @@ class ChartDataManager {
     };
   }
 
+  private mergeSessionChanOverlay(
+    symbol: string,
+    timeframe: string,
+    incoming: ChanOverlayResponse,
+  ): ChanOverlayResponse {
+    const key = sessionHistoryKey(symbol, timeframe);
+    const previous = this.sessionChanOverlays.get(key);
+    const merged = previous
+      ? scopeChanOverlay(
+          mergeChanOverlay(previous, incoming),
+          incoming.levels,
+          incoming.modes,
+        )
+      : incoming;
+    this.sessionChanOverlays.set(key, merged);
+    return merged;
+  }
+
   handleRealtimeBarUpdate(event: {
     symbol: string;
     timeframe: string;
     snapshotVersion?: string;
-    bar?: { time?: number; revision?: number; complete?: boolean };
-  }): void {
+    seq?: number;
+    sessionGeneration?: number;
+    bar?: {
+      time?: number;
+      open?: number;
+      high?: number;
+      low?: number;
+      close?: number;
+      volume?: number;
+      amount?: number | null;
+      revision?: number;
+      complete?: boolean;
+    };
+  }): boolean {
     const symbol = event.symbol.toUpperCase();
     const snapshotVersion =
       event.snapshotVersion ||
       createRealtimeSnapshotVersion(symbol, event.timeframe, event.bar);
     if (!snapshotVersion) {
-      return;
+      return false;
+    }
+    if (!this.upsertRealtimeBar(
+      symbol,
+      event.timeframe,
+      event.bar,
+      event.seq,
+      event.sessionGeneration,
+    )) {
+      return false;
     }
     const key = snapshotVersionKey(symbol, event.timeframe);
     const previous = this.latestRealtimeVersions.get(key);
     if (previous === snapshotVersion) {
-      return;
+      return true;
     }
     this.latestRealtimeVersions.set(key, snapshotVersion);
     this.invalidateSymbolScopedCaches(symbol);
@@ -504,47 +902,247 @@ class ChartDataManager {
       timeframe: event.timeframe,
       snapshotVersion,
     });
+    return true;
   }
 
-  async subscribeChanSnapshots(request: ChartWindowRequest): Promise<() => void> {
+  beginRealtimeSession(symbol: string, timeframe: string, generation: number): boolean {
+    const normalizedGeneration = Math.max(0, Math.trunc(generation));
+    const key = sessionHistoryKey(symbol, timeframe);
+    const current = this.realtimeSessionGenerations.get(key);
+    if (current !== undefined && normalizedGeneration < current) return false;
+    if (current === undefined || normalizedGeneration > current) {
+      this.realtimeSessionGenerations.set(key, normalizedGeneration);
+    }
+    return true;
+  }
+
+  async subscribeChanOverlay(
+    request: ChartWindowRequest,
+    listener: (message: unknown) => void,
+    statusListener: (status: ChanOverlayTransportStatus) => void,
+  ): Promise<() => void> {
+    if (request.from === undefined || request.to === undefined) {
+      throw new Error("Chan realtime subscription requires a bounded from/to range");
+    }
     const subscriptionId = createChanSubscriptionId(request);
     return this.wsClient.subscribe(
       subscriptionId,
       {
-        type: "subscribe_chart_bundle",
+        type: "subscribe_chan",
         ...requestPayload(request),
       },
       (message) => {
-        this.handleChanSnapshotMessage(request, message);
+        if (!message || typeof message !== "object") return;
+        const type = (message as { type?: unknown }).type;
+        if (type === "chan_overlay" || type === "chan_resync_required") {
+          listener(message);
+        }
       },
+      statusListener,
     );
   }
 
-  async getBars(request: ChartWindowRequest): Promise<BarsResponse> {
-    const key = requestKey("bars", request, this.snapshotHint(request));
-    const cached = this.readCache(this.barsCache, key);
+  async subscribeRealtimeBars(
+    request: Pick<ChartWindowRequest, "symbol" | "timeframe">,
+    listener: (event: {
+      symbol: string;
+      timeframe: string;
+      snapshotVersion?: string;
+      seq?: number;
+      sessionGeneration?: number;
+      bar: ApiBar;
+    }) => void,
+    sessionListener: (generation: number) => void,
+  ): Promise<() => void> {
+    const subscriptionId = createRealtimeBarSubscriptionId(request);
+    return this.realtimeClient.subscribe(
+      subscriptionId,
+      request.symbol,
+      request.timeframe,
+      (message) => {
+        if (!isApiBar(message.bar)) {
+          return;
+        }
+        const symbol = String(message.symbol ?? request.symbol).toUpperCase();
+        const timeframe = String(message.timeframe ?? request.timeframe);
+        listener({
+          symbol,
+          timeframe,
+          snapshotVersion: message.snapshot_version,
+          seq: message.seq,
+          sessionGeneration: message.sessionGeneration,
+          bar: message.bar,
+        });
+      },
+      sessionListener,
+    );
+  }
+
+  subscribeRealtimeSidebar(
+    context: RealtimeSidebarContext,
+    listener: (event: unknown) => void,
+  ): Promise<() => void> {
+    return this.realtimeClient.subscribeSidebar(context, listener);
+  }
+
+  updateRealtimeSidebarContext(context: RealtimeSidebarContext): void {
+    this.realtimeClient.updateSidebarContext(context);
+  }
+
+  async getBars(request: ChartWindowRequest): Promise<ChartBarsResponse> {
+    return this.getBarsInternal(request, false);
+  }
+
+  private async getBarsInternal(
+    request: ChartWindowRequest,
+    requireRequestedCoverage: boolean,
+  ): Promise<ChartBarsResponse> {
+    if (request.signal?.aborted) {
+      throw new DOMException("Request aborted", "AbortError");
+    }
+    const normalized = { ...request, symbol: request.symbol.toUpperCase() };
+    const historyKey = sessionHistoryKey(normalized.symbol, normalized.timeframe);
+    const cached = this.readHistory(historyKey, normalized, requireRequestedCoverage);
     if (cached) {
-      recordTvDebug("chartData.bars.cache", { key });
+      recordTvDebug("chartData.bars.cache", { key: historyKey, count: cached.bars.length });
       return cached;
     }
-    const pending = this.pendingBars.get(key);
+
+    const plannedRequest = this.planBarsFetch(historyKey, normalized);
+    const networkRequest = {
+      ...plannedRequest,
+      limit: Math.min(plannedRequest.limit, BARS_HTTP_MAX_LIMIT),
+    };
+    const pending = this.findPendingBars(networkRequest);
     if (pending) {
-      return withAbort(pending, request.signal);
+      recordTvDebug("chartData.bars.coalesced", { key: historyKey });
+      await this.consumePendingBars(pending, normalized, normalized.signal);
+      return this.getBarsInternal(normalized, true);
     }
-    const promise = this.loadBars(request)
-      .then((response) => {
-        this.writeCache(
-          this.barsCache,
-          requestKey("bars", request, this.snapshotHint(request)),
-          response,
-        );
-        return response;
-      })
-      .finally(() => {
-        this.pendingBars.delete(key);
-      });
-    this.pendingBars.set(key, promise);
-    return withAbort(promise, request.signal);
+    const overlapping = this.findOverlappingPendingBars(networkRequest);
+    if (overlapping.length > 0) {
+      return this.waitForPendingCoverage(overlapping, normalized);
+    }
+
+    const controller = new AbortController();
+    const loadRequest = { ...networkRequest, signal: controller.signal };
+    let pendingRequest!: PendingBarsRequest;
+    pendingRequest = {
+      request: networkRequest,
+      controller,
+      consumers: 0,
+      complete: false,
+      promise: this.loadBars(loadRequest)
+        .then((response) => {
+          this.mergeBarsHistory(historyKey, networkRequest, response.bars);
+          return response;
+        })
+        .finally(() => {
+          pendingRequest.complete = true;
+          const key = requestKey("bars", networkRequest);
+          if (this.pendingBars.get(key) === pendingRequest) {
+            this.pendingBars.delete(key);
+          }
+        }),
+    };
+    this.pendingBars.set(requestKey("bars", networkRequest), pendingRequest);
+    await this.consumePendingBars(pendingRequest, normalized, normalized.signal);
+    const loaded = this.responseFromHistory(normalized, []);
+    if (!requireRequestedCoverage && loaded.bars.length >= normalized.limit) {
+      return loaded;
+    }
+    return this.getBarsInternal(normalized, requireRequestedCoverage);
+  }
+
+  private planBarsFetch(key: string, request: ChartWindowRequest): ChartWindowRequest {
+    const history = this.barsHistory.get(key);
+    if (!history) {
+      return request;
+    }
+    const uncovered = firstUncoveredRange(history.covered, request.from, request.to);
+    if (uncovered) return { ...request, ...uncovered };
+    const selected = selectBars(history.bars, request);
+    const deficit = request.limit - selected.length;
+    const earliest = selected[0]?.time;
+    return deficit > 0 && earliest !== undefined
+      ? { ...request, from: undefined, to: earliest, limit: deficit }
+      : request;
+  }
+
+  private findPendingBars(request: ChartWindowRequest): PendingBarsRequest | null {
+    for (const pending of this.pendingBars.values()) {
+      if (
+        !pending.complete &&
+        !pending.controller.signal.aborted &&
+        pending.request.symbol === request.symbol &&
+        pending.request.timeframe === request.timeframe &&
+        rangeContains(pending.request.from, pending.request.to, request.from, request.to) &&
+        pending.request.limit >= request.limit
+      ) {
+        return pending;
+      }
+    }
+    return null;
+  }
+
+  private findOverlappingPendingBars(request: ChartWindowRequest): PendingBarsRequest[] {
+    return [...this.pendingBars.values()].filter(
+      (pending) =>
+        !pending.complete &&
+        !pending.controller.signal.aborted &&
+        pending.request.symbol === request.symbol &&
+        pending.request.timeframe === request.timeframe &&
+        rangesOverlap(pending.request.from, pending.request.to, request.from, request.to),
+    );
+  }
+
+  private async waitForPendingCoverage(
+    pending: PendingBarsRequest[],
+    request: ChartWindowRequest,
+  ): Promise<ChartBarsResponse> {
+    await Promise.all(
+      pending.map((item) => this.consumePendingBars(item, request, request.signal)),
+    );
+    return this.getBarsInternal(request, true);
+  }
+
+  private consumePendingBars(
+    pending: PendingBarsRequest,
+    consumerRequest: ChartWindowRequest,
+    signal?: AbortSignal,
+  ): Promise<ChartBarsResponse> {
+    pending.consumers += 1;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const release = () => {
+        if (settled) return;
+        settled = true;
+        pending.consumers -= 1;
+        signal?.removeEventListener("abort", abort);
+        if (pending.consumers === 0 && !pending.complete) pending.controller.abort();
+      };
+      const abort = () => {
+        release();
+        reject(new DOMException("Request aborted", "AbortError"));
+      };
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+      pending.promise.then(
+        (response) => {
+          if (settled) return;
+          release();
+          resolve(this.responseFromHistory(consumerRequest, response.bars));
+        },
+        (error) => {
+          if (settled) return;
+          release();
+          reject(error);
+        },
+      );
+    });
   }
 
   async getChanOverlay(request: ChartWindowRequest): Promise<ChanOverlayResponse> {
@@ -609,17 +1207,275 @@ class ChartDataManager {
   }
 
   private async loadBars(request: ChartWindowRequest): Promise<BarsResponse> {
-    const response = await this.loadChartWindow(request);
+    return getBarsHttp(
+      request.symbol,
+      request.timeframe,
+      request.limit,
+      request.from,
+      request.to,
+      request.signal,
+    );
+  }
+
+  private readHistory(
+    key: string,
+    request: ChartWindowRequest,
+    requireRequestedCoverage: boolean,
+  ): ChartBarsResponse | null {
+    const history = this.barsHistory.get(key);
+    if (!history) {
+      return null;
+    }
+    const bars = selectBars(history.bars, request);
+    const requestedRangeCovered = rangeCovered(history.covered, request.from, request.to);
+    if (requireRequestedCoverage && !requestedRangeCovered) {
+      return null;
+    }
+    if (
+      bars.length < request.limit &&
+      !(bars.length === 0 && requestedRangeCovered) &&
+      !isHistoricalExhausted(history, request)
+    ) {
+      return null;
+    }
+    history.touchedAt = Date.now();
     return {
-      symbol: response.symbol,
-      timeframe: response.chart_timeframe,
-      bars: response.bars,
+      symbol: request.symbol,
+      timeframe: request.timeframe,
+      bars,
+      noData: bars.length === 0 && isHistoricalExhausted(history, request),
     };
   }
 
+  private mergeBarsHistory(
+    key: string,
+    request: ChartWindowRequest,
+    incoming: ApiBar[],
+  ): void {
+    const previous = this.barsHistory.get(key);
+    const responseBars = normalizeBars(incoming).filter(
+      (bar) =>
+        (request.from === undefined || bar.time >= request.from) &&
+        (request.to === undefined || bar.time < request.to),
+    );
+    const byTime = new Map<number, ApiBar>();
+    for (const bar of previous?.bars ?? []) byTime.set(bar.time, bar);
+    // A later response is authoritative for OHLCV revisions at the same timestamp.
+    const realtimeStates = this.realtimeBarStates.get(key);
+    for (const bar of responseBars) {
+      const existing = byTime.get(bar.time);
+      if (
+        existing &&
+        realtimeStates?.has(bar.time) &&
+        bar.revision <= existing.revision
+      ) {
+        continue;
+      }
+      byTime.set(bar.time, bar);
+      if (existing && bar.revision > existing.revision) realtimeStates?.delete(bar.time);
+    }
+    const allBars = Array.from(byTime.values()).sort((left, right) => left.time - right.time);
+    const trimmed = allBars.length > BARS_HISTORY_MAX_BARS;
+    const incomingLast = responseBars[responseBars.length - 1]?.time;
+    const previousFirst = previous?.bars[0]?.time;
+    const keepOlderSide =
+      trimmed &&
+      incomingLast !== undefined &&
+      previousFirst !== undefined &&
+      incomingLast < previousFirst;
+    const bars = trimmed
+      ? keepOlderSide
+        ? allBars.slice(0, BARS_HISTORY_MAX_BARS)
+        : allBars.slice(-BARS_HISTORY_MAX_BARS)
+      : allBars;
+    if (realtimeStates) {
+      const retainedTimes = new Set(bars.map((bar) => bar.time));
+      for (const time of realtimeStates.keys()) {
+        if (!retainedTimes.has(time)) realtimeStates.delete(time);
+      }
+      if (realtimeStates.size === 0) this.realtimeBarStates.delete(key);
+    }
+    const truncated = responseBars.length >= request.limit;
+    const earliest = responseBars[0]?.time;
+    const provenInterval = truncated && earliest !== undefined
+      ? { from: earliest, to: request.to }
+      : { from: request.from, to: request.to };
+    const exhaustedBefore =
+      !truncated && (request.from === undefined || request.from <= 0)
+        ? request.to ?? Number.POSITIVE_INFINITY
+        : previous?.exhaustedBefore;
+    const covered = mergeCoveredIntervals([
+      ...(previous?.covered ?? []),
+      provenInterval,
+    ]);
+    this.barsHistory.set(key, {
+      bars,
+      covered: trimmed ? clipCoverageToRetainedBars(covered, bars) : covered,
+      exhaustedBefore: trimmed ? undefined : exhaustedBefore,
+      touchedAt: Date.now(),
+    });
+    this.evictBarsHistory();
+    recordTvDebug("chartData.bars.network", {
+      symbol: request.symbol,
+      timeframe: request.timeframe,
+      count: incoming.length,
+    });
+  }
+
+  private upsertRealtimeBar(
+    symbol: string,
+    timeframe: string,
+    bar: {
+      time?: number;
+      open?: number;
+      high?: number;
+      low?: number;
+      close?: number;
+      volume?: number;
+      amount?: number | null;
+      revision?: number;
+      complete?: boolean;
+    } | undefined,
+    seq?: number,
+    sessionGeneration?: number,
+  ): boolean {
+    if (
+      !bar ||
+      typeof bar.time !== "number" ||
+      typeof bar.open !== "number" ||
+      typeof bar.high !== "number" ||
+      typeof bar.low !== "number" ||
+      typeof bar.close !== "number" ||
+      typeof bar.volume !== "number"
+    ) {
+      return false;
+    }
+    const key = sessionHistoryKey(symbol, timeframe);
+    const generation = Math.max(0, Math.trunc(sessionGeneration ?? 0));
+    const currentGeneration = this.realtimeSessionGenerations.get(key);
+    if (currentGeneration !== undefined && generation < currentGeneration) {
+      return false;
+    }
+    if (currentGeneration === undefined || generation > currentGeneration) {
+      this.realtimeSessionGenerations.set(key, generation);
+    }
+    const history = this.barsHistory.get(key);
+    const existing = history?.bars.find((item) => item.time === bar.time);
+    const revised: ApiBar = {
+      time: bar.time,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+      amount: bar.amount ?? existing?.amount ?? null,
+      revision: bar.revision ?? existing?.revision ?? 0,
+      complete: bar.complete ?? existing?.complete ?? false,
+    };
+    const states = this.realtimeBarStates.get(key) ?? new Map<number, RealtimeBarState>();
+    const previousState = states.get(revised.time);
+    const signature = barSignature(revised);
+    const sameSession = previousState?.sessionGeneration === generation;
+    const knownRevision = Math.max(
+      existing?.revision ?? Number.NEGATIVE_INFINITY,
+      previousState?.revision ?? Number.NEGATIVE_INFINITY,
+    );
+    if (revised.revision < knownRevision) {
+      return false;
+    }
+    if (previousState && previousState.sessionGeneration > generation) {
+      return false;
+    }
+    if (previousState && revised.revision === knownRevision) {
+      if (!sameSession) {
+        if (signature === previousState.signature) {
+          states.set(revised.time, {
+            sessionGeneration: generation,
+            revision: revised.revision,
+            seq,
+            signature,
+          });
+          return false;
+        }
+      } else {
+        if (signature === previousState.signature) {
+          if (seq !== undefined && (previousState.seq === undefined || seq > previousState.seq)) {
+            previousState.seq = seq;
+          }
+          return false;
+        }
+        if (previousState.seq !== undefined) {
+          if (seq === undefined || seq <= previousState.seq) return false;
+        }
+      }
+    }
+    const byTime = new Map((history?.bars ?? []).map((item) => [item.time, item]));
+    byTime.set(revised.time, revised);
+    const allBars = [...byTime.values()].sort((left, right) => left.time - right.time);
+    const trimmed = allBars.length > BARS_HISTORY_MAX_BARS;
+    const bars = allBars.slice(-BARS_HISTORY_MAX_BARS);
+    this.barsHistory.set(key, {
+      bars,
+      covered: trimmed
+        ? clipCoverageToRetainedBars(history?.covered ?? [], bars)
+        : history?.covered ?? [],
+      exhaustedBefore: trimmed ? undefined : history?.exhaustedBefore,
+      touchedAt: Date.now(),
+    });
+    states.set(revised.time, {
+      sessionGeneration: generation,
+      revision: revised.revision,
+      seq,
+      signature,
+    });
+    const retainedTimes = new Set(bars.map((item) => item.time));
+    for (const time of states.keys()) {
+      if (!retainedTimes.has(time)) states.delete(time);
+    }
+    this.realtimeBarStates.set(key, states);
+    this.evictBarsHistory();
+    return true;
+  }
+
+  private responseFromHistory(
+    request: ChartWindowRequest,
+    fallbackBars: ApiBar[],
+  ): ChartBarsResponse {
+    const history = this.barsHistory.get(sessionHistoryKey(request.symbol, request.timeframe));
+    const bars = history ? selectBars(history.bars, request) : selectBars(fallbackBars, request);
+    return {
+      symbol: request.symbol,
+      timeframe: request.timeframe,
+      bars,
+      noData: bars.length === 0 && Boolean(history && isHistoricalExhausted(history, request)),
+    };
+  }
+
+  private evictBarsHistory(): void {
+    if (this.barsHistory.size <= BARS_HISTORY_MAX_SERIES) return;
+    const oldest = [...this.barsHistory.entries()]
+      .sort(([, left], [, right]) => left.touchedAt - right.touchedAt)
+      .slice(0, this.barsHistory.size - BARS_HISTORY_MAX_SERIES);
+    for (const [key] of oldest) {
+      this.barsHistory.delete(key);
+      this.realtimeBarStates.delete(key);
+      this.realtimeSessionGenerations.delete(key);
+    }
+  }
+
   private async loadChan(request: ChartWindowRequest): Promise<ChanOverlayResponse> {
-    const response = await this.loadChartWindow(request);
-    return response.chan;
+    const response = await getChanOverlayHttp(
+      request.symbol,
+      request.timeframe,
+      request.limit,
+      request.from,
+      request.to,
+      request.signal,
+      normalizedChanLevels(request),
+      normalizedChanModes(request),
+    );
+    const merged = this.mergeSessionChanOverlay(request.symbol, request.timeframe, response);
+    return merged;
   }
 
   private async loadChartWindow(request: ChartWindowRequest): Promise<ChartWindowResponse> {
@@ -787,100 +1643,6 @@ class ChartDataManager {
     );
   }
 
-  private handleChanSnapshotMessage(
-    request: ChartWindowRequest,
-    message: ChanSubscriptionReply,
-  ): void {
-    const bundle = message.bundle
-      ? normalizeChartBundleForFrontend(message.bundle)
-      : null;
-    if (bundle) {
-      const symbol = String(message.symbol ?? bundle.symbol ?? request.symbol).toUpperCase();
-      const timeframe = String(
-        message.timeframe ?? bundle.chart_timeframe ?? request.timeframe,
-      );
-      const response: ChartWindowResponse = {
-        ...bundle,
-        symbol,
-        chart_timeframe: timeframe,
-        transport: "websocket",
-      };
-      const changed = this.applyPublishedSnapshotVersion(
-        symbol,
-        timeframe,
-        response.chan.snapshot_version,
-      );
-      const mergedResponse = this.mergeSessionChartWindow(response);
-      this.hydrateBundleCaches(
-        {
-          ...request,
-          symbol,
-          timeframe,
-        },
-        mergedResponse,
-      );
-      if (mergedResponse.bars.length > 0) {
-        const first = mergedResponse.bars[0];
-        const last = mergedResponse.bars[mergedResponse.bars.length - 1];
-        this.publishHistoryWindow({
-          source: "realtime",
-          symbol,
-          timeframe,
-          requestedFrom: request.from,
-          requestedTo: request.to,
-          from: first?.time,
-          to: last?.time,
-          limit: Math.max(request.limit, mergedResponse.bars.length),
-          bars: mergedResponse.bars,
-          first: first?.time,
-          last: last?.time,
-        });
-      }
-      if (changed) {
-        this.notifySnapshotUpdate({
-          source: "realtime",
-          symbol,
-          timeframe,
-          snapshotVersion: response.chan.snapshot_version,
-        });
-      }
-      return;
-    }
-    if ((message.type !== "chan_snapshot" && message.type !== "chan_delta") || !message.chan) {
-      return;
-    }
-    const chan = message.chan as ChanOverlayResponse;
-    const symbol = String(message.symbol ?? chan.symbol ?? request.symbol).toUpperCase();
-    const timeframe = String(message.timeframe ?? chan.chart_timeframe ?? request.timeframe);
-    const changed = this.applyPublishedSnapshotVersion(
-      symbol,
-      timeframe,
-      chan.snapshot_version,
-    );
-    this.writeCache(
-      this.chanCache,
-      requestKey(
-        "chan",
-        {
-          ...request,
-          symbol,
-          timeframe,
-        },
-        chan.snapshot_version,
-      ),
-      chan,
-    );
-    if (!changed) {
-      return;
-    }
-    this.notifySnapshotUpdate({
-      source: "realtime",
-      symbol,
-      timeframe,
-      snapshotVersion: chan.snapshot_version,
-    });
-  }
-
   private notePublishedSnapshotVersion(
     symbol: string,
     timeframe: string,
@@ -972,6 +1734,30 @@ function mergeChanOverlay(previous: ChanOverlayResponse, incoming: ChanOverlayRe
     segments,
     centers,
     signals,
+  };
+}
+
+function scopeChanOverlay(
+  overlay: ChanOverlayResponse,
+  levels: readonly string[],
+  modes: readonly string[],
+): ChanOverlayResponse {
+  const levelSet = new Set(levels);
+  const modeSet = new Set(modes);
+  const keep = (item: { level: string; mode: string }) =>
+    levelSet.has(item.level) && modeSet.has(item.mode);
+  return {
+    ...overlay,
+    levels: overlay.levels.filter((level) => levelSet.has(level)),
+    modes: overlay.modes.filter((mode) => modeSet.has(mode)),
+    bars_by_level: Object.fromEntries(
+      levels.map((level) => [level, overlay.bars_by_level[level] ?? 0]),
+    ),
+    strokes: overlay.strokes.filter(keep),
+    segments: overlay.segments.filter(keep),
+    centers: overlay.centers.filter(keep),
+    signals: overlay.signals.filter(keep),
+    channels: overlay.channels.filter(keep),
   };
 }
 
@@ -1123,6 +1909,130 @@ function sessionHistoryKey(symbol: string, timeframe: string): string {
   return `${symbol.toUpperCase()}|${timeframe}`;
 }
 
+function selectBars(bars: ApiBar[], request: ChartWindowRequest): ApiBar[] {
+  const inRange = bars.filter(
+    (bar) =>
+      (request.to === undefined || bar.time < request.to),
+  );
+  return inRange.slice(-request.limit);
+}
+
+function normalizeBars(bars: ApiBar[]): ApiBar[] {
+  const byTime = new Map<number, ApiBar>();
+  for (const bar of bars) byTime.set(bar.time, bar);
+  return [...byTime.values()].sort((left, right) => left.time - right.time);
+}
+
+function barSignature(bar: ApiBar): string {
+  return [
+    bar.time,
+    bar.open,
+    bar.high,
+    bar.low,
+    bar.close,
+    bar.volume,
+    bar.amount ?? "",
+    bar.revision,
+    bar.complete ? 1 : 0,
+  ].join(":");
+}
+
+function rangeContains(
+  outerFrom: number | undefined,
+  outerTo: number | undefined,
+  innerFrom: number | undefined,
+  innerTo: number | undefined,
+): boolean {
+  return (
+    (outerFrom === undefined || (innerFrom !== undefined && outerFrom <= innerFrom)) &&
+    (outerTo === undefined || (innerTo !== undefined && outerTo >= innerTo))
+  );
+}
+
+function rangeCovered(
+  intervals: CoveredInterval[],
+  from: number | undefined,
+  to: number | undefined,
+): boolean {
+  return intervals.some((interval) => rangeContains(interval.from, interval.to, from, to));
+}
+
+function rangesOverlap(
+  leftFrom: number | undefined,
+  leftTo: number | undefined,
+  rightFrom: number | undefined,
+  rightTo: number | undefined,
+): boolean {
+  if (leftTo !== undefined && rightFrom !== undefined && leftTo <= rightFrom) return false;
+  if (rightTo !== undefined && leftFrom !== undefined && rightTo <= leftFrom) return false;
+  return true;
+}
+
+function firstUncoveredRange(
+  intervals: CoveredInterval[],
+  from: number | undefined,
+  to: number | undefined,
+): CoveredInterval | null {
+  if (from === undefined || to === undefined) return null;
+  let cursor = from;
+  for (const interval of intervals
+    .filter((item): item is { from: number; to: number } => item.from !== undefined && item.to !== undefined)
+    .sort((left, right) => left.from - right.from)) {
+    if (interval.to <= cursor) continue;
+    if (interval.from > cursor) return { from: cursor, to: Math.min(interval.from, to) };
+    cursor = Math.max(cursor, interval.to);
+    if (cursor >= to) return null;
+  }
+  return cursor < to ? { from: cursor, to } : null;
+}
+
+function mergeCoveredIntervals(intervals: CoveredInterval[]): CoveredInterval[] {
+  const finite = intervals.filter(
+    (interval): interval is { from: number; to: number } =>
+      interval.from !== undefined && interval.to !== undefined,
+  );
+  const unbounded = intervals.filter(
+    (interval) => interval.from === undefined || interval.to === undefined,
+  );
+  const merged: CoveredInterval[] = [];
+  for (const interval of finite.sort((left, right) => left.from - right.from)) {
+    const previous = merged[merged.length - 1];
+    if (previous?.to !== undefined && interval.from <= previous.to) {
+      previous.to = Math.max(previous.to, interval.to);
+    } else {
+      merged.push({ ...interval });
+    }
+  }
+  return [...unbounded, ...merged].slice(-64);
+}
+
+function clipCoverageToRetainedBars(
+  intervals: CoveredInterval[],
+  bars: ApiBar[],
+): CoveredInterval[] {
+  const earliest = bars[0]?.time;
+  const latestExclusive = bars[bars.length - 1]?.time;
+  if (earliest === undefined || latestExclusive === undefined) return [];
+  const retainedTo = latestExclusive + 1;
+  return mergeCoveredIntervals(
+    intervals
+      .filter(
+        (interval) =>
+          (interval.to === undefined || interval.to > earliest) &&
+          (interval.from === undefined || interval.from < retainedTo),
+      )
+      .map((interval) => ({
+        from: interval.from === undefined ? earliest : Math.max(interval.from, earliest),
+        to: interval.to === undefined ? retainedTo : Math.min(interval.to, retainedTo),
+      })),
+  );
+}
+
+function isHistoricalExhausted(history: BarsHistory, request: ChartWindowRequest): boolean {
+  void request;
+  return history.exhaustedBefore !== undefined;
+}
+
 function snapshotScopedCachePrefix(symbol: string, timeframe: string): string {
   return `|${symbol.toUpperCase()}|${timeframe}|`;
 }
@@ -1130,7 +2040,16 @@ function snapshotScopedCachePrefix(symbol: string, timeframe: string): string {
 function createRealtimeSnapshotVersion(
   symbol: string,
   timeframe: string,
-  bar?: { time?: number; revision?: number; complete?: boolean },
+  bar?: {
+    time?: number;
+    open?: number;
+    high?: number;
+    low?: number;
+    close?: number;
+    volume?: number;
+    revision?: number;
+    complete?: boolean;
+  },
 ): string {
   const time = Number(bar?.time ?? 0);
   if (!Number.isFinite(time) || time <= 0) {
@@ -1143,9 +2062,23 @@ function createRealtimeSnapshotVersion(
     symbol.toUpperCase(),
     timeframe,
     Math.trunc(time).toString().padStart(12, "0"),
+    stableNumber(bar?.open),
+    stableNumber(bar?.high),
+    stableNumber(bar?.low),
+    stableNumber(bar?.close),
+    stableNumber(bar?.volume),
     Math.trunc(revision).toString().padStart(6, "0"),
     complete,
   ].join(":");
+}
+
+function stableNumber(value: unknown): string {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number.toString() : "0";
+}
+
+function unsubscribeTypeFor(type: string): string {
+  return type === "subscribe_chan" ? "unsubscribe_chan" : "unsubscribe_chart_bundle";
 }
 
 function createChanSubscriptionId(request: ChartWindowRequest): string {
@@ -1159,4 +2092,29 @@ function createChanSubscriptionId(request: ChartWindowRequest): string {
     normalizedChanLevels(request).join(","),
     normalizedChanModes(request).join(","),
   ].join(":");
+}
+
+function createRealtimeBarSubscriptionId(
+  request: Pick<ChartWindowRequest, "symbol" | "timeframe">,
+): string {
+  return [
+    "bar",
+    request.symbol.toUpperCase(),
+    request.timeframe,
+  ].join(":");
+}
+
+function isApiBar(value: unknown): value is ApiBar {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const bar = value as Partial<ApiBar>;
+  return (
+    typeof bar.time === "number" &&
+    typeof bar.open === "number" &&
+    typeof bar.high === "number" &&
+    typeof bar.low === "number" &&
+    typeof bar.close === "number" &&
+    typeof bar.volume === "number"
+  );
 }

@@ -4,6 +4,8 @@ import {
   Copy,
   Plus,
   RefreshCw,
+  Save,
+  TestTube2,
   Trash2,
 } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
@@ -14,6 +16,19 @@ import {
   disableAdminToken,
   listAdminTokens,
 } from "../auth/api";
+import {
+  type ConnectivityTestResult,
+  type LlmProviderConfig,
+  type LlmProvidersConfig,
+  type LlmTestResult,
+  type WencaiAdminConfig,
+  fetchLlmProviders,
+  fetchWencaiConfig,
+  saveLlmProviders,
+  saveWencaiConfig,
+  testLlmProvider,
+  testWencaiConfig,
+} from "../api/adminRuntimeConfig";
 import {
   fetchRuntimeFeatureConfig,
   saveRuntimeFeatureConfig,
@@ -30,12 +45,28 @@ type Props = {
   adminToken: string;
 };
 
+const DEFAULT_WENCAI_CONFIG: WencaiAdminConfig = {
+  base_url: "https://openapi.iwencai.com",
+  api_key: "",
+  cookie: "",
+  user_agent: "",
+  pro: false,
+  timeout_seconds: 20,
+};
+
 export function AdminConsole({ adminToken }: Props) {
   const [tokens, setTokens] = useState<AdminToken[]>([]);
   const [featureConfig, setFeatureConfig] = useState<RuntimeFeatureConfig>({
     rightSidebar: [],
     screenerDock: [],
   });
+  const [wencaiConfig, setWencaiConfig] = useState<WencaiAdminConfig>(DEFAULT_WENCAI_CONFIG);
+  const [wencaiTestResult, setWencaiTestResult] = useState<ConnectivityTestResult | null>(null);
+  const [llmConfig, setLlmConfig] = useState<LlmProvidersConfig>({
+    active_provider_id: null,
+    providers: [],
+  });
+  const [llmTestResults, setLlmTestResults] = useState<Record<string, LlmTestResult>>({});
   const [label, setLabel] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
@@ -46,6 +77,8 @@ export function AdminConsole({ adminToken }: Props) {
   useEffect(() => {
     void refreshTokens();
     void refreshFeatureConfig();
+    void refreshWencaiConfig();
+    void refreshLlmProviders();
   }, []);
 
   async function refreshTokens() {
@@ -54,7 +87,7 @@ export function AdminConsole({ adminToken }: Props) {
     try {
       setTokens(await listAdminTokens());
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      setError(readError(nextError));
     } finally {
       setLoading(false);
     }
@@ -66,7 +99,25 @@ export function AdminConsole({ adminToken }: Props) {
       setFeatureConfig(nextConfig);
       publishRuntimeFeatureConfig(nextConfig);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      setError(readError(nextError));
+    }
+  }
+
+  async function refreshWencaiConfig() {
+    try {
+      setWencaiConfig(await fetchWencaiConfig(adminToken));
+    } catch (nextError) {
+      setError(readError(nextError));
+    }
+  }
+
+  async function refreshLlmProviders() {
+    try {
+      const config = await fetchLlmProviders(adminToken);
+      setLlmConfig(config.providers.length ? config : withDefaultProvider(config));
+    } catch (nextError) {
+      setError(readError(nextError));
+      setLlmConfig(withDefaultProvider({ active_provider_id: null, providers: [] }));
     }
   }
 
@@ -81,7 +132,7 @@ export function AdminConsole({ adminToken }: Props) {
       publishRuntimeFeatureConfig(savedConfig);
     } catch (nextError) {
       setFeatureConfig(featureConfig);
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      setError(readError(nextError));
     } finally {
       setMutating(false);
     }
@@ -91,7 +142,7 @@ export function AdminConsole({ adminToken }: Props) {
     event.preventDefault();
     const normalizedLabel = label.trim();
     if (!normalizedLabel) {
-      setError("Token label is required.");
+      setError("请输入令牌标签。");
       return;
     }
     setMutating(true);
@@ -106,7 +157,7 @@ export function AdminConsole({ adminToken }: Props) {
       setLabel("");
       setDisplayName("");
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      setError(readError(nextError));
     } finally {
       setMutating(false);
     }
@@ -121,7 +172,7 @@ export function AdminConsole({ adminToken }: Props) {
         current.map((item) => (item.id === id ? updated : item)),
       );
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      setError(readError(nextError));
     } finally {
       setMutating(false);
     }
@@ -134,7 +185,7 @@ export function AdminConsole({ adminToken }: Props) {
       await deleteAdminToken(id);
       setTokens((current) => current.filter((item) => item.id !== id));
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      setError(readError(nextError));
     } finally {
       setMutating(false);
     }
@@ -147,16 +198,97 @@ export function AdminConsole({ adminToken }: Props) {
     try {
       await navigator.clipboard.writeText(newToken);
     } catch {
-      setError("Clipboard is not available. Select and copy the token manually.");
+      setError("剪贴板不可用，请手动复制令牌。");
     }
   }
 
+  async function handleSaveWencaiConfig() {
+    setMutating(true);
+    setError(null);
+    try {
+      const saved = await saveWencaiConfig(adminToken, wencaiConfig);
+      setWencaiConfig(saved);
+      setWencaiTestResult(null);
+    } catch (nextError) {
+      setError(readError(nextError));
+    } finally {
+      setMutating(false);
+    }
+  }
+
+  async function handleTestWencaiConfig() {
+    setMutating(true);
+    setError(null);
+    try {
+      setWencaiTestResult(await testWencaiConfig(adminToken, wencaiConfig));
+    } catch (nextError) {
+      setError(readError(nextError));
+    } finally {
+      setMutating(false);
+    }
+  }
+
+  async function handleSaveLlmProviders() {
+    setMutating(true);
+    setError(null);
+    try {
+      const saved = await saveLlmProviders(adminToken, llmConfig);
+      setLlmConfig(saved);
+      setLlmTestResults({});
+    } catch (nextError) {
+      setError(readError(nextError));
+    } finally {
+      setMutating(false);
+    }
+  }
+
+  async function handleTestLlmProvider(provider: LlmProviderConfig) {
+    setMutating(true);
+    setError(null);
+    try {
+      const result = await testLlmProvider(adminToken, provider);
+      setLlmTestResults((current) => ({ ...current, [provider.id]: result }));
+    } catch (nextError) {
+      setError(readError(nextError));
+    } finally {
+      setMutating(false);
+    }
+  }
+
+  function updateProvider(id: string, patch: Partial<LlmProviderConfig>) {
+    setLlmConfig((current) => ({
+      ...current,
+      providers: current.providers.map((provider) =>
+        provider.id === id ? { ...provider, ...patch } : provider,
+      ),
+    }));
+  }
+
+  function addProvider() {
+    const provider = createDefaultProvider(`llm-${Date.now()}`);
+    setLlmConfig((current) => ({
+      active_provider_id: current.active_provider_id ?? provider.id,
+      providers: [...current.providers, provider],
+    }));
+  }
+
+  function removeProvider(id: string) {
+    setLlmConfig((current) => {
+      const providers = current.providers.filter((provider) => provider.id !== id);
+      return {
+        active_provider_id:
+          current.active_provider_id === id ? providers[0]?.id ?? null : current.active_provider_id,
+        providers,
+      };
+    });
+  }
+
   return (
-    <section className="admin-workspace" aria-label="Admin token management">
+    <section className="admin-workspace" aria-label="管理后台">
       <div className="admin-head">
         <div>
-          <p className="eyebrow">Admin Console</p>
-          <h1>Access Tokens</h1>
+          <p className="eyebrow">管理后台</p>
+          <h1>访问令牌</h1>
         </div>
         <button
           className="ghost-button"
@@ -165,40 +297,40 @@ export function AdminConsole({ adminToken }: Props) {
           disabled={loading}
         >
           <RefreshCw size={16} />
-          <span>Refresh</span>
+          <span>刷新</span>
         </button>
       </div>
 
       <form className="token-create" onSubmit={handleCreate}>
-        <label htmlFor="token-label">Label</label>
+        <label htmlFor="token-label">标签</label>
         <input
           id="token-label"
           value={label}
           onChange={(event) => setLabel(event.target.value)}
           placeholder="desk-user-01"
         />
-        <label htmlFor="token-display-name">Display name</label>
+        <label htmlFor="token-display-name">显示名称</label>
         <input
           id="token-display-name"
           value={displayName}
           onChange={(event) => setDisplayName(event.target.value)}
-          placeholder="User name or device"
+          placeholder="用户或设备名称"
         />
         <button className="primary-button compact" type="submit" disabled={mutating}>
           <Plus size={16} />
-          <span>Create</span>
+          <span>创建</span>
         </button>
       </form>
 
       {newToken ? (
         <div className="created-token">
           <div>
-            <span>New token</span>
+            <span>新令牌</span>
             <code>{newToken}</code>
           </div>
           <button type="button" onClick={() => void copyNewToken()}>
             <Copy size={15} />
-            <span>Copy</span>
+            <span>复制</span>
           </button>
         </div>
       ) : null}
@@ -212,28 +344,28 @@ export function AdminConsole({ adminToken }: Props) {
 
       <div className="token-table" aria-busy={loading}>
         <div className="token-row token-row-head">
-          <span>Label</span>
-          <span>Display</span>
-          <span>Status</span>
-          <span>Created</span>
+          <span>标签</span>
+          <span>显示</span>
+          <span>状态</span>
+          <span>创建时间</span>
           <span />
         </div>
-        {loading ? <div className="empty-row">Loading tokens</div> : null}
+        {loading ? <div className="empty-row">正在加载令牌</div> : null}
         {!loading && tokens.length === 0 ? (
-          <div className="empty-row">No user tokens yet.</div>
+          <div className="empty-row">暂无用户令牌</div>
         ) : null}
         {tokens.map((item) => (
           <div className="token-row" key={item.id}>
             <span className="token-name">{item.label}</span>
             <span>{item.display_name || "--"}</span>
             <span data-state={item.is_active ? "on" : "off"}>
-              {item.is_active ? "active" : "disabled"}
+              {item.is_active ? "启用" : "停用"}
             </span>
             <span>{formatDate(item.created_at)}</span>
             <span className="row-actions">
               <button
                 type="button"
-                title="Disable token"
+                title="停用令牌"
                 onClick={() => void handleDisable(item.id)}
                 disabled={mutating || !item.is_active}
               >
@@ -241,7 +373,7 @@ export function AdminConsole({ adminToken }: Props) {
               </button>
               <button
                 type="button"
-                title="Delete token"
+                title="删除令牌"
                 onClick={() => void handleDelete(item.id)}
                 disabled={mutating}
               >
@@ -252,11 +384,11 @@ export function AdminConsole({ adminToken }: Props) {
         ))}
       </div>
 
-      <section className="admin-feature-panel" aria-label="Runtime feature switches">
+      <section className="admin-feature-panel" aria-label="运行时功能开关">
         <div className="admin-feature-head">
           <div>
-            <p className="eyebrow">Runtime Config</p>
-            <h2>Feature Switches</h2>
+            <p className="eyebrow">运行时配置</p>
+            <h2>功能开关</h2>
           </div>
           <button
             className="ghost-button"
@@ -265,25 +397,234 @@ export function AdminConsole({ adminToken }: Props) {
             disabled={mutating}
           >
             <RefreshCw size={16} />
-            <span>Reload</span>
+            <span>重新加载</span>
           </button>
         </div>
 
         <div className="admin-feature-grid">
           <FeatureSwitchGroup
-            title="Right Sidebar"
+            title="右侧栏"
             area="rightSidebar"
             config={featureConfig}
             disabled={mutating}
             onToggle={toggleFeature}
           />
           <FeatureSwitchGroup
-            title="Bottom Dock"
+            title="底部工具栏"
             area="screenerDock"
             config={featureConfig}
             disabled={mutating}
             onToggle={toggleFeature}
           />
+        </div>
+      </section>
+
+      <section className="admin-feature-panel" aria-label="问财配置">
+        <div className="admin-feature-head">
+          <div>
+            <p className="eyebrow">问财配置</p>
+            <h2>问财 API / Cookie</h2>
+          </div>
+          <button className="ghost-button" type="button" onClick={() => void refreshWencaiConfig()}>
+            <RefreshCw size={16} />
+            <span>重新加载</span>
+          </button>
+        </div>
+        <div className="admin-form-grid">
+          <label className="admin-field">
+            <span>OpenAPI Base URL</span>
+            <input
+              value={wencaiConfig.base_url}
+              onChange={(event) =>
+                setWencaiConfig((current) => ({ ...current, base_url: event.target.value }))
+              }
+              placeholder="https://openapi.iwencai.com"
+            />
+          </label>
+          <label className="admin-field">
+            <span>OpenAPI API Key</span>
+            <input
+              type="password"
+              value={wencaiConfig.api_key}
+              onChange={(event) =>
+                setWencaiConfig((current) => ({ ...current, api_key: event.target.value }))
+              }
+              placeholder="优先使用 IWENCAI_API_KEY"
+            />
+          </label>
+          <label className="admin-field admin-field-wide">
+            <span>Cookie</span>
+            <textarea
+              value={wencaiConfig.cookie}
+              onChange={(event) =>
+                setWencaiConfig((current) => ({ ...current, cookie: event.target.value }))
+              }
+              placeholder="复制浏览器请求头中的 Cookie"
+              rows={3}
+            />
+          </label>
+          <label className="admin-field">
+            <span>User Agent</span>
+            <input
+              value={wencaiConfig.user_agent ?? ""}
+              onChange={(event) =>
+                setWencaiConfig((current) => ({ ...current, user_agent: event.target.value }))
+              }
+              placeholder="可选"
+            />
+          </label>
+          <label className="admin-field">
+            <span>超时秒数</span>
+            <input
+              type="number"
+              min={1}
+              value={wencaiConfig.timeout_seconds}
+              onChange={(event) =>
+                setWencaiConfig((current) => ({
+                  ...current,
+                  timeout_seconds: Number(event.target.value) || 20,
+                }))
+              }
+            />
+          </label>
+          <label className="admin-check">
+            <input
+              type="checkbox"
+              checked={wencaiConfig.pro}
+              onChange={(event) =>
+                setWencaiConfig((current) => ({ ...current, pro: event.target.checked }))
+              }
+            />
+            <span>使用问财专业版</span>
+          </label>
+        </div>
+        <div className="admin-config-actions">
+          <button type="button" onClick={() => void handleTestWencaiConfig()} disabled={mutating}>
+            <TestTube2 size={15} />
+            <span>测试连接</span>
+          </button>
+          <button type="button" onClick={() => void handleSaveWencaiConfig()} disabled={mutating}>
+            <Save size={15} />
+            <span>保存配置</span>
+          </button>
+          {wencaiTestResult ? <TestResultBadge result={wencaiTestResult} /> : null}
+        </div>
+      </section>
+
+      <section className="admin-feature-panel" aria-label="LLM 接入点">
+        <div className="admin-feature-head">
+          <div>
+            <p className="eyebrow">LLM 配置</p>
+            <h2>模型接入点</h2>
+          </div>
+          <div className="admin-config-actions">
+            <button type="button" onClick={addProvider}>
+              <Plus size={15} />
+              <span>新增接入点</span>
+            </button>
+            <button type="button" onClick={() => void handleSaveLlmProviders()} disabled={mutating}>
+              <Save size={15} />
+              <span>保存全部</span>
+            </button>
+          </div>
+        </div>
+        <div className="llm-provider-stack">
+          {llmConfig.providers.map((provider) => (
+            <div className="llm-provider-card" key={provider.id}>
+              <div className="llm-provider-head">
+                <label className="admin-check">
+                  <input
+                    type="radio"
+                    checked={llmConfig.active_provider_id === provider.id}
+                    onChange={() =>
+                      setLlmConfig((current) => ({
+                        ...current,
+                        active_provider_id: provider.id,
+                      }))
+                    }
+                  />
+                  <span>当前使用</span>
+                </label>
+                <label className="admin-check">
+                  <input
+                    type="checkbox"
+                    checked={provider.enabled}
+                    onChange={(event) => updateProvider(provider.id, { enabled: event.target.checked })}
+                  />
+                  <span>启用</span>
+                </label>
+                <button type="button" onClick={() => void handleTestLlmProvider(provider)} disabled={mutating}>
+                  <TestTube2 size={15} />
+                  <span>测试连接</span>
+                </button>
+                <button type="button" onClick={() => removeProvider(provider.id)}>
+                  <Trash2 size={15} />
+                  <span>删除</span>
+                </button>
+              </div>
+              <div className="admin-form-grid">
+                <label className="admin-field">
+                  <span>接入点 ID</span>
+                  <input value={provider.id} onChange={(event) => updateProvider(provider.id, { id: event.target.value })} />
+                </label>
+                <label className="admin-field">
+                  <span>名称</span>
+                  <input value={provider.name} onChange={(event) => updateProvider(provider.id, { name: event.target.value })} />
+                </label>
+                <label className="admin-field admin-field-wide">
+                  <span>Base URL</span>
+                  <input value={provider.base_url} onChange={(event) => updateProvider(provider.id, { base_url: event.target.value })} />
+                </label>
+                <label className="admin-field admin-field-wide">
+                  <span>API Key</span>
+                  <input value={provider.api_key} onChange={(event) => updateProvider(provider.id, { api_key: event.target.value })} />
+                </label>
+                <label className="admin-field">
+                  <span>默认模型</span>
+                  <select
+                    value={provider.active_model}
+                    onChange={(event) => updateProvider(provider.id, { active_model: event.target.value })}
+                  >
+                    {provider.models.map((model) => (
+                      <option value={model} key={model}>
+                        {model}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="admin-field">
+                  <span>超时秒数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={provider.timeout_seconds}
+                    onChange={(event) =>
+                      updateProvider(provider.id, { timeout_seconds: Number(event.target.value) || 20 })
+                    }
+                  />
+                </label>
+                <label className="admin-field admin-field-wide">
+                  <span>备选模型（一行一个）</span>
+                  <textarea
+                    rows={3}
+                    value={provider.models.join("\n")}
+                    onChange={(event) => {
+                      const models = splitModels(event.target.value);
+                      updateProvider(provider.id, {
+                        models,
+                        active_model: models.includes(provider.active_model)
+                          ? provider.active_model
+                          : models[0] ?? "",
+                      });
+                    }}
+                  />
+                </label>
+              </div>
+              {llmTestResults[provider.id] ? (
+                <LlmTestResultBadge result={llmTestResults[provider.id]} />
+              ) : null}
+            </div>
+          ))}
         </div>
       </section>
     </section>
@@ -325,6 +666,22 @@ function FeatureSwitchGroup({
   );
 }
 
+function TestResultBadge({ result }: { result: ConnectivityTestResult }) {
+  return (
+    <span className="admin-test-result" data-ok={result.ok}>
+      {result.ok ? "连接成功" : "连接失败"}，耗时 {result.latency_ms}ms，样例 {result.sample_count} 条：{result.message}
+    </span>
+  );
+}
+
+function LlmTestResultBadge({ result }: { result: LlmTestResult }) {
+  return (
+    <span className="admin-test-result" data-ok={result.ok}>
+      {result.ok ? "连接成功" : "连接失败"}，{result.provider} / {result.model}，耗时 {result.latency_ms}ms：{result.message}
+    </span>
+  );
+}
+
 function toggleRuntimeFeature(
   config: RuntimeFeatureConfig,
   area: RuntimeFeatureArea,
@@ -356,6 +713,38 @@ function isRuntimeFeatureEnabled(
   id: string,
 ): boolean {
   return config[area]?.find((item) => item.id === id)?.enabled !== false;
+}
+
+function withDefaultProvider(config: LlmProvidersConfig): LlmProvidersConfig {
+  const provider = createDefaultProvider("siliconflow");
+  return {
+    active_provider_id: config.active_provider_id ?? provider.id,
+    providers: config.providers.length ? config.providers : [provider],
+  };
+}
+
+function createDefaultProvider(id: string): LlmProviderConfig {
+  return {
+    id,
+    name: "硅基流动",
+    base_url: "https://api.siliconflow.cn/v1",
+    api_key: "",
+    models: ["deepseek-ai/DeepSeek-V3.2"],
+    active_model: "deepseek-ai/DeepSeek-V3.2",
+    enabled: true,
+    timeout_seconds: 20,
+  };
+}
+
+function splitModels(value: string): string[] {
+  return value
+    .split(/\r?\n|,/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function readError(value: unknown): string {
+  return value instanceof Error ? value.message : String(value);
 }
 
 function formatDate(value?: string | null): string {

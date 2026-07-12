@@ -88,6 +88,10 @@ export type NewsItem = {
   summary?: string;
   url?: string;
   tags?: string[];
+  relatedSymbols?: Array<{
+    symbol: string;
+    changePercent: number | null;
+  }>;
 };
 
 export type StockNewsFeed = DataFreshness & {

@@ -1,7 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { Moon, Sun } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { chartDataManager } from "../api/chartDataManager";
-import { DEFAULT_CHAN_LEVELS, type ApiBar } from "../api/client";
+import { createHttpMarketSidebarTransport } from "../api/marketSidebar";
+import { MarketSidebarStore } from "../api/marketSidebarStore";
+import { ChanOverlayManager, chanLevelsForTimeframe } from "../api/chanOverlayManager";
+import { ChanRealtimeOverlayBridge, ChanRealtimePollingGate, type ChanRealtimeContext } from "../api/chanRealtimeOverlayBridge";
+import { getBars, type ApiBar, type ChanOverlayResponse } from "../api/client";
 import { listUserSettings, saveUserSetting } from "../api/userSettings";
+import { readWatchlistGroups } from "../api/watchlistStore";
 import type { AuthSession } from "../auth/api";
 import { TRADINGVIEW_DEBUG } from "../config";
 import {
@@ -23,6 +29,7 @@ import {
   setWidgetTimeframe,
   subscribeChanStudySettingsChanges,
   subscribeWidgetSymbolChanges,
+  subscribeWidgetVisibleRangeChanges,
   type ChartTheme,
   type TradingViewWidget,
 } from "../tradingview/widget";
@@ -38,8 +45,6 @@ import { ScreenerDock } from "./ScreenerDock";
 const DEFAULT_SYMBOL = "000001.SZ";
 const DEFAULT_TIMEFRAME = "5f";
 const DEFAULT_BAR_WINDOW_SIZE = 300;
-const MAX_CHART_BUNDLE_REQUEST_BARS = 5_000;
-const CHAN_RENDER_LEVELS = DEFAULT_CHAN_LEVELS;
 
 type ChartMode = "loading" | "tradingview" | "fallback";
 
@@ -55,6 +60,20 @@ function loadInitialChartSymbol(): string {
   }
   const raw = new URLSearchParams(window.location.search).get("symbol")?.trim();
   return normalizeChartSymbol(raw, DEFAULT_SYMBOL);
+}
+
+export async function installAsyncSubscription(
+  create: () => Promise<() => void>,
+  isCurrent: () => boolean,
+  assign: (dispose: () => void) => void,
+): Promise<boolean> {
+  const dispose = await create();
+  if (!isCurrent()) {
+    dispose();
+    return false;
+  }
+  assign(dispose);
+  return true;
 }
 
 export function ChartWorkspace({
@@ -78,9 +97,43 @@ export function ChartWorkspace({
   const [chartMode, setChartMode] = useState<ChartMode>("loading");
   const [bars, setBars] = useState<ApiBar[]>([]);
   const [currentSymbol, setCurrentSymbol] = useState(loadInitialChartSymbol);
+  const [confirmedChartSymbol, setConfirmedChartSymbol] = useState(loadInitialChartSymbol);
   const [currentTimeframe, setCurrentTimeframe] = useState(DEFAULT_TIMEFRAME);
+  const [rightSidebarCollapseSignal, setRightSidebarCollapseSignal] = useState(0);
   const currentSymbolRef = useRef(currentSymbol);
+  const confirmedChartSymbolRef = useRef(confirmedChartSymbol);
   const currentTimeframeRef = useRef(currentTimeframe);
+  const marketSidebarStoreRef = useRef<MarketSidebarStore | null>(null);
+  if (!marketSidebarStoreRef.current) {
+    marketSidebarStoreRef.current = new MarketSidebarStore(
+      createHttpMarketSidebarTransport(session.token),
+      confirmedChartSymbol,
+      readWatchlistGroups().flatMap((group) => group.items.map((item) => item.symbol)),
+    );
+  }
+  const marketSidebarStore = marketSidebarStoreRef.current;
+  const marketSnapshot = useSyncExternalStore(
+    marketSidebarStore.subscribe,
+    marketSidebarStore.getSnapshot,
+    marketSidebarStore.getSnapshot,
+  );
+
+  useEffect(() => {
+    void marketSidebarStore.start();
+    return () => marketSidebarStore.dispose();
+  }, [marketSidebarStore]);
+
+  const confirmChartSymbol = useCallback((symbol: string) => {
+    const normalized = symbol.toUpperCase();
+    if (confirmedChartSymbolRef.current === normalized) return;
+    confirmedChartSymbolRef.current = normalized;
+    setConfirmedChartSymbol(normalized);
+    marketSidebarStore.confirmChartSymbol(normalized);
+  }, [marketSidebarStore]);
+
+  const handleWatchlistSymbolsChange = useCallback((symbols: string[]) => {
+    marketSidebarStore.setWatchlistSymbols(symbols);
+  }, [marketSidebarStore]);
 
   useEffect(() => {
     let cancelled = false;
@@ -195,7 +248,23 @@ export function ChartWorkspace({
     let cancelled = false;
     let overlayVersion = 0;
     let disposeSymbolSubscription: (() => void) | null = null;
+    let disposeVisibleRangeSubscription: (() => void) | null = null;
     let disposeStudySettingsSubscription: (() => void) | null = null;
+    let releaseOverlayRequest: (() => void) | null = null;
+    const overlayManager = new ChanOverlayManager();
+    const realtimeBridge = new ChanRealtimeOverlayBridge();
+    let activeOverlay: {
+      generation: number;
+      context: ChanRealtimeContext;
+      from: number;
+      to: number;
+      limit: number;
+      bars: ApiBar[];
+      releaseSocket: (() => void) | null;
+      refreshController: AbortController | null;
+      refreshPromise: Promise<void> | null;
+      pollingGate: ChanRealtimePollingGate | null;
+    } | null = null;
     let latestHistoryWindow:
       | {
           symbol: string;
@@ -206,49 +275,147 @@ export function ChartWorkspace({
           bars: ApiBar[];
         }
       | null = null;
-    let chanSnapshotSubscriptionKey = "";
-    let disposeChanSnapshotSubscription: (() => void) | null = null;
-    const syncChanSnapshotSubscription = (windowRequest: {
-      symbol: string;
-      timeframe: string;
-      limit: number;
-      from?: number;
-      to?: number;
-    }) => {
-      const nextKey = [
-        windowRequest.symbol.toUpperCase(),
-        windowRequest.timeframe,
-        windowRequest.limit,
-        windowRequest.from ?? "",
-        windowRequest.to ?? "",
-      ].join("|");
-      if (nextKey === chanSnapshotSubscriptionKey) {
+    const teardownActiveOverlay = () => {
+      const active = activeOverlay;
+      if (!active) return;
+      active.releaseSocket?.();
+      active.refreshController?.abort();
+      active.pollingGate?.dispose();
+      realtimeBridge.unsubscribe(active.context);
+      overlayManager.switchContext();
+      activeOverlay = null;
+    };
+    const requestOverlay = (symbol: string, timeframe: string, from: number, to: number, chartBars: ApiBar[]) => {
+      const widget = widgetRef.current;
+      if (!widget || to < from) return;
+      const modes = (["confirmed", "predictive"] as const).filter(
+        (mode) => chanOverlaySettingsRef.current.modes[mode],
+      );
+      const context: ChanRealtimeContext = { symbol: symbol.toUpperCase(), chartTimeframe: timeframe, modes };
+      if (activeOverlay && activeOverlay.context.symbol === context.symbol
+        && activeOverlay.context.chartTimeframe === context.chartTimeframe
+        && activeOverlay.context.modes.join(",") === modes.join(",")
+        && activeOverlay.from === from && activeOverlay.to === to) {
+        activeOverlay.bars = chartBars;
         return;
       }
-      disposeChanSnapshotSubscription?.();
-      disposeChanSnapshotSubscription = null;
-      chanSnapshotSubscriptionKey = nextKey;
-      void chartDataManager
-        .subscribeChanSnapshots({
-          symbol: windowRequest.symbol,
-          timeframe: windowRequest.timeframe,
-          limit: Math.min(windowRequest.limit, MAX_CHART_BUNDLE_REQUEST_BARS),
-          from: windowRequest.from,
-          to: windowRequest.to,
-          levels: CHAN_RENDER_LEVELS,
-        })
-        .then((dispose) => {
-          if (cancelled || chanSnapshotSubscriptionKey !== nextKey) {
-            dispose();
-            return;
-          }
-          disposeChanSnapshotSubscription = dispose;
-        })
-        .catch(() => {
-          if (chanSnapshotSubscriptionKey === nextKey) {
-            chanSnapshotSubscriptionKey = "";
-          }
+      releaseOverlayRequest?.();
+      releaseOverlayRequest = null;
+      teardownActiveOverlay();
+      const requestVersion = ++overlayVersion;
+      const session: NonNullable<typeof activeOverlay> = {
+        generation: requestVersion,
+        context,
+        from,
+        to,
+        limit: Math.max(DEFAULT_BAR_WINDOW_SIZE, chartBars.length),
+        bars: chartBars,
+        releaseSocket: null,
+        refreshController: null,
+        refreshPromise: null,
+        pollingGate: null,
+      };
+      activeOverlay = session;
+      const isCurrent = () => !cancelled && activeOverlay === session
+        && requestVersion === overlayVersion && widgetRef.current === widget;
+      const paint = (overlay: ChanOverlayResponse) => {
+        if (!isCurrent()) return;
+        void renderChanOverlay(widget, overlay, chanOverlaySettingsRef.current, {
+          chartBars: session.bars,
+          isCurrent,
         });
+      };
+      const hydrateBridge = (overlay: ChanOverlayResponse) => realtimeBridge.hydrateHttp({
+        ...context,
+        snapshotVersion: overlay.snapshot_version,
+        range: { from: session.from, to: session.to },
+        objects: {
+          strokes: overlay.strokes,
+          segments: overlay.segments,
+          centers: overlay.centers,
+          signals: overlay.signals,
+          channels: overlay.channels,
+        },
+      });
+      const refreshHttp = (source: "resync" | "poll") => {
+        if (!isCurrent() || session.refreshPromise) return session.refreshPromise;
+        const controller = new AbortController();
+        session.refreshController = controller;
+        const promise = overlayManager.fetchFresh({
+          symbol: context.symbol,
+          timeframe: context.chartTimeframe,
+          from: session.from,
+          to: session.to,
+          modes: [...modes],
+        }, controller.signal).then((overlay) => {
+          if (!isCurrent() || controller.signal.aborted) return;
+          hydrateBridge(overlay);
+          paint(overlay);
+        }).catch((error) => {
+          if (!controller.signal.aborted && isCurrent()) {
+            recordTvDebug(`chan.overlay.${source}.error`, {
+              symbol: context.symbol,
+              timeframe: context.chartTimeframe,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }).finally(() => {
+          if (session.refreshController === controller) session.refreshController = null;
+          if (session.refreshPromise === promise) session.refreshPromise = null;
+        });
+        session.refreshPromise = promise;
+        return promise;
+      };
+      session.pollingGate = new ChanRealtimePollingGate(() => {
+        if (isCurrent()) void refreshHttp("poll");
+      });
+      const subscribeRealtime = () => {
+        void chartDataManager.subscribeChanOverlay({
+          symbol: context.symbol,
+          timeframe: context.chartTimeframe,
+          levels: chanLevelsForTimeframe(context.chartTimeframe),
+          modes,
+          from: session.from,
+          to: session.to,
+          limit: session.limit,
+        }, (message) => {
+          if (!isCurrent()) return;
+          const result = realtimeBridge.apply(message);
+          if (result.status === "applied") {
+            const overlay = overlayManager.applyRealtime(result.state);
+            if (overlay) paint(overlay);
+          } else if (result.status === "resync") {
+            void refreshHttp("resync");
+          }
+        }, (status) => {
+          if (!isCurrent()) return;
+          if (status === "replayed") realtimeBridge.resetTransportEpoch(context);
+          recordTvDebug("chan.overlay.transport", { status, symbol: context.symbol, timeframe: context.chartTimeframe });
+          session.pollingGate?.update(status);
+        }).then((release) => {
+          if (!isCurrent()) release();
+          else session.releaseSocket = release;
+        }).catch((error) => {
+          if (!isCurrent()) return;
+          session.pollingGate?.update("disconnected");
+          recordTvDebug("chan.overlay.subscribe.error", String(error));
+        });
+      };
+      overlayManager.retain(symbol, timeframe, [...modes], { from, to });
+      releaseOverlayRequest = overlayManager.request({
+        symbol,
+        timeframe,
+        from,
+        to,
+        modes: [...modes],
+        onPaint: (overlay) => {
+          if (!isCurrent()) return;
+          hydrateBridge(overlay);
+          paint(overlay);
+          if (!session.releaseSocket) subscribeRealtime();
+        },
+        onError: (error) => recordTvDebug("chan.overlay.error", { symbol, timeframe, message: error.message }),
+      });
     };
     const unsubscribeHistory = chartDataManager.subscribeHistoryWindows((event) => {
       if (cancelled || event.bars.length === 0) {
@@ -258,6 +425,7 @@ export function ChartWorkspace({
       currentSymbolRef.current = nextSymbol;
       currentTimeframeRef.current = event.timeframe;
       setCurrentSymbol((previous) => (previous === nextSymbol ? previous : nextSymbol));
+      confirmChartSymbol(nextSymbol);
       setCurrentTimeframe((previous) => (previous === event.timeframe ? previous : event.timeframe));
       latestHistoryWindow = {
         symbol: event.symbol,
@@ -271,67 +439,9 @@ export function ChartWorkspace({
       if (!widget) {
         return;
       }
-      syncChanSnapshotSubscription({
-        symbol: event.symbol,
-        timeframe: event.timeframe,
-        limit: latestHistoryWindow.limit,
-        from: latestHistoryWindow.from,
-        to: latestHistoryWindow.to,
-      });
-      const requestVersion = ++overlayVersion;
-      void renderCurrentChanOverlay({
-        widget,
-        symbol: event.symbol,
-        timeframe: event.timeframe,
-        limit: latestHistoryWindow.limit,
-        from: latestHistoryWindow.from,
-        to: latestHistoryWindow.to,
-        settings: chanOverlaySettingsRef.current,
-        chartBars: event.bars,
-        isCurrent: () =>
-          !cancelled &&
-          requestVersion === overlayVersion &&
-          widgetRef.current === widget &&
-          currentSymbolRef.current === nextSymbol &&
-          (!getWidgetTimeframe(widget) || getWidgetTimeframe(widget) === event.timeframe),
-      });
-    });
-    const unsubscribeSnapshots = chartDataManager.subscribeSnapshotUpdates((event) => {
-      if (event.source !== "realtime") {
-        return;
-      }
-      const widget = widgetRef.current;
-      if (!widget || cancelled) {
-        return;
-      }
-      const activeTimeframe = getWidgetTimeframe(widget) ?? DEFAULT_TIMEFRAME;
-      if (event.timeframe !== activeTimeframe && event.timeframe !== latestHistoryWindow?.timeframe) {
-        return;
-      }
-      if (
-        !latestHistoryWindow ||
-        latestHistoryWindow.symbol.toUpperCase() !== event.symbol.toUpperCase() ||
-        latestHistoryWindow.timeframe !== activeTimeframe
-      ) {
-        return;
-      }
-      const requestVersion = ++overlayVersion;
-      void renderCurrentChanOverlay({
-        widget,
-        symbol: event.symbol,
-        timeframe: activeTimeframe,
-        limit: latestHistoryWindow.limit,
-        from: latestHistoryWindow.from,
-        to: latestHistoryWindow.to,
-        settings: chanOverlaySettingsRef.current,
-        chartBars: latestHistoryWindow.bars,
-        isCurrent: () =>
-          !cancelled &&
-          requestVersion === overlayVersion &&
-          widgetRef.current === widget &&
-          currentSymbolRef.current === event.symbol.toUpperCase() &&
-          (!getWidgetTimeframe(widget) || getWidgetTimeframe(widget) === activeTimeframe),
-      });
+      const from = event.bars[0]?.time;
+      const to = event.bars[event.bars.length - 1]?.time;
+      if (from !== undefined && to !== undefined) requestOverlay(event.symbol, event.timeframe, from, to, event.bars);
     });
     const initialSymbol = currentSymbolRef.current;
     const initialTimeframe = currentTimeframeRef.current;
@@ -343,7 +453,6 @@ export function ChartWorkspace({
       initialSymbol,
       initialTimeframe,
       chartThemeRef.current,
-      { onToggleTheme: toggleChartTheme },
     )
       .then(async (widget) => {
         if (!widget) {
@@ -358,15 +467,38 @@ export function ChartWorkspace({
           return;
         }
         widgetRef.current = widget;
-        disposeSymbolSubscription = await subscribeWidgetSymbolChanges(widget, (nextSymbol) => {
-          currentSymbolRef.current = nextSymbol;
-          setCurrentSymbol((previous) => (previous === nextSymbol ? previous : nextSymbol));
-        });
+        const widgetIsCurrent = () => !cancelled && widgetRef.current === widget;
+        if (!await installAsyncSubscription(
+          () => subscribeWidgetSymbolChanges(widget, (nextSymbol) => {
+            if (activeOverlay && activeOverlay.context.symbol !== nextSymbol.toUpperCase()) teardownActiveOverlay();
+            currentSymbolRef.current = nextSymbol;
+            setCurrentSymbol((previous) => (previous === nextSymbol ? previous : nextSymbol));
+            confirmChartSymbol(nextSymbol);
+          }),
+          widgetIsCurrent,
+          (dispose) => { disposeSymbolSubscription = dispose; },
+        )) return;
+        if (!await installAsyncSubscription(
+          () => subscribeWidgetVisibleRangeChanges(widget, (range) => {
+            const timeframe = getWidgetTimeframe(widget) ?? currentTimeframeRef.current;
+            const symbol = getWidgetSymbol(widget) ?? currentSymbolRef.current;
+            const bars = latestHistoryWindow?.symbol.toUpperCase() === symbol.toUpperCase()
+              && latestHistoryWindow.timeframe === timeframe
+              ? latestHistoryWindow.bars
+              : [];
+            requestOverlay(symbol, timeframe, Math.floor(range.from), Math.floor(range.to), bars);
+          }),
+          widgetIsCurrent,
+          (dispose) => { disposeVisibleRangeSubscription = dispose; },
+        )) return;
+        if (!widgetIsCurrent()) return;
         disposeStudySettingsSubscription = subscribeChanStudySettingsChanges(
           widget,
           (nextSettings) => {
             chanOverlaySettingsRef.current = nextSettings;
             setChanOverlaySettings(nextSettings);
+            const active = activeOverlay;
+            if (active) requestOverlay(active.context.symbol, active.context.chartTimeframe, active.from, active.to, active.bars);
           },
         );
         setChartMode("tradingview");
@@ -376,22 +508,39 @@ export function ChartWorkspace({
           latestHistoryWindow.timeframe === initialTimeframe
             ? latestHistoryWindow
             : null;
-        const requestVersion = ++overlayVersion;
-        void renderCurrentChanOverlay({
-          widget,
-          symbol: initialSymbol,
-          timeframe: initialTimeframe,
-          limit: initialWindow?.limit ?? DEFAULT_BAR_WINDOW_SIZE,
-          from: initialWindow?.from,
-          to: initialWindow?.to,
-          settings: chanOverlaySettingsRef.current,
-          chartBars: initialWindow?.bars,
-          isCurrent: () =>
-            !cancelled &&
-            requestVersion === overlayVersion &&
-            widgetRef.current === widget &&
-            (!getWidgetTimeframe(widget) || getWidgetTimeframe(widget) === initialTimeframe),
-        });
+        const initialBars = initialWindow?.bars ?? [];
+        const from = initialBars[0]?.time;
+        const to = initialBars[initialBars.length - 1]?.time;
+        if (from !== undefined && to !== undefined) {
+          requestOverlay(initialSymbol, initialTimeframe, from, to, initialBars);
+        } else {
+          // The library can finish its first history request before its visible
+          // range callback is subscribed. Reuse the bar manager cache to start
+          // the first bounded overlay request instead of leaving the chart bare.
+          void chartDataManager.getBars({
+            symbol: initialSymbol,
+            timeframe: initialTimeframe,
+            limit: DEFAULT_BAR_WINDOW_SIZE,
+          }).then((response) => {
+            if (!widgetIsCurrent() || response.bars.length === 0) return;
+            const first = response.bars[0]?.time;
+            const last = response.bars[response.bars.length - 1]?.time;
+            if (first === undefined || last === undefined) return;
+            latestHistoryWindow = {
+              symbol: initialSymbol,
+              timeframe: initialTimeframe,
+              limit: Math.max(DEFAULT_BAR_WINDOW_SIZE, response.bars.length),
+              from: first,
+              to: last,
+              bars: response.bars,
+            };
+            requestOverlay(initialSymbol, initialTimeframe, first, last, response.bars);
+          }).catch((error) => {
+            if (widgetIsCurrent()) {
+              recordTvDebug("chan.overlay.initial-bars.error", String(error));
+            }
+          });
+        }
       })
       .catch(() => {
         if (!cancelled) {
@@ -405,11 +554,13 @@ export function ChartWorkspace({
       const current = widgetRef.current;
       widgetRef.current = null;
       disposeSymbolSubscription?.();
+      disposeVisibleRangeSubscription?.();
       disposeStudySettingsSubscription?.();
+      releaseOverlayRequest?.();
+      teardownActiveOverlay();
       current?.remove();
-      disposeChanSnapshotSubscription?.();
+      overlayManager.dispose();
       unsubscribeHistory();
-      unsubscribeSnapshots();
     };
   }, [session.token]);
 
@@ -437,27 +588,57 @@ export function ChartWorkspace({
   }, [currentTimeframe]);
 
   function handleSelectSymbol(symbol: string) {
-    setCurrentSymbol(symbol.toUpperCase());
+    const normalized = symbol.toUpperCase();
+    currentSymbolRef.current = normalized;
+    confirmChartSymbol(normalized);
+    void chartDataManager.getBars({
+      symbol: normalized,
+      timeframe: currentTimeframeRef.current,
+      limit: DEFAULT_BAR_WINDOW_SIZE,
+    }).catch(() => {
+      // TradingView's own history request remains the fallback.
+    });
+    setCurrentSymbol(normalized);
   }
 
   function toggleChartTheme() {
     setChartTheme((current) => (current === "dark" ? "light" : "dark"));
   }
 
+  function collapseRightSidebarForScreener() {
+    setRightSidebarCollapseSignal((current) => current + 1);
+  }
+
   return (
     <section className="chart-workspace" aria-label="TradingView chart">
       <div className="chart-frame">
         <div id={widgetContainerId.current} className="tv-container" />
+        <button
+          type="button"
+          className="chart-theme-toggle"
+          title={chartTheme === "dark" ? "切换到白色主题" : "切换到黑色主题"}
+          aria-label={chartTheme === "dark" ? "切换到白色主题" : "切换到黑色主题"}
+          onClick={toggleChartTheme}
+        >
+          {chartTheme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+        </button>
         {chartMode === "loading" ? (
           <div className="chart-loading">Loading TradingView</div>
         ) : null}
         {chartMode === "fallback" ? <FallbackChart bars={bars} /> : null}
       </div>
-      <ScreenerDock onSelectSymbol={handleSelectSymbol} />
-      <RightSidebar
-        activeSymbol={currentSymbol}
-        timeframe={currentTimeframe}
+      <ScreenerDock
         onSelectSymbol={handleSelectSymbol}
+        onOpenPanel={collapseRightSidebarForScreener}
+        authToken={session.token}
+      />
+      <RightSidebar
+        activeSymbol={confirmedChartSymbol}
+        timeframe={currentTimeframe}
+        collapseSignal={rightSidebarCollapseSignal}
+        onSelectSymbol={handleSelectSymbol}
+        marketSnapshot={marketSnapshot}
+        onWatchlistSymbolsChange={handleWatchlistSymbolsChange}
         authToken={session.token}
         isAdmin={session.role === "admin"}
         onOpenAdmin={onOpenAdmin}
@@ -472,88 +653,10 @@ async function refreshFallbackBars(
   setBars: (bars: ApiBar[]) => void,
 ) {
   try {
-    const response = await chartDataManager.getChartWindow({
-      symbol,
-      timeframe: DEFAULT_TIMEFRAME,
-      limit: DEFAULT_BAR_WINDOW_SIZE,
-    });
+    const response = await getBars(symbol, DEFAULT_TIMEFRAME, DEFAULT_BAR_WINDOW_SIZE);
     setBars(response.bars);
   } catch {
     setBars([]);
-  }
-}
-
-async function renderCurrentChanOverlay({
-  widget,
-  symbol,
-  timeframe,
-  limit,
-  from,
-  to,
-  settings,
-  chartBars = [],
-  isCurrent,
-}: {
-  widget: TradingViewWidget;
-  symbol: string;
-  timeframe: string;
-  limit: number;
-  from?: number;
-  to?: number;
-  settings: ReturnType<typeof createDefaultChanOverlaySettings>;
-  chartBars?: ApiBar[];
-  isCurrent(): boolean;
-}) {
-  try {
-    recordTvDebug("chan.renderCurrent.request", {
-      symbol,
-      timeframe,
-      limit: Math.min(limit, MAX_CHART_BUNDLE_REQUEST_BARS),
-      from,
-      to,
-      chartBars: chartBars.length,
-    });
-    const window = await chartDataManager.getChartWindow({
-      symbol,
-      timeframe,
-      limit: Math.min(limit, MAX_CHART_BUNDLE_REQUEST_BARS),
-      from,
-      to,
-      levels: CHAN_RENDER_LEVELS,
-    });
-    const projectedBars = chartBars.length > 0 ? chartBars : window.bars;
-    const chan = window.chan;
-    if (!isCurrent()) {
-      recordTvDebug("chan.renderCurrent.stale", {
-        symbol,
-        timeframe,
-        snapshotVersion: chan.snapshot_version,
-      });
-      return;
-    }
-    recordTvDebug("chan.renderCurrent.response", {
-      symbol,
-      timeframe,
-      snapshotVersion: chan.snapshot_version,
-      strokes: chan.strokes.length,
-      segments: chan.segments.length,
-      centers: chan.centers.length,
-      signals: chan.signals.length,
-      chartBars: projectedBars.length,
-    });
-    await renderChanOverlay(widget, chan, settings, {
-      isCurrent,
-      chartBars: projectedBars,
-    });
-  } catch (error) {
-    recordTvDebug("chan.renderCurrent.error", {
-      symbol,
-      timeframe,
-      message: error instanceof Error ? error.message : String(error),
-    });
-    if (TRADINGVIEW_DEBUG) {
-      console.warn("[chan-render-current-failed]", error);
-    }
   }
 }
 

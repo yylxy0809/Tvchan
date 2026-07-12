@@ -65,6 +65,8 @@ type TimedSignalPoint = {
 };
 
 type RawStrokePoint = {
+  seq: number;
+  level?: string;
   startTime: number;
   startPrice: number;
   endTime: number;
@@ -101,6 +103,7 @@ type RawLevelModeData = {
 };
 
 type CanonicalLineLike = ChanStroke & {
+  seq?: number | null;
   is_sure?: boolean;
 };
 
@@ -136,6 +139,7 @@ type LevelCache = {
 type ChanStudyState = {
   resolution: string;
   viewBarTimes: number[];
+  viewBars: ApiBar[];
   rawLevels: Record<ChanLevel, Record<ModeKey, RawLevelModeData>>;
   levels: Record<ChanLevel, Record<ModeKey, LevelCache>>;
   fallbackCenters: ChanCenter[];
@@ -171,21 +175,24 @@ type ChannelPlot = {
 
 type PlotDefinition = MainLinePlot | CenterPlot | SignalPlot | ChannelPlot;
 
-const LEVELS: ChanLevel[] = ["5f", "30f", "1d"];
+const LEVELS: ChanLevel[] = ["5f", "30f", "1d", "1w", "1m"];
 const MODE_KEYS: ModeKey[] = ["confirmed", "predictive", "merged"];
 const SIGNAL_VARIANTS: SignalVariant[] = ["1", "2", "2s", "3"];
+const VALUES_PER_LEVEL = 14;
 const STUDY_ID = "ChanOverlay@tv-basicstudies-1";
 const STUDY_NAME = "Chan Overlay";
 const STUDY_SHORT = "Chan";
 export const CHAN_STUDY_DESCRIPTION = STUDY_SHORT;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TRANSPARENT = "rgba(0,0,0,0)";
-const NAN_VALUES = Array.from({ length: 42 }, () => Number.NaN);
+const NAN_VALUES = Array.from({ length: LEVELS.length * VALUES_PER_LEVEL }, () => Number.NaN);
 
 const MAIN_LINE_PLOTS: MainLinePlot[] = [
   { id: "bi_val", title: "5f\u7b14", level: "5f" },
-  { id: "seg_val", title: "30f\u7ebf\u6bb5", level: "30f" },
-  { id: "ss_val", title: "\u65e5\u7ebf\u8d70\u52bf", level: "1d" },
+  { id: "seg_val", title: "30f\u7b14", level: "30f" },
+  { id: "ss_val", title: "\u65e5\u7ebf\u7b14", level: "1d" },
+  { id: "week_val", title: "周线笔", level: "1w" },
+  { id: "month_val", title: "月线笔", level: "1m" },
 ];
 
 const CENTER_PLOTS: CenterPlot[] = [
@@ -195,34 +202,22 @@ const CENTER_PLOTS: CenterPlot[] = [
   { id: "zs30_lo", title: "30f\u4e2d\u67a2\u4e0b\u8f68", level: "30f", side: "low" },
   { id: "zsd_hi", title: "\u65e5\u7ebf\u4e2d\u67a2\u4e0a\u8f68", level: "1d", side: "high" },
   { id: "zsd_lo", title: "\u65e5\u7ebf\u4e2d\u67a2\u4e0b\u8f68", level: "1d", side: "low" },
+  { id: "zsw_hi", title: "周线中枢上轨", level: "1w", side: "high" },
+  { id: "zsw_lo", title: "周线中枢下轨", level: "1w", side: "low" },
+  { id: "zsm_hi", title: "月线中枢上轨", level: "1m", side: "high" },
+  { id: "zsm_lo", title: "月线中枢下轨", level: "1m", side: "low" },
 ];
 
-const SIGNAL_PLOTS: SignalPlot[] = [
-  signalPlot("5f", "buy", "1"),
-  signalPlot("5f", "buy", "2"),
-  signalPlot("5f", "buy", "2s"),
-  signalPlot("5f", "buy", "3"),
-  signalPlot("5f", "sell", "1"),
-  signalPlot("5f", "sell", "2"),
-  signalPlot("5f", "sell", "2s"),
-  signalPlot("5f", "sell", "3"),
-  signalPlot("30f", "buy", "1"),
-  signalPlot("30f", "buy", "2"),
-  signalPlot("30f", "buy", "2s"),
-  signalPlot("30f", "buy", "3"),
-  signalPlot("30f", "sell", "1"),
-  signalPlot("30f", "sell", "2"),
-  signalPlot("30f", "sell", "2s"),
-  signalPlot("30f", "sell", "3"),
-  signalPlot("1d", "buy", "1"),
-  signalPlot("1d", "buy", "2"),
-  signalPlot("1d", "buy", "2s"),
-  signalPlot("1d", "buy", "3"),
-  signalPlot("1d", "sell", "1"),
-  signalPlot("1d", "sell", "2"),
-  signalPlot("1d", "sell", "2s"),
-  signalPlot("1d", "sell", "3"),
-];
+const SIGNAL_PLOTS: SignalPlot[] = LEVELS.flatMap((level) => [
+  signalPlot(level, "buy", "1"),
+  signalPlot(level, "buy", "2"),
+  signalPlot(level, "buy", "2s"),
+  signalPlot(level, "buy", "3"),
+  signalPlot(level, "sell", "1"),
+  signalPlot(level, "sell", "2"),
+  signalPlot(level, "sell", "2s"),
+  signalPlot(level, "sell", "3"),
+]);
 
 const CHANNEL_PLOTS: ChannelPlot[] = [
   { id: "ch5_hi", title: "5f plot_channel \u4e0a\u8f68", level: "5f", side: "upper" },
@@ -231,6 +226,10 @@ const CHANNEL_PLOTS: ChannelPlot[] = [
   { id: "ch30_lo", title: "30f plot_channel \u4e0b\u8f68", level: "30f", side: "lower" },
   { id: "chd_hi", title: "\u65e5\u7ebf plot_channel \u4e0a\u8f68", level: "1d", side: "upper" },
   { id: "chd_lo", title: "\u65e5\u7ebf plot_channel \u4e0b\u8f68", level: "1d", side: "lower" },
+  { id: "chw_hi", title: "周线 plot_channel 上轨", level: "1w", side: "upper" },
+  { id: "chw_lo", title: "周线 plot_channel 下轨", level: "1w", side: "lower" },
+  { id: "chm_hi", title: "月线 plot_channel 上轨", level: "1m", side: "upper" },
+  { id: "chm_lo", title: "月线 plot_channel 下轨", level: "1m", side: "lower" },
 ];
 
 const PLOTS: PlotDefinition[] = [...MAIN_LINE_PLOTS, ...CENTER_PLOTS, ...CHANNEL_PLOTS, ...SIGNAL_PLOTS];
@@ -239,11 +238,15 @@ const PALETTE_ID_BY_LEVEL: Record<ChanLevel, string> = {
   "5f": "pal_bi",
   "30f": "pal_seg",
   "1d": "pal_ss",
+  "1w": "pal_w",
+  "1m": "pal_m",
 };
 const FILL_ID_BY_LEVEL: Record<ChanLevel, string> = {
   "5f": "fill5",
   "30f": "fill30",
   "1d": "filld",
+  "1w": "fillw",
+  "1m": "fillm",
 };
 
 const EMPTY_LEVEL_CACHE: LevelCache = {
@@ -262,15 +265,20 @@ const EMPTY_LEVEL_CACHE: LevelCache = {
 const EMPTY_STATE: ChanStudyState = {
   resolution: "5",
   viewBarTimes: [],
+  viewBars: [],
   rawLevels: {
     "5f": createEmptyRawLevelState(),
     "30f": createEmptyRawLevelState(),
     "1d": createEmptyRawLevelState(),
+    "1w": createEmptyRawLevelState(),
+    "1m": createEmptyRawLevelState(),
   },
   levels: {
     "5f": createEmptyLevelState(),
     "30f": createEmptyLevelState(),
     "1d": createEmptyLevelState(),
+    "1w": createEmptyLevelState(),
+    "1m": createEmptyLevelState(),
   },
   fallbackCenters: [],
 };
@@ -278,7 +286,7 @@ const EMPTY_STATE: ChanStudyState = {
 let activeStudyState: ChanStudyState = EMPTY_STATE;
 
 export function setChanStudyOverlay(overlay: ChanOverlayResponse, chartBars: ApiBar[] = []): void {
-  activeStudyState = buildStudyState(overlay, chartBars);
+  activeStudyState = updateStudyState(activeStudyState, overlay, chartBars);
 }
 
 export function clearChanStudyOverlay(): void {
@@ -302,9 +310,7 @@ export function buildChanStudyOverrides(
   );
 
   for (const plot of MAIN_LINE_PLOTS) {
-    const style = plot.level === "5f"
-      ? settings.styles[plot.level].stroke
-      : settings.styles[plot.level].segment;
+    const style = settings.styles[plot.level].stroke;
     const path = plotOverrideName(plot.id);
     overrides[`${path}.color`] = style.color;
     overrides[`${path}.linestyle`] = lineStyle;
@@ -326,9 +332,6 @@ export function buildChanStudyOverrides(
     const fillId = FILL_ID_BY_LEVEL[level];
     const style = settings.styles[level].center;
     const visible = settings.levels[level] && settings.parts.centers;
-    overrides[`${fillId}.color`] = style.color;
-    overrides[`${fillId}.transparency`] = style.transparency;
-    overrides[`${fillId}.visible`] = visible;
     overrides[`filledAreasStyle.${fillId}.color`] = style.color;
     overrides[`filledAreasStyle.${fillId}.transparency`] = style.transparency;
     overrides[`filledAreasStyle.${fillId}.visible`] = visible;
@@ -419,6 +422,34 @@ export function createChanCustomIndicators(PineJS: PineJS) {
           { id: "bspd_2s", type: "shapes" },
           { id: "bspd_2ss", type: "shapes" },
           { id: "bspd_3s", type: "shapes" },
+          { id: "week_val", type: "line" },
+          { id: "week_col", type: "colorer", target: "week_val", palette: PALETTE_ID_BY_LEVEL["1w"] },
+          { id: "zsw_hi", type: "line" },
+          { id: "zsw_lo", type: "line" },
+          { id: "chw_hi", type: "line" },
+          { id: "chw_lo", type: "line" },
+          { id: "bspw_1b", type: "shapes" },
+          { id: "bspw_2b", type: "shapes" },
+          { id: "bspw_2sb", type: "shapes" },
+          { id: "bspw_3b", type: "shapes" },
+          { id: "bspw_1s", type: "shapes" },
+          { id: "bspw_2s", type: "shapes" },
+          { id: "bspw_2ss", type: "shapes" },
+          { id: "bspw_3s", type: "shapes" },
+          { id: "month_val", type: "line" },
+          { id: "month_col", type: "colorer", target: "month_val", palette: PALETTE_ID_BY_LEVEL["1m"] },
+          { id: "zsm_hi", type: "line" },
+          { id: "zsm_lo", type: "line" },
+          { id: "chm_hi", type: "line" },
+          { id: "chm_lo", type: "line" },
+          { id: "bspm_1b", type: "shapes" },
+          { id: "bspm_2b", type: "shapes" },
+          { id: "bspm_2sb", type: "shapes" },
+          { id: "bspm_3b", type: "shapes" },
+          { id: "bspm_1s", type: "shapes" },
+          { id: "bspm_2s", type: "shapes" },
+          { id: "bspm_2ss", type: "shapes" },
+          { id: "bspm_3s", type: "shapes" },
         ],
         palettes: {
           pal_bi: {
@@ -433,11 +464,21 @@ export function createChanCustomIndicators(PineJS: PineJS) {
             colors: [{ name: "1d-up" }, { name: "1d-down" }],
             valToIndex: { 0: 0, 1: 1 },
           },
+          pal_w: {
+            colors: [{ name: "1w-up" }, { name: "1w-down" }],
+            valToIndex: { 0: 0, 1: 1 },
+          },
+          pal_m: {
+            colors: [{ name: "1m-up" }, { name: "1m-down" }],
+            valToIndex: { 0: 0, 1: 1 },
+          },
         },
         filledAreas: [
           { id: "fill5", objAId: "zs5_hi", objBId: "zs5_lo", type: "plot_plot", title: "5f涓灑" },
           { id: "fill30", objAId: "zs30_hi", objBId: "zs30_lo", type: "plot_plot", title: "30f涓灑" },
           { id: "filld", objAId: "zsd_hi", objBId: "zsd_lo", type: "plot_plot", title: "鏃ョ嚎涓灑" },
+          { id: "fillw", objAId: "zsw_hi", objBId: "zsw_lo", type: "plot_plot", title: "周线中枢" },
+          { id: "fillm", objAId: "zsm_hi", objBId: "zsm_lo", type: "plot_plot", title: "月线中枢" },
         ],
         defaults: {
           inputs: DEFAULT_CHAN_STUDY_INPUTS,
@@ -481,16 +522,46 @@ export function createChanCustomIndicators(PineJS: PineJS) {
             bspd_2s: buildSignalDefaults("1d", "sell", "2"),
             bspd_2ss: buildSignalDefaults("1d", "sell", "2s"),
             bspd_3s: buildSignalDefaults("1d", "sell", "3"),
+            week_val: buildLineDefaults("1w"),
+            zsw_hi: buildCenterDefaults("1w"),
+            zsw_lo: buildCenterDefaults("1w"),
+            chw_hi: buildChannelDefaults("1w"),
+            chw_lo: buildChannelDefaults("1w"),
+            bspw_1b: buildSignalDefaults("1w", "buy", "1"),
+            bspw_2b: buildSignalDefaults("1w", "buy", "2"),
+            bspw_2sb: buildSignalDefaults("1w", "buy", "2s"),
+            bspw_3b: buildSignalDefaults("1w", "buy", "3"),
+            bspw_1s: buildSignalDefaults("1w", "sell", "1"),
+            bspw_2s: buildSignalDefaults("1w", "sell", "2"),
+            bspw_2ss: buildSignalDefaults("1w", "sell", "2s"),
+            bspw_3s: buildSignalDefaults("1w", "sell", "3"),
+            month_val: buildLineDefaults("1m"),
+            zsm_hi: buildCenterDefaults("1m"),
+            zsm_lo: buildCenterDefaults("1m"),
+            chm_hi: buildChannelDefaults("1m"),
+            chm_lo: buildChannelDefaults("1m"),
+            bspm_1b: buildSignalDefaults("1m", "buy", "1"),
+            bspm_2b: buildSignalDefaults("1m", "buy", "2"),
+            bspm_2sb: buildSignalDefaults("1m", "buy", "2s"),
+            bspm_3b: buildSignalDefaults("1m", "buy", "3"),
+            bspm_1s: buildSignalDefaults("1m", "sell", "1"),
+            bspm_2s: buildSignalDefaults("1m", "sell", "2"),
+            bspm_2ss: buildSignalDefaults("1m", "sell", "2s"),
+            bspm_3s: buildSignalDefaults("1m", "sell", "3"),
           },
           filledAreasStyle: {
             fill5: buildFillDefaults("5f"),
             fill30: buildFillDefaults("30f"),
             filld: buildFillDefaults("1d"),
+            fillw: buildFillDefaults("1w"),
+            fillm: buildFillDefaults("1m"),
           },
           palettes: {
             pal_bi: buildPaletteDefaults("5f"),
             pal_seg: buildPaletteDefaults("30f"),
             pal_ss: buildPaletteDefaults("1d"),
+            pal_w: buildPaletteDefaults("1w"),
+            pal_m: buildPaletteDefaults("1m"),
           },
         },
         styles: {
@@ -533,6 +604,32 @@ export function createChanCustomIndicators(PineJS: PineJS) {
           bspd_2s: buildSignalMeta("bspd_2s"),
           bspd_2ss: buildSignalMeta("bspd_2ss"),
           bspd_3s: buildSignalMeta("bspd_3s"),
+          week_val: { title: plotOverrideName("week_val"), joinPoints: true, histogramBase: 0 },
+          zsw_hi: { title: plotOverrideName("zsw_hi"), joinPoints: false, histogramBase: 0 },
+          zsw_lo: { title: plotOverrideName("zsw_lo"), joinPoints: false, histogramBase: 0 },
+          chw_hi: { title: plotOverrideName("chw_hi"), joinPoints: true, histogramBase: 0 },
+          chw_lo: { title: plotOverrideName("chw_lo"), joinPoints: true, histogramBase: 0 },
+          bspw_1b: buildSignalMeta("bspw_1b"),
+          bspw_2b: buildSignalMeta("bspw_2b"),
+          bspw_2sb: buildSignalMeta("bspw_2sb"),
+          bspw_3b: buildSignalMeta("bspw_3b"),
+          bspw_1s: buildSignalMeta("bspw_1s"),
+          bspw_2s: buildSignalMeta("bspw_2s"),
+          bspw_2ss: buildSignalMeta("bspw_2ss"),
+          bspw_3s: buildSignalMeta("bspw_3s"),
+          month_val: { title: plotOverrideName("month_val"), joinPoints: true, histogramBase: 0 },
+          zsm_hi: { title: plotOverrideName("zsm_hi"), joinPoints: false, histogramBase: 0 },
+          zsm_lo: { title: plotOverrideName("zsm_lo"), joinPoints: false, histogramBase: 0 },
+          chm_hi: { title: plotOverrideName("chm_hi"), joinPoints: true, histogramBase: 0 },
+          chm_lo: { title: plotOverrideName("chm_lo"), joinPoints: true, histogramBase: 0 },
+          bspm_1b: buildSignalMeta("bspm_1b"),
+          bspm_2b: buildSignalMeta("bspm_2b"),
+          bspm_2sb: buildSignalMeta("bspm_2sb"),
+          bspm_3b: buildSignalMeta("bspm_3b"),
+          bspm_1s: buildSignalMeta("bspm_1s"),
+          bspm_2s: buildSignalMeta("bspm_2s"),
+          bspm_2ss: buildSignalMeta("bspm_2ss"),
+          bspm_3s: buildSignalMeta("bspm_3s"),
         },
       },
       constructor: function (this: PineStudyContext) {
@@ -609,6 +706,30 @@ export function createChanCustomIndicators(PineJS: PineJS) {
             this,
             resolution,
           );
+          applyMainLevel(
+            values,
+            42,
+            "1w",
+            settings,
+            displaySettings,
+            modeKey,
+            rangeStart,
+            rangeEnd,
+            this,
+            resolution,
+          );
+          applyMainLevel(
+            values,
+            56,
+            "1m",
+            settings,
+            displaySettings,
+            modeKey,
+            rangeStart,
+            rangeEnd,
+            this,
+            resolution,
+          );
 
           return values;
         };
@@ -645,11 +766,14 @@ function applyMainLevel(
   }
 
   if (settings.parts.centers) {
-    const pivot = findPivotOverlap(levelCache.pivots, levelCache.pivotStarts, rangeStart, rangeEnd);
-    const center = applyPivotBreak(level, pivot, context);
-    if (center) {
-      values[baseIndex + 2] = center.high;
-      values[baseIndex + 3] = center.low;
+    const pivot = applyPivotBreak(
+      level,
+      findPivotOverlap(levelCache.pivots, levelCache.pivotStarts, rangeStart, rangeEnd),
+      context,
+    );
+    if (pivot) {
+      values[baseIndex + 2] = pivot.high;
+      values[baseIndex + 3] = pivot.low;
     }
   } else {
     clearPivotBreak(level, context);
@@ -710,10 +834,71 @@ function buildStudyState(
   return {
     resolution,
     viewBarTimes,
+    viewBars: chartBars,
     rawLevels,
-    levels: rebuildLevelCaches(rawLevels, resolution, viewBarTimes),
+    levels: rebuildLevelCaches(rawLevels, resolution, viewBarTimes, chartBars),
     fallbackCenters: [],
   };
+}
+
+function updateStudyState(
+  previous: ChanStudyState,
+  overlay: ChanOverlayResponse,
+  chartBars: ApiBar[],
+): ChanStudyState {
+  const resolution = INTERVAL_BY_TIMEFRAME[overlay.chart_timeframe] ?? "5";
+  const viewBarTimes = buildViewBarTimes(chartBars, resolution);
+  if (
+    previous === EMPTY_STATE
+    || previous.resolution !== resolution
+    || !chartBarsEqual(previous.viewBars, chartBars)
+  ) {
+    return buildStudyState(overlay, chartBars);
+  }
+
+  const incomingRaw = buildRawLevelState(overlay);
+  const rawLevels = { ...previous.rawLevels };
+  const levels = { ...previous.levels };
+  for (const level of LEVELS) {
+    let levelChanged = false;
+    const nextRawLevel = { ...previous.rawLevels[level] };
+    const nextLevel = { ...previous.levels[level] };
+    for (const mode of MODE_KEYS) {
+      if (rawLevelModeEqual(previous.rawLevels[level][mode], incomingRaw[level][mode])) {
+        continue;
+      }
+      levelChanged = true;
+      nextRawLevel[mode] = incomingRaw[level][mode];
+      nextLevel[mode] = buildLevelCacheFromRaw(
+        incomingRaw[level][mode],
+        resolution,
+        viewBarTimes,
+        chartBars,
+      );
+    }
+    if (levelChanged) {
+      rawLevels[level] = nextRawLevel;
+      levels[level] = nextLevel;
+    }
+  }
+  return { ...previous, resolution, viewBarTimes, viewBars: chartBars, rawLevels, levels };
+}
+
+function chartBarsEqual(left: ApiBar[], right: ApiBar[]): boolean {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  return left.every((bar, index) => {
+    const other = right[index];
+    return other !== undefined
+      && bar.time === other.time
+      && bar.high === other.high
+      && bar.low === other.low
+      && bar.revision === other.revision;
+  });
+}
+
+function rawLevelModeEqual(left: RawLevelModeData, right: RawLevelModeData): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function ensureStudyStateResolution(resolution: string): void {
@@ -731,6 +916,7 @@ function ensureStudyStateResolution(resolution: string): void {
       activeStudyState.rawLevels,
       resolution,
       nextViewBarTimes,
+      activeStudyState.viewBars,
     ),
   };
 }
@@ -742,6 +928,8 @@ function buildRawLevelState(
     "5f": createEmptyRawLevelState(),
     "30f": createEmptyRawLevelState(),
     "1d": createEmptyRawLevelState(),
+    "1w": createEmptyRawLevelState(),
+    "1m": createEmptyRawLevelState(),
   };
 
   for (const level of LEVELS) {
@@ -765,7 +953,9 @@ function buildRawLevelModeData(
       .filter((item) => normalizeLevel(item.level) === level)
       .filter((item) => modeMatches(item.mode, resolveConfirmed(item), modeKey))
       .map(lineToRawStroke)
-      .filter((item): item is RawStrokePoint => item !== null),
+      .filter((item): item is RawStrokePoint => item !== null)
+      .map((item) => ({ ...item, level }))
+      .sort(compareRawStrokes),
     centers: overlay.centers
       .filter((item) => normalizeLevel(item.level) === level)
       .filter((item) => modeMatches(item.mode, item.confirmed, modeKey))
@@ -802,12 +992,23 @@ function lineToRawStroke(item: CanonicalLineLike): RawStrokePoint | null {
     return null;
   }
   return {
+    seq: numberFromUnknown(item.seq) ?? 0,
     startTime: startTime * 1000,
     startPrice,
     endTime: endTime * 1000,
     endPrice,
     direction: String(item.direction ?? ""),
   };
+}
+
+function compareRawStrokes(left: RawStrokePoint, right: RawStrokePoint): number {
+  if (left.seq !== right.seq) {
+    return left.seq - right.seq;
+  }
+  if (left.startTime !== right.startTime) {
+    return left.startTime - right.startTime;
+  }
+  return left.endTime - right.endTime;
 }
 
 function centerToRawCenter(item: ChanCenter): RawCenterInterval | null {
@@ -873,18 +1074,21 @@ function rebuildLevelCaches(
   rawLevels: ChanStudyState["rawLevels"],
   resolution: string,
   viewBarTimes: number[],
+  viewBars: ApiBar[],
 ): ChanStudyState["levels"] {
   const levels: ChanStudyState["levels"] = {
     "5f": createEmptyLevelState(),
     "30f": createEmptyLevelState(),
     "1d": createEmptyLevelState(),
+    "1w": createEmptyLevelState(),
+    "1m": createEmptyLevelState(),
   };
 
   for (const level of LEVELS) {
     levels[level] = {
-      confirmed: buildLevelCacheFromRaw(rawLevels[level].confirmed, resolution, viewBarTimes),
-      predictive: buildLevelCacheFromRaw(rawLevels[level].predictive, resolution, viewBarTimes),
-      merged: buildLevelCacheFromRaw(rawLevels[level].merged, resolution, viewBarTimes),
+      confirmed: buildLevelCacheFromRaw(rawLevels[level].confirmed, resolution, viewBarTimes, viewBars),
+      predictive: buildLevelCacheFromRaw(rawLevels[level].predictive, resolution, viewBarTimes, viewBars),
+      merged: buildLevelCacheFromRaw(rawLevels[level].merged, resolution, viewBarTimes, viewBars),
     };
   }
 
@@ -895,8 +1099,9 @@ function buildLevelCacheFromRaw(
   levelData: RawLevelModeData,
   resolution: string,
   viewBarTimes: number[],
+  viewBars: ApiBar[],
 ): LevelCache {
-  const stroke = buildStrokePointsForView(levelData.strokes, resolution, viewBarTimes);
+  const stroke = buildStrokePointsForView(levelData.strokes, resolution, viewBarTimes, viewBars);
   const pivots = sortedPivotsForView(levelData.centers, resolution, viewBarTimes);
   const channel = buildChannelMapForView(levelData.channels, resolution, viewBarTimes);
   const bspBuy = buildBspMapForView(levelData.signals, "buy", resolution, viewBarTimes);
@@ -947,6 +1152,7 @@ function buildStrokePointsForView(
   strokes: RawStrokePoint[],
   resolution: string,
   viewBarTimes: number[],
+  viewBars: ApiBar[] = [],
 ): { map: Map<number, TimedLinePoint>; times: number[] } {
   const map = new Map<number, TimedLinePoint>();
   if (!strokes.length) {
@@ -954,28 +1160,17 @@ function buildStrokePointsForView(
   }
 
   for (const stroke of strokes) {
-    const endTime = normalizeChanPointTimeForResolution(
-      stroke.endTime,
-      resolution,
-      viewBarTimes,
-    );
-    if (Number.isFinite(endTime)) {
-      map.set(endTime, {
-        price: stroke.endPrice,
-        dir: stroke.direction,
-      });
-    }
-  }
-
-  for (const stroke of strokes) {
-    const startTime = normalizeChanPointTimeForResolution(
-      stroke.startTime,
-      resolution,
-      viewBarTimes,
-    );
+    const startTime = projectChanPointToViewTime(stroke.startTime, stroke.startPrice, stroke.level, resolution, viewBarTimes, viewBars);
     if (Number.isFinite(startTime)) {
       map.set(startTime, {
         price: stroke.startPrice,
+        dir: stroke.direction,
+      });
+    }
+    const endTime = projectChanPointToViewTime(stroke.endTime, stroke.endPrice, stroke.level, resolution, viewBarTimes, viewBars);
+    if (Number.isFinite(endTime)) {
+      map.set(endTime, {
+        price: stroke.endPrice,
         dir: stroke.direction,
       });
     }
@@ -1152,21 +1347,9 @@ function resolveActiveModeKey(settings: ChanOverlaySettings): ModeKey {
 }
 
 function shouldShowSignalLevel(level: ChanLevel, resolution: string): boolean {
-  const normalized = resolution.trim().toUpperCase();
-  const minuteValue = Number.parseInt(normalized, 10);
-  const isMinute30OrAbove = Number.isFinite(minuteValue) && minuteValue >= 30;
-  const isHourOrAbove = /^\d+H$/.test(normalized);
-  const isDailyOrAbove = normalized === "D"
-    || normalized === "1D"
-    || normalized === "W"
-    || normalized === "1W"
-    || normalized === "M"
-    || normalized === "1M";
-
-  if (!isMinute30OrAbove && !isHourOrAbove && !isDailyOrAbove) {
-    return true;
-  }
-  return level === "30f" || level === "1d";
+  void level;
+  void resolution;
+  return true;
 }
 
 function shouldShowSignalPlot(
@@ -1315,7 +1498,7 @@ function buildCenterDefaults(level: ChanLevel): Record<string, unknown> {
     linestyle: 0,
     linewidth: style.linewidth,
     plottype: 0,
-    visible: false,
+    visible: true,
     trackPrice: false,
     transparency: 0,
   };
@@ -1361,7 +1544,13 @@ function buildFillDefaults(level: ChanLevel): Record<string, unknown> {
   if (level === "30f") {
     return { color: "rgba(46,196,182,0.12)", visible: true, transparency: 80 };
   }
-  return { color: "rgba(240,101,149,0.12)", visible: true, transparency: 80 };
+  if (level === "1d") {
+    return { color: "rgba(240,101,149,0.12)", visible: true, transparency: 80 };
+  }
+  if (level === "1w") {
+    return { color: "rgba(255,146,43,0.12)", visible: true, transparency: 80 };
+  }
+  return { color: "rgba(76,110,245,0.12)", visible: true, transparency: 80 };
 }
 
 function buildPaletteDefaults(level: ChanLevel): Record<string, unknown> {
@@ -1387,7 +1576,7 @@ function buildSignalMeta(plotId: string): Record<string, unknown> {
 }
 
 function defaultLineStyle(level: ChanLevel): { color: string; linewidth: number } {
-  return settingsLine(level, level === "5f" ? "stroke" : "segment");
+  return settingsLine(level, "stroke");
 }
 
 function defaultCenterStyle(level: ChanLevel): { color: string; linewidth: number } {
@@ -1396,11 +1585,7 @@ function defaultCenterStyle(level: ChanLevel): { color: string; linewidth: numbe
 
 function defaultSignalStyle(level: ChanLevel, side: SignalSide): ResolvedChanSignalStyle {
   return getChanSignalStyle(
-    {
-      "5f": createDefaultChanOverlaySettings().styles["5f"],
-      "30f": createDefaultChanOverlaySettings().styles["30f"],
-      "1d": createDefaultChanOverlaySettings().styles["1d"],
-    },
+    createDefaultChanOverlaySettings().styles,
     level,
     side === "buy" ? "B" : "S",
   );
@@ -1429,7 +1614,14 @@ function signalPlot(level: ChanLevel, side: SignalSide, variant: SignalVariant):
 }
 
 function signalPlotId(level: ChanLevel, side: SignalSide, variant: SignalVariant): string {
-  const prefix = level === "1d" ? "bspd" : level === "30f" ? "bsp30" : "bsp5";
+  const prefixByLevel: Record<ChanLevel, string> = {
+    "5f": "bsp5",
+    "30f": "bsp30",
+    "1d": "bspd",
+    "1w": "bspw",
+    "1m": "bspm",
+  };
+  const prefix = prefixByLevel[level];
   const suffix = side === "buy"
     ? variant === "2s"
       ? "2sb"
@@ -1441,7 +1633,14 @@ function signalPlotId(level: ChanLevel, side: SignalSide, variant: SignalVariant
 }
 
 function signalText(level: ChanLevel, side: SignalSide, variant: SignalVariant): string {
-  const levelText = level === "1d" ? "\u65e5\u7ebf" : level;
+  const levelTextByLevel: Record<ChanLevel, string> = {
+    "5f": "5f",
+    "30f": "30f",
+    "1d": "\u65e5\u7ebf",
+    "1w": "周线",
+    "1m": "月线",
+  };
+  const levelText = levelTextByLevel[level];
   const variantText = variant === "2s" ? "2s\u7c7b" : `${variant}\u7c7b`;
   const sideText = side === "buy" ? "\u4e70" : "\u5356";
   return `${levelText}${variantText}${sideText}`;
@@ -1498,6 +1697,12 @@ function normalizeLevel(level: string): ChanLevel {
   }
   if (normalized === "1d" || normalized === "d" || normalized === "daily" || normalized === "day") {
     return "1d";
+  }
+  if (normalized === "1w" || normalized === "w" || normalized === "weekly" || normalized === "week") {
+    return "1w";
+  }
+  if (normalized === "1m" || normalized === "m" || normalized === "monthly" || normalized === "month") {
+    return "1m";
   }
   return "5f";
 }
@@ -1624,29 +1829,8 @@ function mapChanTimeToViewTime(
     }
   }
 
-  if (normalized === "D" || normalized === "1D") {
-    const date = new Date(chanTimeMs);
-    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 0, 0, 0, 0);
-  }
-
-  if (normalized === "W" || normalized === "1W") {
-    const date = new Date(chanTimeMs);
-    const dayOfWeek = date.getUTCDay();
-    const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-    return Date.UTC(
-      date.getUTCFullYear(),
-      date.getUTCMonth(),
-      date.getUTCDate() - daysFromMonday,
-      0,
-      0,
-      0,
-      0,
-    );
-  }
-
-  if (normalized === "M" || normalized === "1M") {
-    const date = new Date(chanTimeMs);
-    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1, 0, 0, 0, 0);
+  if (["D", "1D", "W", "1W", "M", "1M"].includes(normalized)) {
+    return toTradingViewTime(chanTimeMs / 1000, normalized);
   }
 
   return toTradingViewTime(chanTimeMs / 1000, resolution);
@@ -1726,6 +1910,56 @@ function normalizeChanPointTimeForResolution(
   return mapChanTimeToViewTime(chanTimeMs, resolution, viewBarTimes);
 }
 
+// Higher-level endpoints land on the last chart bar that owns the reported extreme.
+export function projectChanPointToViewTime(
+  chanTimeMs: number,
+  price: number,
+  level: string | undefined,
+  resolution: string,
+  viewBarTimes: number[] = [],
+  viewBars: ApiBar[] = [],
+): number {
+  const sameLevel = !level || (INTERVAL_BY_TIMEFRAME[level] ?? level).toUpperCase() === resolution.toUpperCase();
+  if (sameLevel) {
+    return ["D", "1D", "W", "1W", "M", "1M"].includes(resolution.toUpperCase())
+      ? toTradingViewTime(chanTimeMs / 1000, resolution)
+      : chanTimeMs;
+  }
+  const intervalStart = nativeIntervalStartMs(chanTimeMs, level);
+  const intervalBars = viewBars.filter((bar) => bar.time * 1000 > intervalStart && bar.time * 1000 <= chanTimeMs);
+  if (intervalBars.length) {
+    const maxHigh = Math.max(...intervalBars.map((bar) => bar.high));
+    const minLow = Math.min(...intervalBars.map((bar) => bar.low));
+    const candidates = intervalBars.filter((bar) =>
+      (price === maxHigh && bar.high === price) || (price === minLow && bar.low === price),
+    );
+    if (candidates.length) return toTradingViewTime(candidates[candidates.length - 1].time, resolution);
+  }
+  return mapChanTimeToViewTime(chanTimeMs, resolution, viewBarTimes);
+}
+
+function nativeIntervalStartMs(endMs: number, level: string): number {
+  const shanghaiOffset = 8 * 60 * 60 * 1000;
+  if (level === "1d" || level === "1w" || level === "1m") {
+    const shanghai = new Date(endMs - 1 + shanghaiOffset);
+    let day = shanghai.getUTCDate();
+    if (level === "1w") {
+      day -= (shanghai.getUTCDay() + 6) % 7;
+    }
+    if (level === "1m") {
+      day = 1;
+    }
+    return Date.UTC(shanghai.getUTCFullYear(), shanghai.getUTCMonth(), day) - shanghaiOffset;
+  }
+  const secondsByLevel: Record<string, number> = {
+    "5f": 5 * 60,
+    "15f": 15 * 60,
+    "30f": 30 * 60,
+    "1h": 60 * 60,
+  };
+  return endMs - (secondsByLevel[level] ?? 0) * 1000;
+}
+
 function lowerBound(values: number[], target: number): number {
   let low = 0;
   let high = values.length;
@@ -1760,11 +1994,14 @@ export const __CHAN_STUDY_TESTING__ = {
   lineToRawStroke,
   sortedPivotsForView,
   buildBspMapForView,
+  buildChannelMapForView,
   lastPointInRange,
   findPivotOverlap,
   applyPivotBreak,
   mapChanTimeToViewTime,
   mapChanTimeToLoadedIntradayBar,
   normalizeChanPointTimeForResolution,
+  projectChanPointToViewTime,
+  getActiveStudyState: () => activeStudyState,
 };
 

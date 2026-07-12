@@ -2,6 +2,7 @@ type RuntimeAppConfig = {
   apiBaseUrl?: string;
   apiToken?: string;
   chanStudy?: boolean | string;
+  chartV2Fallback?: boolean | string;
   chartDataTransport?: string;
   frontendAdminToken?: string;
   tvDebug?: boolean | string;
@@ -17,11 +18,12 @@ const runtimeConfig =
   typeof window !== "undefined" ? window.__TV_APP_CONFIG__ ?? {} : {};
 const queryParams =
   typeof window !== "undefined" ? new URLSearchParams(window.location.search) : undefined;
+const viteEnv = import.meta.env ?? {};
 
 const configuredApiBaseUrl =
   queryParams?.get("apiBaseUrl") ??
   runtimeConfig.apiBaseUrl ??
-  import.meta.env.VITE_API_BASE_URL ??
+  viteEnv.VITE_API_BASE_URL ??
   "http://127.0.0.1:8001";
 
 export const API_BASE_URL =
@@ -34,25 +36,25 @@ export const LOGIN_TOKEN_STORAGE_KEY = "tv-a-share-login-token";
 
 export const FRONTEND_ADMIN_TOKEN =
   runtimeConfig.frontendAdminToken ??
-  import.meta.env.VITE_FRONTEND_ADMIN_TOKEN ??
+  viteEnv.VITE_FRONTEND_ADMIN_TOKEN ??
   "";
 
 export const DEFAULT_API_TOKEN =
   runtimeConfig.apiToken ??
-  import.meta.env.VITE_API_TOKEN ??
+  viteEnv.VITE_API_TOKEN ??
   (API_BASE_URL ? "dev-local-token" : "");
 
 export const API_TOKEN = DEFAULT_API_TOKEN;
 
 export const TRADINGVIEW_DEBUG =
   readBoolean(queryParams?.get("tvDebug")) ??
-  readBoolean(import.meta.env.VITE_TV_DEBUG) ??
+  readBoolean(viteEnv.VITE_TV_DEBUG) ??
   readBoolean(runtimeConfig.tvDebug) ??
   false;
 
 export const CHAN_STUDY_ENABLED =
   readBoolean(queryParams?.get("chanStudy")) ??
-  readBoolean(import.meta.env.VITE_CHAN_STUDY_ENABLED) ??
+  readBoolean(viteEnv.VITE_CHAN_STUDY_ENABLED) ??
   readBoolean(runtimeConfig.chanStudy) ??
   true;
 
@@ -60,10 +62,16 @@ export type ChartDataTransport = "http" | "websocket" | "auto";
 
 export const CHART_DATA_TRANSPORT = readTransport(
   queryParams?.get("dataTransport") ??
-    import.meta.env.VITE_CHART_DATA_TRANSPORT ??
+    viteEnv.VITE_CHART_DATA_TRANSPORT ??
     runtimeConfig.chartDataTransport ??
     "http",
 );
+
+export const ALLOW_CHART_V2_FALLBACK =
+  readBoolean(queryParams?.get("chartV2Fallback")) ??
+  readBoolean(viteEnv.VITE_ALLOW_CHART_V2_FALLBACK) ??
+  readBoolean(runtimeConfig.chartV2Fallback) ??
+  false;
 
 export function apiUrl(path: string): string {
   const normalizedPath = normalizePath(path);
