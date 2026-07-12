@@ -41,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chan-levels", default=os.getenv("CHAN_MODULE_C_LEVELS", DEFAULT_MODULE_C_CHAN_LEVELS))
     parser.add_argument("--modes", default=os.getenv("CHAN_MODULE_C_MODES", DEFAULT_MODES))
     parser.add_argument("--run-group-id", default=os.getenv("CHAN_MODULE_C_RUN_GROUP_ID"))
+    parser.add_argument("--batch-id", type=int, default=os.getenv("CHAN_MODULE_C_BATCH_ID"))
+    parser.add_argument("--publication-namespace", default=os.getenv("CHAN_MODULE_C_PUBLICATION_NAMESPACE", "production"))
+    parser.add_argument("--profile-id", default=os.getenv("CHAN_MODULE_C_PROFILE_ID", "module-c-native-5lvl"))
     parser.add_argument("--concurrency", type=int, default=int(os.getenv("CHAN_MODULE_C_CONCURRENCY", "1")))
     parser.add_argument("--shard-index", type=int, default=int(os.getenv("CHAN_MODULE_C_SHARD_INDEX", "0")))
     parser.add_argument("--shard-count", type=int, default=int(os.getenv("CHAN_MODULE_C_SHARD_COUNT", "1")))
@@ -87,6 +90,8 @@ async def main() -> None:
     db_pool_max_size = max(db_pool_min_size, args.db_pool_max_size)
     if not args.dry_run and not args.run_group_id:
         raise ValueError("--run-group-id is required for a non-dry Module C recompute")
+    if not args.dry_run and not args.batch_id:
+        raise ValueError("--batch-id is required for a non-dry Module C recompute")
     run_group_id = args.run_group_id or f"dry-run-{uuid.uuid4()}"
 
     async with PostgresKlineWriter(
@@ -145,6 +150,9 @@ async def main() -> None:
             publication_profile="baseline",
             publication_source="full_recompute",
             run_kind="full_recompute",
+            batch_id=args.batch_id,
+            publication_namespace=args.publication_namespace,
+            profile_id=args.profile_id,
             run_group_id=run_group_id,
         ) as chan_writer:
             result = await process_symbols_concurrently(
