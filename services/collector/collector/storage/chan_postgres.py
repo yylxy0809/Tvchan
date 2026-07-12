@@ -173,6 +173,9 @@ class PostgresChanWriter:
         run_group_id: str | None = None,
         publication_source: str = "collector",
         run_kind: str = "online",
+        batch_id: int | None = None,
+        publication_namespace: str | None = None,
+        profile_id: str | None = None,
         worker_id: str | None = None,
         claim_token: str | None = None,
     ) -> None:
@@ -189,6 +192,9 @@ class PostgresChanWriter:
         self.run_group_id = run_group_id
         self.publication_source = publication_source
         self.run_kind = run_kind
+        self.batch_id = batch_id
+        self.publication_namespace = publication_namespace
+        self.profile_id = profile_id
         self.worker_id = worker_id
         self.claim_token = claim_token
         self._pool = None
@@ -259,9 +265,15 @@ class PostgresChanWriter:
                     computed_at,
                     run_kind,
                     run_group_id,
-                    cutoff_bar_end
+                    cutoff_bar_end,
+                    batch_id,
+                    publication_namespace,
+                    profile_id,
+                    run_identity,
+                    provenance
                 )
-                values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6)
+                values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6,
+                        $11, $12, $13, $14, jsonb_build_object('source',$15::text,'profile',$13::text))
                 returning id
                 """,
                 symbol_id,
@@ -274,6 +286,11 @@ class PostgresChanWriter:
                 snapshot_version,
                 self.run_kind,
                 self.run_group_id,
+                self.batch_id,
+                self.publication_namespace,
+                self.profile_id,
+                f"{self.run_group_id}:{symbol}:{level}:{snapshot_version}",
+                self.publication_source,
             )
 
             try:
@@ -646,6 +663,10 @@ class PostgresChanWriter:
                 status,
                 run_id,
                 last_error,
+                self.batch_id,
+                self.publication_namespace,
+                self.profile_id,
+                self.run_group_id,
             )
             for mode in modes
         ]
@@ -680,12 +701,16 @@ class PostgresChanWriter:
                 published_at,
                 updated_at,
                 last_error
+                ,batch_id
+                ,publication_namespace
+                ,profile_id
+                ,run_group_id
             )
             values (
                 $1, $2, $3::varchar, $4, $5, $6, $7, $8::varchar, $9::varchar, $10::varchar, $11,
                 case when $10::text = 'published' then now() else null end,
                 now(),
-                $12
+                $12, $13, $14, $15, $16
             )
             on conflict (symbol_id, chan_level, mode, base_timeframe)
             do update
@@ -702,6 +727,10 @@ class PostgresChanWriter:
                 end,
                 updated_at = now(),
                 last_error = excluded.last_error
+                ,batch_id = excluded.batch_id
+                ,publication_namespace = excluded.publication_namespace
+                ,profile_id = excluded.profile_id
+                ,run_group_id = excluded.run_group_id
             where {table}.status <> 'published'
                or {table}.base_to_bar_end is null
                or {table}.base_to_bar_end < excluded.base_to_bar_end
