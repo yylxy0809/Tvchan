@@ -2,7 +2,11 @@ import asyncio
 import json
 from datetime import UTC, datetime
 
-from collector.module_c_execution_report import build_report, parse_args, write_artifacts
+from collector.module_c_execution_report import _json_object, build_report, parse_args, write_artifacts
+
+
+def test_json_object_decodes_asyncpg_jsonb_text() -> None:
+    assert _json_object('{"gate_pass": true}') == {"gate_pass": True}
 
 
 class Conn:

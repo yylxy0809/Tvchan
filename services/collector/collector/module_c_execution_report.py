@@ -192,6 +192,15 @@ def _dict(row: Any | None) -> dict[str, Any]:
     return dict(row) if row is not None else {}
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        decoded = json.loads(value)
+        return dict(decoded) if isinstance(decoded, Mapping) else {}
+    return {}
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.astimezone().isoformat()
@@ -309,7 +318,7 @@ async def build_report(
     if int(official.get("future_leak_events") or 0):
         block("official_future_leak", official, "Correct replay event ordering and regenerate only affected official evidence.")
 
-    canonical_summary = canonical.get("summary") or {}
+    canonical_summary = _json_object(canonical.get("summary"))
     canonical_ready = canonical.get("status") == "completed"
     if not canonical_ready:
         block("canonical_gate_unavailable", canonical, "Complete the read-only canonical gate and retain its audit evidence.")
