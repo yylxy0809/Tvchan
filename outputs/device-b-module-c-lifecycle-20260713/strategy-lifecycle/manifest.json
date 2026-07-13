@@ -1,0 +1,15 @@
+{
+  "as_of_time": "2026-07-13T20:46:22.770467+00:00",
+  "source_contract": "chan_structure_lifecycle_events/current_only",
+  "counts": {
+    "official": 0,
+    "observable": 0,
+    "diagnostic": 3724383
+  },
+  "official_ready": false,
+  "future_rows_rejected": 0,
+  "blockers": [
+    "historical_replay_lifecycle_unavailable"
+  ],
+  "decision": "NO_GO"
+}

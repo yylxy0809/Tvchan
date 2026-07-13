@@ -1,0 +1,138 @@
+{
+  "batch_id": 6,
+  "by_level_mode": [
+    {
+      "chan_level": 5,
+      "direct_batch": 41,
+      "equivalent_noop": 20,
+      "expected": 61,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "confirmed",
+      "outbox_incomplete": 0,
+      "published": 61
+    },
+    {
+      "chan_level": 5,
+      "direct_batch": 41,
+      "equivalent_noop": 20,
+      "expected": 61,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "predictive",
+      "outbox_incomplete": 0,
+      "published": 61
+    },
+    {
+      "chan_level": 30,
+      "direct_batch": 868,
+      "equivalent_noop": 20,
+      "expected": 888,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "confirmed",
+      "outbox_incomplete": 0,
+      "published": 888
+    },
+    {
+      "chan_level": 30,
+      "direct_batch": 868,
+      "equivalent_noop": 20,
+      "expected": 888,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "predictive",
+      "outbox_incomplete": 0,
+      "published": 888
+    },
+    {
+      "chan_level": 1440,
+      "direct_batch": 5491,
+      "equivalent_noop": 40,
+      "expected": 5531,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "confirmed",
+      "outbox_incomplete": 0,
+      "published": 5531
+    },
+    {
+      "chan_level": 1440,
+      "direct_batch": 5491,
+      "equivalent_noop": 40,
+      "expected": 5531,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "predictive",
+      "outbox_incomplete": 0,
+      "published": 5531
+    },
+    {
+      "chan_level": 10080,
+      "direct_batch": 5491,
+      "equivalent_noop": 40,
+      "expected": 5531,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "confirmed",
+      "outbox_incomplete": 0,
+      "published": 5531
+    },
+    {
+      "chan_level": 10080,
+      "direct_batch": 5491,
+      "equivalent_noop": 40,
+      "expected": 5531,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "predictive",
+      "outbox_incomplete": 0,
+      "published": 5531
+    },
+    {
+      "chan_level": 43200,
+      "direct_batch": 5489,
+      "equivalent_noop": 40,
+      "expected": 5529,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "confirmed",
+      "outbox_incomplete": 0,
+      "published": 5529
+    },
+    {
+      "chan_level": 43200,
+      "direct_batch": 5489,
+      "equivalent_noop": 40,
+      "expected": 5529,
+      "missing": 0,
+      "missing_history": 0,
+      "missing_outbox": 0,
+      "mode": "predictive",
+      "outbox_incomplete": 0,
+      "published": 5529
+    }
+  ],
+  "expected_modes": [
+    "confirmed",
+    "predictive"
+  ],
+  "generated_at": "2026-07-13T21:11:59.060708+00:00",
+  "summary": {
+    "expected": 35080,
+    "missing": 0,
+    "missing_history": 0,
+    "missing_outbox": 0,
+    "outbox_incomplete": 0,
+    "published": 35080
+  }
+}

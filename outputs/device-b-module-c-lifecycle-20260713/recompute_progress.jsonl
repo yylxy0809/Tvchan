@@ -1,0 +1,10 @@
+{"attempts": 61, "bars": 774739, "centers": 3237, "chan_level": 5, "count": 61, "latest_update": "2026-07-13T20:45:52.353898+00:00", "segments": 4319, "signals": 4096, "status": "completed", "strokes": 27690}
+{"attempts": 0, "bars": 0, "centers": 0, "chan_level": 5, "count": 5473, "latest_update": "2026-07-13T10:22:31.755130+00:00", "segments": 0, "signals": 0, "status": "excluded", "strokes": 0}
+{"attempts": 888, "bars": 8819946, "centers": 42650, "chan_level": 30, "count": 888, "latest_update": "2026-07-13T20:45:52.567385+00:00", "segments": 55477, "signals": 56003, "status": "completed", "strokes": 358675}
+{"attempts": 0, "bars": 0, "centers": 0, "chan_level": 30, "count": 4646, "latest_update": "2026-07-13T10:22:31.976863+00:00", "segments": 0, "signals": 0, "status": "excluded", "strokes": 0}
+{"attempts": 5531, "bars": 13709078, "centers": 84129, "chan_level": 1440, "count": 5531, "latest_update": "2026-07-13T20:45:53.297686+00:00", "segments": 116582, "signals": 107470, "status": "completed", "strokes": 716483}
+{"attempts": 0, "bars": 0, "centers": 0, "chan_level": 1440, "count": 3, "latest_update": "2026-07-13T10:22:32.039406+00:00", "segments": 0, "signals": 0, "status": "excluded", "strokes": 0}
+{"attempts": 5531, "bars": 2903843, "centers": 17725, "chan_level": 10080, "count": 5531, "latest_update": "2026-07-13T20:46:12.786840+00:00", "segments": 31334, "signals": 23007, "status": "completed", "strokes": 161446}
+{"attempts": 0, "bars": 0, "centers": 0, "chan_level": 10080, "count": 3, "latest_update": "2026-07-13T10:22:32.222832+00:00", "segments": 0, "signals": 0, "status": "excluded", "strokes": 0}
+{"attempts": 5529, "bars": 687244, "centers": 2521, "chan_level": 43200, "count": 5529, "latest_update": "2026-07-13T20:46:22.762081+00:00", "segments": 11002, "signals": 2569, "status": "completed", "strokes": 35783}
+{"attempts": 0, "bars": 0, "centers": 0, "chan_level": 43200, "count": 5, "latest_update": "2026-07-13T10:22:32.404757+00:00", "segments": 0, "signals": 0, "status": "excluded", "strokes": 0}

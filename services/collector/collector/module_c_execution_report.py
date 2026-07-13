@@ -58,14 +58,33 @@ order by chan_level, status
 HEAD_COVERAGE_SQL = """
 /* report:head-coverage */
 with expected as (
-    select task.symbol_id, task.symbol, task.chan_level, mode.mode
+    select task.symbol_id, task.symbol, task.chan_level, task.status as task_status,
+           task.run_id as task_run_id, task.target_bar_until,
+           task.bar_count as task_bar_count, mode.mode
     from chan_c_full_recompute_tasks task
     cross join (values ('confirmed'::varchar), ('predictive'::varchar)) mode(mode)
     where task.batch_id = $1 and task.eligible
 ), coverage as (
     select expected.*,
-           head.run_id,
-           run.status as run_status,
+           head.run_id as head_run_id,
+           head.batch_id as head_batch_id,
+           head_run.batch_id as head_run_batch_id,
+           head_run.status as head_run_status,
+           task_run.status as task_run_status,
+           (
+               task_run.status = 'success'
+               and task_run.symbol_id = head_run.symbol_id
+               and task_run.chan_level = head_run.chan_level
+               and task_run.mode = head_run.mode
+               and task_run.input_signature = head_run.input_signature
+               and task_run.config_hash = head_run.config_hash
+               and task_run.bar_from is not distinct from head_run.bar_from
+               and task_run.bar_until = head_run.bar_until
+               and task_run.bar_until = expected.target_bar_until
+               and task_run.bar_count is not distinct from head_run.bar_count
+               and task_run.bar_count is not distinct from expected.task_bar_count
+               and task_run.base_timeframe = head_run.base_timeframe
+           ) as input_identity_equivalent,
            history.id as history_id,
            outbox.id as outbox_id,
            outbox.status as outbox_status
@@ -74,25 +93,50 @@ with expected as (
       on head.symbol_id = expected.symbol_id
      and head.chan_level = expected.chan_level
      and head.mode = expected.mode
-     and head.batch_id = $1
+     and head.base_timeframe = expected.chan_level
      and head.status = 'published'
-    left join chan_c_runs run
-      on run.id = head.run_id and run.batch_id = $1 and run.status = 'success'
+    left join chan_c_runs head_run on head_run.id = head.run_id
+    left join chan_c_runs task_run
+      on task_run.id = expected.task_run_id and task_run.batch_id = $1
     left join chan_c_head_history history
       on history.symbol_id = expected.symbol_id
      and history.chan_level = expected.chan_level
      and history.mode = expected.mode
+     and history.base_timeframe = head.base_timeframe
      and history.new_run_id = head.run_id
     left join chan_c_head_outbox outbox on outbox.head_history_id = history.id
+), assessed as (
+    select coverage.*,
+           (
+               head_run_status = 'success'
+               and (
+                   (head_batch_id = $1 and head_run_batch_id = $1)
+                   or (task_status = 'completed' and input_identity_equivalent)
+               )
+           ) as covered,
+           (
+               head_run_status = 'success'
+               and head_batch_id = $1
+               and head_run_batch_id = $1
+           ) as direct_batch,
+           (
+               head_run_status = 'success'
+               and head_batch_id is distinct from $1
+               and task_status = 'completed'
+               and input_identity_equivalent
+           ) as equivalent_noop
+    from coverage
 )
 select chan_level, mode, count(*)::bigint as expected,
-       count(run_id) filter (where run_status = 'success')::bigint as published,
-       count(*) filter (where run_status is distinct from 'success')::bigint as missing,
+       count(*) filter (where covered)::bigint as published,
+       count(*) filter (where not coalesce(covered, false))::bigint as missing,
+       count(*) filter (where direct_batch)::bigint as direct_batch,
+       count(*) filter (where equivalent_noop)::bigint as equivalent_noop,
        count(*) filter (where history_id is null)::bigint as missing_history,
        count(*) filter (where outbox_id is null)::bigint as missing_outbox,
        count(*) filter (where outbox_status is distinct from 'completed')::bigint
            as outbox_incomplete
-from coverage
+from assessed
 group by chan_level, mode
 order by chan_level, mode
 """
