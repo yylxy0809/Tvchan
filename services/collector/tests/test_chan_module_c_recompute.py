@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import UTC, datetime
 from pathlib import Path
 import sys
@@ -243,6 +244,12 @@ def test_full_recompute_claim_is_sharded_leased_and_attempt_bounded() -> None:
     assert "for update skip locked" in query.lower()
     assert "lease_version = task.lease_version + 1" in query
     assert args == (11, "worker-2", 900, 2, 4, 3)
+
+
+def test_batch_init_casts_config_hash_for_asyncpg() -> None:
+    sql = inspect.getsource(recompute.ensure_recompute_batch)
+    assert "$4::varchar" in sql
+    assert "build.config_hash = $4::text" in sql
 
 
 def test_claimed_task_uses_one_level_and_frozen_cutoff(monkeypatch) -> None:
