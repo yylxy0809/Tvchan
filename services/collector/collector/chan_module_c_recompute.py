@@ -353,12 +353,12 @@ async def ensure_recompute_batch(
                     publication_namespace, profile_id, shard_count,
                     active_symbols, disposition_rows
                 )
-                select $1, build_id, $3, $4, $5, $6, $7,
+                select $1, build_id, $3, $4::varchar, $5, $6, $7,
                        active_symbols, count(*)
                   from module_c_eligibility_builds build
                   join module_c_eligibility eligibility using (build_id)
                  where build.build_id = $2::uuid
-                   and build.config_hash = $4
+                   and build.config_hash = $4::text
                    and eligibility.timeframe = any($8::int[])
                  group by build_id, active_symbols
                 on conflict (batch_id) do nothing
