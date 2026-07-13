@@ -310,3 +310,69 @@ def test_full_publish_does_not_emit_outbox_when_head_upsert_loses() -> None:
         assert not any("insert into chan_c_head_outbox" in query for query in conn.queries)
 
     asyncio.run(scenario())
+
+
+def test_full_publish_rejects_a_head_changed_after_task_initialization() -> None:
+    class Conn:
+        async def fetchrow(self, *_args):
+            return {"run_id": 9, "base_to_bar_end": datetime.fromtimestamp(200, UTC)}
+
+    async def scenario() -> None:
+        writer = PostgresChanWriter("postgresql://unused")
+        with pytest.raises(StaleChanHeadError, match="head changed"):
+            await writer._upsert_published_heads(
+                Conn(), symbol_id=1, level_code=5, modes=["confirmed"],
+                base_timeframe_code=5, bar_from=datetime.fromtimestamp(100, UTC),
+                bar_until=datetime.fromtimestamp(200, UTC), bar_count=20,
+                snapshot_version="new", run_id=10, status="published", last_error=None,
+                expected_heads={"confirmed": 8}, publication_claim_token="task-token",
+            )
+
+    asyncio.run(scenario())
+
+
+def test_full_recompute_write_and_task_completion_share_the_fenced_transaction() -> None:
+    class FullConn(FakeConn):
+        async def execute(self, query: str, *args):
+            self.execute_calls.append((query, args))
+            if "set status = 'completed'" in query:
+                return "UPDATE 1"
+            return "OK"
+
+    async def scenario() -> None:
+        conn = FullConn()
+        conn._fetchval_results = iter([1, 1, 99])
+        writer = PostgresChanWriter(
+            "postgresql://unused", batch_id=7, run_group_id="batch-7",
+            native_base_timeframe=True,
+        )
+        writer._pool = FakePool(conn)
+        task = {
+            "batch_id": 7, "symbol_id": 1, "chan_level": 5,
+            "claim_token": "claim-1", "lease_version": 2,
+            "expected_heads": {},
+        }
+
+        await writer.replace_analysis(
+            symbol="000001.SZ", level="5f", modes=["confirmed", "predictive"],
+            bar_from=datetime.fromtimestamp(100, UTC),
+            bar_until=datetime.fromtimestamp(200, UTC), bar_count=20,
+            response={
+                "snapshot_version": "batch-7-snapshot",
+                "strokes": [], "segments": [], "centers": [], "signals": [],
+            },
+            full_recompute_task=task,
+        )
+
+        fence_query, fence_args = conn.fetchval_calls[1]
+        assert "from chan_c_full_recompute_tasks" in fence_query
+        assert fence_args == (7, 1, 5, "claim-1", 2)
+        run_query, _run_args = conn.fetchval_calls[2]
+        assert "on conflict (batch_id, run_identity)" in run_query
+        completion = next(
+            (query, args) for query, args in conn.execute_calls
+            if "set status = 'completed'" in query
+        )
+        assert completion[1][:5] == (7, 1, 5, "claim-1", 2)
+
+    asyncio.run(scenario())
