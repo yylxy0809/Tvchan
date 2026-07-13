@@ -2,7 +2,13 @@ import asyncio
 import json
 from datetime import UTC, datetime
 
-from collector.module_c_execution_report import _json_object, build_report, parse_args, write_artifacts
+from collector.module_c_execution_report import (
+    HEAD_COVERAGE_SQL,
+    _json_object,
+    build_report,
+    parse_args,
+    write_artifacts,
+)
 
 
 def test_json_object_decodes_asyncpg_jsonb_text() -> None:
@@ -115,6 +121,8 @@ class Conn:
                 "expected": 2,
                 "published": 2 - self.missing_heads,
                 "missing": self.missing_heads,
+                "direct_batch": 2 - self.missing_heads,
+                "equivalent_noop": 0,
                 "missing_history": self.missing_heads,
                 "missing_outbox": self.missing_heads,
                 "outbox_incomplete": self.missing_heads,
@@ -169,6 +177,25 @@ def test_report_no_go_lists_each_required_blocking_class() -> None:
         "baseline_claims_historical_first_seen",
         "official_future_leak",
     } <= codes
+
+
+def test_head_coverage_accepts_direct_batch_or_strict_input_equivalent_noop() -> None:
+    normalized = " ".join(HEAD_COVERAGE_SQL.split()).lower()
+    assert "head_run_status = 'success'" in normalized
+    assert "(head_batch_id = $1 and head_run_batch_id = $1) or (task_status = 'completed' and input_identity_equivalent)" in normalized
+    assert "task_run.symbol_id = head_run.symbol_id" in normalized
+    assert "task_run.chan_level = head_run.chan_level" in normalized
+    assert "task_run.mode = head_run.mode" in normalized
+    assert "task_run.input_signature = head_run.input_signature" in normalized
+    assert "task_run.config_hash = head_run.config_hash" in normalized
+    assert "task_run.bar_from is not distinct from head_run.bar_from" in normalized
+    assert "task_run.bar_until = head_run.bar_until" in normalized
+    assert "task_run.bar_until = expected.target_bar_until" in normalized
+    assert "task_run.bar_count is not distinct from head_run.bar_count" in normalized
+    assert "task_run.bar_count is not distinct from expected.task_bar_count" in normalized
+    assert "task_run.base_timeframe = head_run.base_timeframe" in normalized
+    assert "history.new_run_id = head.run_id" in normalized
+    assert "outbox_status is distinct from 'completed'" in normalized
 
 
 def test_write_artifacts_replaces_all_required_report_files(tmp_path) -> None:

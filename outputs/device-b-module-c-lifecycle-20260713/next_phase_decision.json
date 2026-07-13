@@ -1,0 +1,19 @@
+{
+  "batch_id": 6,
+  "blockers": [
+    {
+      "code": "official_historical_coverage_missing",
+      "evidence": {
+        "baseline_claimed_historical_events": 0,
+        "future_leak_events": 0,
+        "historical_replay_heads": 0,
+        "official_expected_heads": 35080,
+        "official_missing_heads": 35080
+      },
+      "minimum_fix": "Complete cutoff historical replay before exposing an official backtest dataset."
+    }
+  ],
+  "decision": "NO_GO",
+  "generated_at": "2026-07-13T21:11:59.060708+00:00",
+  "next_phase": "historical_replay_and_official_backtest"
+}
