@@ -15,7 +15,7 @@ CLAIM_OUTBOX_SQL = """
 with due as (
     select id
     from chan_c_head_outbox
-    where status <> 'completed'
+    where status in ('pending', 'processing', 'failed')
     order by id
     limit $1
     for update skip locked
@@ -23,7 +23,8 @@ with due as (
     select outbox.id
     from chan_c_head_outbox outbox
     join due on due.id = outbox.id
-    where outbox.status = 'pending'
+    where (outbox.status in ('pending', 'failed')
+           and coalesce(outbox.next_attempt_at, '-infinity'::timestamptz) <= clock_timestamp())
        or (outbox.status = 'processing' and outbox.lease_until <= clock_timestamp())
 )
 update chan_c_head_outbox outbox
@@ -31,11 +32,29 @@ set status = 'processing',
     lease_version = outbox.lease_version + 1,
     lease_token = md5(outbox.id::text || ':' || (outbox.lease_version + 1)::text || ':' || clock_timestamp()::text),
     lease_until = clock_timestamp() + ($2::int * interval '1 second'),
+    next_attempt_at = null,
     attempts = outbox.attempts + 1,
     updated_at = clock_timestamp()
 from claimable
 where outbox.id = claimable.id
 returning outbox.*
+"""
+
+FAIL_OUTBOX_SQL = """
+update chan_c_head_outbox
+set status = case when attempts >= $4 then 'dead_letter' else 'failed' end,
+    lease_token = null,
+    lease_until = null,
+    next_attempt_at = case
+        when attempts >= $4 then null
+        else clock_timestamp() + ($5::int * interval '1 second')
+    end,
+    last_error = left($6, 2000),
+    failed_at = clock_timestamp(),
+    dead_lettered_at = case when attempts >= $4 then clock_timestamp() else null end,
+    updated_at = clock_timestamp()
+where id = $1 and status = 'processing' and lease_token = $2 and lease_version = $3
+returning id, status
 """
 
 ACK_OUTBOX_SQL = """
@@ -206,7 +225,14 @@ class LifecycleObserver:
         rows = await conn.fetch(CLAIM_OUTBOX_SQL, max(1, limit), max(1, lease_seconds))
         return [dict(row) for row in rows]
 
-    async def process_next(self, conn: Any, *, lease_seconds: int = 300) -> int:
+    async def process_next(
+        self,
+        conn: Any,
+        *,
+        lease_seconds: int = 300,
+        max_attempts: int = 5,
+        retry_delay_seconds: int = 30,
+    ) -> int:
         """Serialize planning and persistence so lifecycle events follow outbox order."""
         if not await conn.fetchval(TRY_LIFECYCLE_SESSION_LOCK_SQL):
             return 0
@@ -214,7 +240,19 @@ class LifecycleObserver:
             claimed = await self.claim(conn, limit=1, lease_seconds=lease_seconds)
             if not claimed:
                 return 0
-            await self.process_claimed(conn, claimed[0])
+            try:
+                await self.process_claimed(conn, claimed[0])
+            except Exception as exc:
+                if not await self.fail(
+                    conn,
+                    claimed[0],
+                    error=str(exc),
+                    max_attempts=max_attempts,
+                    retry_delay_seconds=retry_delay_seconds,
+                ):
+                    raise LostLifecycleLease(
+                        f"Lost lifecycle outbox lease while recording failure: {claimed[0]['id']}"
+                    ) from exc
             return 1
         finally:
             await conn.fetchval(UNLOCK_LIFECYCLE_SESSION_SQL)
@@ -233,6 +271,26 @@ class LifecycleObserver:
             RENEW_OUTBOX_SQL,
             claimed["id"], claimed["lease_token"], claimed["lease_version"],
             max(1, lease_seconds),
+        )
+        return row is not None
+
+    async def fail(
+        self,
+        conn: Any,
+        claimed: dict[str, Any],
+        *,
+        error: str,
+        max_attempts: int = 5,
+        retry_delay_seconds: int = 30,
+    ) -> bool:
+        row = await conn.fetchrow(
+            FAIL_OUTBOX_SQL,
+            claimed["id"],
+            claimed["lease_token"],
+            claimed["lease_version"],
+            max(1, max_attempts),
+            max(1, retry_delay_seconds),
+            error,
         )
         return row is not None
 

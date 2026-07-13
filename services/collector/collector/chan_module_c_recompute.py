@@ -42,11 +42,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--modes", default=os.getenv("CHAN_MODULE_C_MODES", DEFAULT_MODES))
     parser.add_argument("--run-group-id", default=os.getenv("CHAN_MODULE_C_RUN_GROUP_ID"))
     parser.add_argument("--batch-id", type=int, default=os.getenv("CHAN_MODULE_C_BATCH_ID"))
+    parser.add_argument("--eligibility-build-id", default=os.getenv("CHAN_MODULE_C_ELIGIBILITY_BUILD_ID"))
     parser.add_argument("--publication-namespace", default=os.getenv("CHAN_MODULE_C_PUBLICATION_NAMESPACE", "production"))
     parser.add_argument("--profile-id", default=os.getenv("CHAN_MODULE_C_PROFILE_ID", "module-c-native-5lvl"))
     parser.add_argument("--concurrency", type=int, default=int(os.getenv("CHAN_MODULE_C_CONCURRENCY", "1")))
     parser.add_argument("--shard-index", type=int, default=int(os.getenv("CHAN_MODULE_C_SHARD_INDEX", "0")))
     parser.add_argument("--shard-count", type=int, default=int(os.getenv("CHAN_MODULE_C_SHARD_COUNT", "1")))
+    parser.add_argument("--worker-id", default=os.getenv("CHAN_MODULE_C_WORKER_ID"))
+    parser.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=int(os.getenv("CHAN_MODULE_C_LEASE_SECONDS", "900")),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=int(os.getenv("CHAN_MODULE_C_MAX_ATTEMPTS", "3")),
+    )
     parser.add_argument("--sleep", type=float, default=float(os.getenv("CHAN_MODULE_C_SLEEP", "0.1")))
     parser.add_argument(
         "--db-pool-min-size",
@@ -92,6 +104,16 @@ async def main() -> None:
         raise ValueError("--run-group-id is required for a non-dry Module C recompute")
     if not args.dry_run and not args.batch_id:
         raise ValueError("--batch-id is required for a non-dry Module C recompute")
+    if not args.dry_run and not args.eligibility_build_id:
+        raise ValueError("--eligibility-build-id is required for a non-dry Module C recompute")
+    if not args.dry_run and set(levels) != set(parse_timeframes(DEFAULT_MODULE_C_CHAN_LEVELS)):
+        raise ValueError("A production Module C batch must use the native five-level contract")
+    if not args.dry_run and args.prepare_native_bars:
+        raise ValueError("--prepare-native-bars is forbidden for a production Module C batch")
+    if not args.dry_run and args.concurrency != 1:
+        raise ValueError("A durable B4 worker must use --concurrency=1; scale with static shards")
+    if not args.dry_run and set(modes) != {"confirmed", "predictive"}:
+        raise ValueError("A production Module C batch must publish confirmed and predictive modes")
     run_group_id = args.run_group_id or f"dry-run-{uuid.uuid4()}"
 
     async with PostgresKlineWriter(
@@ -99,46 +121,58 @@ async def main() -> None:
         pool_min_size=db_pool_min_size,
         pool_max_size=db_pool_max_size,
     ) as kline_writer:
-        symbols = await resolve_symbols(
-            kline_writer=kline_writer,
-            symbols_arg=args.symbols,
-            levels=levels,
-            symbol_limit=args.symbol_limit,
-        )
         shard_count = max(1, args.shard_count)
         shard_index = args.shard_index
         if shard_index < 0 or shard_index >= shard_count:
             raise ValueError(f"--shard-index must be in [0, {shard_count - 1}]")
-        if shard_count > 1:
-            symbols = [symbol for index, symbol in enumerate(symbols) if index % shard_count == shard_index]
-        shard_symbols = len(symbols)
-        skipped_completed = 0
-        if args.skip_completed and symbols:
-            remaining_symbols = await filter_completed_symbols(
+        if args.dry_run:
+            symbols = await resolve_symbols(
                 kline_writer=kline_writer,
-                symbols=symbols,
+                symbols_arg=args.symbols,
+                levels=levels,
+                symbol_limit=args.symbol_limit,
+            )
+            if shard_count > 1:
+                symbols = [symbol for index, symbol in enumerate(symbols) if index % shard_count == shard_index]
+            emit(
+                "chan_module_c_pass_started",
+                symbols=len(symbols),
                 levels=levels,
                 modes=modes,
+                concurrency=max(1, args.concurrency),
+                shard_index=shard_index,
+                shard_count=shard_count,
+                dry_run=True,
             )
-            skipped_completed = shard_symbols - len(remaining_symbols)
-            symbols = remaining_symbols
-        emit(
-            "chan_module_c_pass_started",
-            symbols=len(symbols),
-            shard_symbols=shard_symbols,
-            skipped_completed=skipped_completed,
-            levels=levels,
-            modes=modes,
-            concurrency=max(1, args.concurrency),
-            shard_index=shard_index,
-            shard_count=shard_count,
-            dry_run=args.dry_run,
-        )
-        if args.dry_run:
             for symbol in symbols:
                 emit("chan_module_c_dry_symbol", symbol=symbol, levels=levels)
             emit("chan_module_c_pass_finished", symbols=len(symbols), runs=0)
             return
+
+        worker_id = args.worker_id or f"module-c-b4-s{shard_index}-{uuid.uuid4().hex[:12]}"
+        await ensure_recompute_batch(
+            kline_writer=kline_writer,
+            batch_id=args.batch_id,
+            eligibility_build_id=args.eligibility_build_id,
+            run_group_id=run_group_id,
+            config_hash=MODULE_C_CONFIG_HASH,
+            publication_namespace=args.publication_namespace,
+            profile_id=args.profile_id,
+            shard_count=shard_count,
+            levels=levels,
+        )
+        emit(
+            "chan_module_c_pass_started",
+            batch_id=args.batch_id,
+            eligibility_build_id=args.eligibility_build_id,
+            levels=levels,
+            modes=modes,
+            concurrency=1,
+            shard_index=shard_index,
+            shard_count=shard_count,
+            worker_id=worker_id,
+            dry_run=False,
+        )
 
         async with PostgresChanWriter(
             args.database_url,
@@ -154,24 +188,32 @@ async def main() -> None:
             publication_namespace=args.publication_namespace,
             profile_id=args.profile_id,
             run_group_id=run_group_id,
+            worker_id=worker_id,
         ) as chan_writer:
-            result = await process_symbols_concurrently(
+            result = await process_claimed_tasks(
                 kline_writer=kline_writer,
                 chan_writer=chan_writer,
-                symbols=symbols,
-                levels=levels,
+                batch_id=args.batch_id,
                 modes=modes,
-                concurrency=max(1, args.concurrency),
+                worker_id=worker_id,
+                shard_index=shard_index,
+                shard_count=shard_count,
+                lease_seconds=max(30, args.lease_seconds),
+                max_attempts=max(1, args.max_attempts),
                 sleep=max(0.0, args.sleep),
                 chan_py_path=args.chan_py_path,
-                prepare_native_bars=args.prepare_native_bars,
             )
         emit(
             "chan_module_c_pass_finished",
-            symbols=len(symbols),
+            batch_id=args.batch_id,
             runs=result["runs"],
             failed=result["failed"],
         )
+        if result["failed"]:
+            raise RuntimeError(
+                f"Module C batch {args.batch_id} shard {shard_index} has "
+                f"{result['failed']} exhausted failed tasks"
+            )
 
 
 async def resolve_symbols(
@@ -276,6 +318,417 @@ def is_module_c_complete(
         and row.get("base_timeframe") == row.get("chan_level")
     }
     return expected <= complete
+
+
+DB_LEVEL_NAMES = {
+    5: "5f",
+    30: "30f",
+    1440: "1d",
+    10080: "1w",
+    43200: "1m",
+}
+
+
+async def ensure_recompute_batch(
+    *,
+    kline_writer: PostgresKlineWriter,
+    batch_id: int,
+    eligibility_build_id: str,
+    run_group_id: str,
+    config_hash: str,
+    publication_namespace: str,
+    profile_id: str,
+    shard_count: int,
+    levels: list[str],
+) -> None:
+    """Create one immutable batch manifest and its level-specific tasks."""
+    assert kline_writer._pool is not None
+    level_codes = [timeframe_to_db_code(level) for level in levels]
+    async with kline_writer._pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                insert into chan_c_full_recompute_batches (
+                    batch_id, eligibility_build_id, run_group_id, config_hash,
+                    publication_namespace, profile_id, shard_count,
+                    active_symbols, disposition_rows
+                )
+                select $1, build_id, $3, $4, $5, $6, $7,
+                       active_symbols, count(*)
+                  from module_c_eligibility_builds build
+                  join module_c_eligibility eligibility using (build_id)
+                 where build.build_id = $2::uuid
+                   and build.config_hash = $4
+                   and eligibility.timeframe = any($8::int[])
+                 group by build_id, active_symbols
+                on conflict (batch_id) do nothing
+                """,
+                batch_id,
+                eligibility_build_id,
+                run_group_id,
+                config_hash,
+                publication_namespace,
+                profile_id,
+                shard_count,
+                level_codes,
+            )
+            batch = await conn.fetchrow(
+                """
+                select eligibility_build_id::text as eligibility_build_id,
+                       run_group_id, config_hash, publication_namespace,
+                       profile_id, shard_count
+                  from chan_c_full_recompute_batches
+                 where batch_id = $1
+                 for update
+                """,
+                batch_id,
+            )
+            if batch is None:
+                raise RuntimeError(f"Unknown eligibility build: {eligibility_build_id}")
+            expected = {
+                "eligibility_build_id": str(eligibility_build_id),
+                "run_group_id": run_group_id,
+                "config_hash": config_hash,
+                "publication_namespace": publication_namespace,
+                "profile_id": profile_id,
+                "shard_count": shard_count,
+            }
+            actual = {key: batch[key] for key in expected}
+            if actual != expected:
+                raise RuntimeError(f"Batch {batch_id} manifest mismatch: {actual!r}")
+
+            await conn.execute(
+                """
+                insert into chan_c_full_recompute_tasks (
+                    batch_id, symbol_id, symbol, chan_level, eligible,
+                    exclusion_reasons, target_bar_until, shard_bucket, status,
+                    expected_heads
+                )
+                select $1, eligibility.symbol_id, eligibility.symbol,
+                       eligibility.timeframe, eligibility.eligible,
+                       eligibility.reasons, eligibility.covered_until,
+                       mod((hashtextextended(eligibility.symbol, 0) & 2147483647)::integer, 1024)::smallint,
+                       case when eligibility.eligible then 'pending' else 'excluded' end,
+                       coalesce((
+                           select jsonb_object_agg(head.mode, head.run_id)
+                             from scheme2_chan_c_published_heads head
+                            where head.symbol_id = eligibility.symbol_id
+                              and head.chan_level = eligibility.timeframe
+                              and head.base_timeframe = eligibility.timeframe
+                              and head.status = 'published'
+                       ), '{}'::jsonb)
+                  from module_c_eligibility eligibility
+                 where eligibility.build_id = $2::uuid
+                   and eligibility.timeframe = any($3::int[])
+                on conflict (batch_id, symbol_id, chan_level) do nothing
+                """,
+                batch_id,
+                eligibility_build_id,
+                level_codes,
+            )
+            task_count = await conn.fetchval(
+                "select count(*) from chan_c_full_recompute_tasks where batch_id = $1",
+                batch_id,
+            )
+            disposition_rows = await conn.fetchval(
+                "select disposition_rows from chan_c_full_recompute_batches where batch_id = $1",
+                batch_id,
+            )
+            if int(task_count or 0) != int(disposition_rows or 0):
+                raise RuntimeError(
+                    f"Batch {batch_id} task manifest is incomplete: "
+                    f"tasks={task_count} expected={disposition_rows}"
+                )
+
+
+async def claim_recompute_task(
+    *,
+    kline_writer: PostgresKlineWriter,
+    batch_id: int,
+    worker_id: str,
+    shard_index: int,
+    shard_count: int,
+    lease_seconds: int,
+    max_attempts: int,
+) -> dict[str, Any] | None:
+    assert kline_writer._pool is not None
+    async with kline_writer._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            with candidate as (
+                select batch_id, symbol_id, chan_level
+                  from chan_c_full_recompute_tasks
+                 where batch_id = $1
+                   and eligible
+                   and attempts < $6
+                   and mod(shard_bucket::integer, $5) = $4
+                   and (
+                       status in ('pending', 'failed')
+                       or (status = 'running' and lease_until <= now())
+                   )
+                 order by attempts, symbol_id, chan_level
+                 for update skip locked
+                 limit 1
+            )
+            update chan_c_full_recompute_tasks task
+               set status = 'running',
+                   attempts = task.attempts + 1,
+                   worker_id = $2,
+                   lease_version = task.lease_version + 1,
+                   claim_token = md5(task.batch_id::text || ':' || task.symbol_id::text || ':' ||
+                                     task.chan_level::text || ':' || (task.lease_version + 1)::text || ':' ||
+                                     clock_timestamp()::text || ':' || random()::text),
+                   lease_until = now() + ($3::integer * interval '1 second'),
+                   lease_heartbeat_at = now(),
+                   started_at = coalesce(task.started_at, now()),
+                   last_error = null,
+                   updated_at = now()
+              from candidate
+             where task.batch_id = candidate.batch_id
+               and task.symbol_id = candidate.symbol_id
+               and task.chan_level = candidate.chan_level
+            returning task.*
+            """,
+            batch_id,
+            worker_id,
+            lease_seconds,
+            shard_index,
+            shard_count,
+            max_attempts,
+        )
+        if row is not None:
+            await conn.execute(
+                """
+                update chan_c_full_recompute_batches
+                   set status = 'running', started_at = coalesce(started_at, now()),
+                       finished_at = null, updated_at = now()
+                 where batch_id = $1 and status <> 'running'
+                """,
+                batch_id,
+            )
+    return dict(row) if row is not None else None
+
+
+async def heartbeat_recompute_task(
+    *,
+    kline_writer: PostgresKlineWriter,
+    task: Mapping[str, Any],
+    lease_seconds: int,
+) -> bool:
+    assert kline_writer._pool is not None
+    async with kline_writer._pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            update chan_c_full_recompute_tasks
+               set lease_until = now() + ($6::integer * interval '1 second'),
+                   lease_heartbeat_at = now(), updated_at = now()
+             where batch_id = $1 and symbol_id = $2 and chan_level = $3
+               and status = 'running' and claim_token = $4
+               and lease_version = $5 and lease_until > now()
+            """,
+            task["batch_id"],
+            task["symbol_id"],
+            task["chan_level"],
+            task["claim_token"],
+            task["lease_version"],
+            lease_seconds,
+        )
+    return result.endswith(" 1")
+
+
+async def fail_recompute_task(
+    *,
+    kline_writer: PostgresKlineWriter,
+    task: Mapping[str, Any],
+    error: str,
+) -> bool:
+    assert kline_writer._pool is not None
+    async with kline_writer._pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            update chan_c_full_recompute_tasks
+               set status = 'failed', last_error = $6,
+                   worker_id = null, claim_token = null, lease_until = null,
+                   lease_heartbeat_at = null, updated_at = now()
+             where batch_id = $1 and symbol_id = $2 and chan_level = $3
+               and status = 'running' and claim_token = $4 and lease_version = $5
+            """,
+            task["batch_id"],
+            task["symbol_id"],
+            task["chan_level"],
+            task["claim_token"],
+            task["lease_version"],
+            error[:2000],
+        )
+    return result.endswith(" 1")
+
+
+async def process_claimed_tasks(
+    *,
+    kline_writer: PostgresKlineWriter,
+    chan_writer: PostgresChanWriter,
+    batch_id: int,
+    modes: list[str],
+    worker_id: str,
+    shard_index: int,
+    shard_count: int,
+    lease_seconds: int,
+    max_attempts: int,
+    sleep: float,
+    chan_py_path: str | None,
+) -> dict[str, int]:
+    runs = 0
+    failures_observed = 0
+    while True:
+        task = await claim_recompute_task(
+            kline_writer=kline_writer,
+            batch_id=batch_id,
+            worker_id=worker_id,
+            shard_index=shard_index,
+            shard_count=shard_count,
+            lease_seconds=lease_seconds,
+            max_attempts=max_attempts,
+        )
+        if task is None:
+            break
+        try:
+            await process_claimed_task(
+                kline_writer=kline_writer,
+                chan_writer=chan_writer,
+                task=task,
+                modes=modes,
+                lease_seconds=lease_seconds,
+                chan_py_path=chan_py_path,
+            )
+            runs += 1
+        except Exception as exc:
+            failures_observed += 1
+            await fail_recompute_task(kline_writer=kline_writer, task=task, error=str(exc))
+            emit(
+                "chan_module_c_task_failed",
+                batch_id=batch_id,
+                symbol=task["symbol"],
+                level=DB_LEVEL_NAMES[int(task["chan_level"])],
+                attempt=task["attempts"],
+                error=str(exc)[:500],
+            )
+        if sleep > 0:
+            await asyncio.sleep(sleep)
+    assert kline_writer._pool is not None
+    async with kline_writer._pool.acquire() as conn:
+        await conn.execute(
+            """
+            update chan_c_full_recompute_batches batch
+               set status = case
+                       when exists (
+                           select 1 from chan_c_full_recompute_tasks task
+                            where task.batch_id = batch.batch_id and task.status = 'failed'
+                       ) then 'failed'
+                       else 'completed'
+                   end,
+                   finished_at = now(), updated_at = now()
+             where batch.batch_id = $1
+               and not exists (
+                   select 1 from chan_c_full_recompute_tasks task
+                    where task.batch_id = batch.batch_id
+                      and task.status in ('pending', 'running')
+               )
+            """,
+            batch_id,
+        )
+        failed = await conn.fetchval(
+            """
+            select count(*)
+              from chan_c_full_recompute_tasks
+             where batch_id = $1 and eligible and status = 'failed'
+               and attempts >= $4 and mod(shard_bucket::integer, $3) = $2
+            """,
+            batch_id,
+            shard_index,
+            shard_count,
+            max_attempts,
+        )
+    return {
+        "runs": runs,
+        "failed": int(failed or 0),
+        "failures_observed": failures_observed,
+    }
+
+
+async def process_claimed_task(
+    *,
+    kline_writer: PostgresKlineWriter,
+    chan_writer: PostgresChanWriter,
+    task: Mapping[str, Any],
+    modes: list[str],
+    lease_seconds: int,
+    chan_py_path: str | None,
+) -> None:
+    level = DB_LEVEL_NAMES[int(task["chan_level"])]
+    target = task["target_bar_until"]
+    bars = [bar for bar in await kline_writer.get_bars(str(task["symbol"]), level) if bar.ts <= target]
+    if not bars or bars[-1].ts != target:
+        raise RuntimeError(
+            f"Frozen cutoff unavailable for {task['symbol']} {level}: "
+            f"expected={target!s} actual={bars[-1].ts if bars else None!s}"
+        )
+
+    stop_heartbeat = asyncio.Event()
+    lease_lost = asyncio.Event()
+
+    async def heartbeat_loop() -> None:
+        interval = max(1.0, lease_seconds / 3)
+        while not stop_heartbeat.is_set():
+            try:
+                await asyncio.wait_for(stop_heartbeat.wait(), timeout=interval)
+            except TimeoutError:
+                if not await heartbeat_recompute_task(
+                    kline_writer=kline_writer, task=task, lease_seconds=lease_seconds
+                ):
+                    lease_lost.set()
+                    return
+
+    heartbeat = asyncio.create_task(heartbeat_loop())
+    try:
+        response = await compute_module_c_overlay(
+            symbol=str(task["symbol"]),
+            levels=[level],
+            modes=modes,
+            bars_by_level={level: bars},
+            chan_py_path=chan_py_path,
+        )
+    finally:
+        stop_heartbeat.set()
+        await heartbeat
+    if lease_lost.is_set() or not await heartbeat_recompute_task(
+        kline_writer=kline_writer, task=task, lease_seconds=lease_seconds
+    ):
+        raise RuntimeError("Full-recompute task lease was lost before publication")
+
+    validate_module_c_response(
+        response=response,
+        symbol=str(task["symbol"]),
+        levels=[level],
+        bars_by_level={level: bars},
+    )
+    counts = await chan_writer.replace_analysis(
+        symbol=str(task["symbol"]),
+        level=level,
+        modes=modes,
+        bar_from=bars[0].ts,
+        bar_until=bars[-1].ts,
+        bar_count=len(bars),
+        response=filter_chan_response_level(response, level),
+        full_recompute_task=task,
+    )
+    emit(
+        "chan_module_c_task_completed",
+        batch_id=task["batch_id"],
+        symbol=task["symbol"],
+        level=level,
+        bars=len(bars),
+        **counts,
+    )
 
 
 async def process_symbols_concurrently(

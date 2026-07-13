@@ -59,7 +59,9 @@ def evaluate_dispositions(
     coverage: Mapping[tuple[int, str], datetime],
     unresolved: Mapping[tuple[str, str], int],
     missing_source: Mapping[tuple[str, str], int],
+    canonical_dispositions: Mapping[tuple[int, str], str] | None = None,
 ) -> list[Disposition]:
+    canonical_dispositions = canonical_dispositions or {}
     rows: list[Disposition] = []
     for symbol in sorted(symbols, key=lambda item: item.symbol_id):
         daily_unresolved = unresolved.get((symbol.name, "1d"), 0)
@@ -77,6 +79,10 @@ def evaluate_dispositions(
                 reasons.append("daily_unresolved_propagated")
             if direct_missing:
                 reasons.append("missing_source_file")
+            if canonical_dispositions and canonical_dispositions.get(
+                (symbol.symbol_id, timeframe)
+            ) != "eligible":
+                reasons.append("canonical_gate_unresolved")
             if covered_until is None:
                 reasons.append("missing_ingest_watermark")
 
@@ -129,8 +135,11 @@ def _write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = {
         "jsonl": output_dir / "module_c_eligible_universe.jsonl",
+        "contract_jsonl": output_dir / "module_c_eligibility.jsonl",
         "csv": output_dir / "module_c_eligible_universe.csv",
         "summary": output_dir / "module_c_eligibility_summary.json",
+        "excluded_summary": output_dir / "excluded_summary.json",
+        "excluded_markdown": output_dir / "excluded_summary.md",
     }
     temporary: dict[str, Path] = {}
     try:
@@ -141,7 +150,7 @@ def _write_outputs(
             )
             temporary[key] = Path(handle.name)
             with handle:
-                if key == "jsonl":
+                if key in {"jsonl", "contract_jsonl"}:
                     for row in rows:
                         handle.write(json.dumps(row.json_record(), ensure_ascii=False, sort_keys=True) + "\n")
                 elif key == "csv":
@@ -154,9 +163,19 @@ def _write_outputs(
                         record = row.json_record()
                         record["reasons"] = ";".join(record["reasons"])
                         writer.writerow(record)
-                else:
+                elif key == "summary":
                     json.dump(metadata, handle, ensure_ascii=False, indent=2, sort_keys=True)
                     handle.write("\n")
+                elif key == "excluded_summary":
+                    json.dump(metadata["excluded_summary"], handle, ensure_ascii=False, indent=2, sort_keys=True)
+                    handle.write("\n")
+                else:
+                    excluded = metadata["excluded_summary"]
+                    handle.write("# Module C excluded scopes\n\n")
+                    handle.write(f"Excluded scopes: {excluded['excluded_scopes']}\n\n")
+                    handle.write("| Reason | Scopes |\n|---|---:|\n")
+                    for reason, count in excluded["reasons"].items():
+                        handle.write(f"| {reason} | {count} |\n")
         for key, target in paths.items():
             os.replace(temporary[key], target)
     finally:
@@ -164,8 +183,9 @@ def _write_outputs(
             path.unlink(missing_ok=True)
 
 
-async def _load_inputs(connection: asyncpg.Connection) -> tuple[
-    list[Symbol], dict[tuple[int, str], datetime], dict[tuple[str, str], int], dict[tuple[str, str], int]
+async def _load_inputs(connection: asyncpg.Connection, audit_run_id: str | None = None) -> tuple[
+    list[Symbol], dict[tuple[int, str], datetime], dict[tuple[str, str], int],
+    dict[tuple[str, str], int], dict[tuple[int, str], str], str | None,
 ]:
     symbol_rows = await connection.fetch(
         "SELECT id, code, exchange FROM symbols WHERE is_active = TRUE ORDER BY id"
@@ -195,14 +215,36 @@ async def _load_inputs(connection: asyncpg.Connection) -> tuple[
         target = unresolved if row["reason"] == "ambiguous_volume_unit" else missing_source
         key = (str(row["symbol"]), str(row["timeframe"]))
         target[key] = target.get(key, 0) + int(row["rows"])
-    return symbols, coverage, unresolved, missing_source
+    if audit_run_id is None:
+        audit_run_id = await connection.fetchval(
+            "SELECT audit_run_id::text FROM kline_audit_runs "
+            "WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 1"
+        )
+    canonical_dispositions: dict[tuple[int, str], str] = {}
+    if audit_run_id is not None:
+        audit_rows = await connection.fetch(
+            "SELECT symbol_id, timeframe, metadata->>'disposition' AS disposition "
+            "FROM kline_audit_checkpoints WHERE audit_run_id = $1::uuid",
+            audit_run_id,
+        )
+        canonical_dispositions = {
+            (int(row["symbol_id"]), CODE_TO_TIMEFRAME[int(row["timeframe"])]):
+                str(row["disposition"] or "unresolved")
+            for row in audit_rows
+            if int(row["timeframe"]) in CODE_TO_TIMEFRAME
+        }
+    return symbols, coverage, unresolved, missing_source, canonical_dispositions, audit_run_id
 
 
 async def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     connection = await asyncpg.connect(args.database_url)
     try:
-        symbols, coverage, unresolved, missing_source = await _load_inputs(connection)
-        rows = evaluate_dispositions(symbols, coverage, unresolved, missing_source)
+        symbols, coverage, unresolved, missing_source, canonical_dispositions, audit_run_id = (
+            await _load_inputs(connection, args.audit_run_id)
+        )
+        rows = evaluate_dispositions(
+            symbols, coverage, unresolved, missing_source, canonical_dispositions
+        )
         active_hash = _stable_hash(symbol.name for symbol in symbols)
         manifest_hash = _stable_hash(row.json_record() for row in rows)
         summary = build_summary(rows)
@@ -214,6 +256,13 @@ async def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "active_universe_hash": active_hash,
             "manifest_hash": manifest_hash,
             "active_symbols": len(symbols),
+            "canonical_audit_run_id": audit_run_id,
+            "excluded_summary": {
+                "excluded_scopes": sum(not row.eligible for row in rows),
+                "reasons": dict(sorted(Counter(
+                    reason for row in rows for reason in row.reasons
+                ).items())),
+            },
             **summary,
         }
         if not args.dry_run:
@@ -245,6 +294,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-version", required=True)
     parser.add_argument("--config-hash", required=True)
     parser.add_argument("--build-id")
+    parser.add_argument("--audit-run-id")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
     return parser

@@ -229,6 +229,7 @@ class PostgresChanWriter:
         bar_until: datetime,
         bar_count: int,
         response: dict[str, Any],
+        full_recompute_task: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         assert self._pool is not None
         async with self._pool.acquire() as conn:
@@ -250,56 +251,74 @@ class PostgresChanWriter:
                 level if self.native_base_timeframe else "5f"
             )
             runs_table = self.tables["runs"]
-            run_id = await conn.fetchval(
-                f"""
-                insert into {runs_table} (
+            run_identity = hashlib.sha256(
+                f"{self.run_group_id}|{symbol}|{level}|{snapshot_version}".encode("utf-8")
+            ).hexdigest()
+
+            async def insert_run(*, resumable: bool) -> int:
+                conflict_sql = """
+                    on conflict (batch_id, run_identity)
+                        where batch_id is not null and run_identity is not null
+                    do update set status = 'running', started_at = now(), finished_at = null,
+                                  error_message = null
+                """ if resumable else ""
+                return await conn.fetchval(
+                    f"""
+                    insert into {runs_table} (
+                        symbol_id, chan_level, mode, input_signature, config_hash,
+                        bar_from, bar_until, bar_count, status, snapshot_version,
+                        computed_at, run_kind, run_group_id, cutoff_bar_end,
+                        base_timeframe, batch_id, publication_namespace, profile_id,
+                        run_identity, provenance
+                    )
+                    values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6,
+                            $11, $12, $13, $14, $15,
+                            jsonb_build_object('source',$16::text,'profile',$14::varchar))
+                    {conflict_sql}
+                    returning id
+                    """,
                     symbol_id,
-                    chan_level,
-                    mode,
-                    input_signature,
-                    config_hash,
+                    level_code,
+                    f"{symbol}:{level}:{int(bar_until.timestamp())}",
+                    self.run_config_hash,
                     bar_from,
                     bar_until,
                     bar_count,
-                    status,
                     snapshot_version,
-                    computed_at,
-                    run_kind,
-                    run_group_id,
-                    cutoff_bar_end,
-                    base_timeframe,
-                    batch_id,
-                    publication_namespace,
-                    profile_id,
+                    self.run_kind,
+                    self.run_group_id,
+                    base_timeframe_code,
+                    self.batch_id,
+                    self.publication_namespace,
+                    self.profile_id,
                     run_identity,
-                    provenance
+                    self.publication_source,
                 )
-                values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6,
-                        $11, $12, $13, $14, $15, jsonb_build_object('source',$16::text,'profile',$14::varchar))
-                returning id
-                """,
-                symbol_id,
-                level_code,
-                f"{symbol}:{level}:{int(bar_until.timestamp())}",
-                self.run_config_hash,
-                bar_from,
-                bar_until,
-                bar_count,
-                snapshot_version,
-                self.run_kind,
-                self.run_group_id,
-                base_timeframe_code,
-                self.batch_id,
-                self.publication_namespace,
-                self.profile_id,
-                hashlib.sha256(
-                    f"{self.run_group_id}|{symbol}|{level}|{snapshot_version}".encode("utf-8")
-                ).hexdigest(),
-                self.publication_source,
-            )
 
+            run_id = None if full_recompute_task is not None else await insert_run(resumable=False)
             try:
                 async with conn.transaction():
+                    if full_recompute_task is not None:
+                        fenced = await conn.fetchval(
+                            """
+                            select 1
+                              from chan_c_full_recompute_tasks
+                             where batch_id = $1 and symbol_id = $2 and chan_level = $3
+                               and status = 'running' and claim_token = $4
+                               and lease_version = $5 and lease_until > now()
+                             for update
+                            """,
+                            full_recompute_task["batch_id"],
+                            symbol_id,
+                            level_code,
+                            full_recompute_task["claim_token"],
+                            full_recompute_task["lease_version"],
+                        )
+                        if fenced != 1:
+                            raise StaleChanHeadError(
+                                f"Full-recompute task fence failed for symbol_id={symbol_id} level={level_code}"
+                            )
+                        run_id = await insert_run(resumable=True)
                     stroke_count = await self._insert_stroke_like(
                         conn,
                         self.tables["strokes"],
@@ -353,6 +372,16 @@ class PostgresChanWriter:
                         run_id=run_id,
                         status="published",
                         last_error=None,
+                        expected_heads=(
+                            _read_extra(full_recompute_task.get("expected_heads"))
+                            if full_recompute_task is not None
+                            else None
+                        ),
+                        publication_claim_token=(
+                            str(full_recompute_task["claim_token"])
+                            if full_recompute_task is not None
+                            else None
+                        ),
                     )
                     await self._upsert_recompute_watermarks(
                         conn,
@@ -364,28 +393,57 @@ class PostgresChanWriter:
                         dirty_from_bar_end=None,
                         last_error=None,
                     )
+                    if full_recompute_task is not None:
+                        completed = await conn.execute(
+                            """
+                            update chan_c_full_recompute_tasks
+                               set status = 'completed', run_id = $6, bar_count = $7,
+                                   stroke_count = $8, segment_count = $9,
+                                   center_count = $10, signal_count = $11,
+                                   worker_id = null, claim_token = null, lease_until = null,
+                                   lease_heartbeat_at = null, finished_at = now(), updated_at = now()
+                             where batch_id = $1 and symbol_id = $2 and chan_level = $3
+                               and status = 'running' and claim_token = $4
+                               and lease_version = $5 and lease_until > now()
+                            """,
+                            full_recompute_task["batch_id"],
+                            symbol_id,
+                            level_code,
+                            full_recompute_task["claim_token"],
+                            full_recompute_task["lease_version"],
+                            run_id,
+                            bar_count,
+                            stroke_count,
+                            segment_count,
+                            center_count,
+                            signal_count,
+                        )
+                        if not completed.endswith(" 1"):
+                            raise StaleChanHeadError(
+                                f"Full-recompute completion fence failed for symbol_id={symbol_id} level={level_code}"
+                            )
             except Exception as exc:
-                await conn.execute(
-                    f"""
-                    update {runs_table}
-                    set status = 'failed',
-                        finished_at = now(),
-                        error_message = $2
-                    where id = $1
-                    """,
-                    run_id,
-                    str(exc)[:2000],
-                )
-                await self._upsert_recompute_watermarks(
-                    conn,
-                    symbol_id=symbol_id,
-                    level_code=level_code,
-                    modes=modes,
-                    base_timeframe_code=base_timeframe_code,
-                    last_computed_bar_end=None,
-                    dirty_from_bar_end=bar_from,
-                    last_error=str(exc)[:2000],
-                )
+                if run_id is not None and full_recompute_task is None:
+                    await conn.execute(
+                        f"""
+                        update {runs_table}
+                        set status = 'failed', finished_at = now(), error_message = $2
+                        where id = $1
+                        """,
+                        run_id,
+                        str(exc)[:2000],
+                    )
+                if full_recompute_task is None:
+                    await self._upsert_recompute_watermarks(
+                        conn,
+                        symbol_id=symbol_id,
+                        level_code=level_code,
+                        modes=modes,
+                        base_timeframe_code=base_timeframe_code,
+                        last_computed_bar_end=None,
+                        dirty_from_bar_end=bar_from,
+                        last_error=str(exc)[:2000],
+                    )
                 raise
 
         return {
@@ -653,6 +711,8 @@ class PostgresChanWriter:
         run_id: int,
         status: str,
         last_error: str | None,
+        expected_heads: dict[str, Any] | None = None,
+        publication_claim_token: str | None = None,
     ) -> dict[str, Any]:
         rows = [
             (
@@ -690,6 +750,14 @@ class PostgresChanWriter:
                 """,
                 symbol_id, level_code, mode, base_timeframe_code,
             )
+            if expected_heads is not None:
+                expected_run_id = expected_heads.get(mode)
+                actual_run_id = previous[mode]["run_id"] if previous[mode] else None
+                if actual_run_id != expected_run_id:
+                    raise StaleChanHeadError(
+                        f"Full-recompute head changed for symbol_id={symbol_id} "
+                        f"level={level_code} mode={mode}"
+                    )
         upsert_sql = f"""
             insert into {table} (
                 symbol_id,
@@ -760,6 +828,7 @@ class PostgresChanWriter:
                 old_base_to_bar_end=old["base_to_bar_end"] if old else None,
                 new_base_to_bar_end=bar_until,
                 snapshot_version=snapshot_version,
+                claim_token=publication_claim_token,
             )
 
     async def _publish_heads_cas(
