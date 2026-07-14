@@ -203,3 +203,19 @@ def test_lost_lease_aborts_atomic_persist() -> None:
         assert conn.tx.exc_type is LostLifecycleLease
 
     asyncio.run(exercise())
+
+
+def test_historical_replay_uses_isolated_state_and_cutoff_event_time() -> None:
+    source = Path(__file__).resolve().parents[1] / "collector" / "lifecycle_observer.py"
+    text = source.read_text(encoding="utf-8")
+    assert 'profile != "historical_replay"' in text
+    assert "select cutoff_time" in text
+    assert "observed_time=history[\"published_at\"]" in text
+
+
+def test_migration_039_separates_observed_and_effective_time() -> None:
+    migration = (
+        Path(__file__).resolve().parents[3] / "db" / "sql" / "039_lifecycle_event_observed_time.sql"
+    ).read_text(encoding="utf-8").lower()
+    assert "add column if not exists observed_time" in migration
+    assert "effective_time <= observed_time" in migration

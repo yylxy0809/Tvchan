@@ -342,16 +342,17 @@ class LifecycleObserver:
             conn, run_id=history["new_run_id"], config_hash=str(new_config_hash or ""), **common
         )
         fingerprints = sorted({item.fingerprint for item in previous + current})
+        profile = str(history["publication_profile"])
         state_rows = await conn.fetch(
             "select fingerprint, current_status, current_mode from chan_structure_lifecycle_current where fingerprint = any($1::varchar[])",
             fingerprints,
-        ) if fingerprints else []
+        ) if fingerprints and profile != "historical_replay" else []
         states = {
             str(row["fingerprint"]): LifecycleState(str(row["current_status"]), row["current_mode"])
             for row in state_rows
         }
         events = plan_events(
-            profile=str(history["publication_profile"]), previous=previous,
+            profile=profile, previous=previous,
             current=current, states=states,
         )
         visible_fingerprints: set[str] = set()
@@ -376,9 +377,26 @@ class LifecycleObserver:
             event for event in events
             if event.event_type != "disappeared" or event.observation.fingerprint not in visible_fingerprints
         ]
+        effective_time = history["published_at"]
+        if profile == "historical_replay":
+            effective_time = await conn.fetchval(
+                """
+                select cutoff_time
+                  from chan_c_historical_replay_heads
+                 where run_id = $1 and mode = $2
+                 order by cutoff_time
+                 limit 1
+                """,
+                history["new_run_id"], history["mode"],
+            )
+            if effective_time is None:
+                raise RuntimeError(
+                    f"Missing historical replay cutoff for run_id={history['new_run_id']}"
+                )
         await self.persist_and_acknowledge(
             conn, claimed=claimed, events=events,
-            effective_time=history["published_at"], run_id=int(history["new_run_id"]),
+            effective_time=effective_time, observed_time=history["published_at"],
+            run_id=int(history["new_run_id"]),
             current_mode=str(history["mode"]),
         )
         return len(events)
@@ -398,6 +416,7 @@ class LifecycleObserver:
         effective_time: datetime,
         run_id: int | None,
         current_mode: str | None,
+        observed_time: datetime | None = None,
     ) -> None:
         """Commit events, projection, fenced ACK and watermark atomically."""
         async with conn.transaction():
@@ -407,6 +426,7 @@ class LifecycleObserver:
                 claimed=claimed,
                 events=events,
                 effective_time=effective_time,
+                observed_time=observed_time or effective_time,
                 run_id=run_id,
                 current_mode=current_mode,
             )
@@ -420,6 +440,7 @@ class LifecycleObserver:
         claimed: dict[str, Any],
         events: Iterable[PlannedEvent],
         effective_time: datetime,
+        observed_time: datetime,
         run_id: int | None,
         current_mode: str | None,
     ) -> None:
@@ -452,13 +473,14 @@ class LifecycleObserver:
                 """
                 insert into chan_structure_lifecycle_events(
                     fingerprint, head_history_id, event_type, effective_time, point_time,
-                    previous_mode, current_mode, run_id, provenance
-                ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+                    previous_mode, current_mode, run_id, provenance, observed_time
+                ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
                 on conflict (fingerprint, event_type, head_history_id) do nothing
                 """,
                 item.fingerprint, head_history_id, event.event_type, effective_time,
                 utc_instant(item.point_time), event.previous_mode, event_current_mode,
                 run_id, json.dumps(payload, sort_keys=True, default=str),
+                utc_instant(observed_time),
             )
             if payload.get("publication_profile") == "historical_replay":
                 continue
