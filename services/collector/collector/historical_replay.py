@@ -186,6 +186,8 @@ async def claim_replay_task(
     worker_id: str,
     lease_seconds: int = 900,
     max_attempts: int = 3,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
 ) -> Mapping[str, Any] | None:
     assert kline_writer._pool is not None
     async with kline_writer._pool.acquire() as conn:
@@ -195,9 +197,10 @@ async def claim_replay_task(
                 select id
                   from chan_c_historical_replay_tasks
                  where batch_id = $1 and eligible and attempts < $4
+                   and ($5::integer is null or mod(symbol_id, $5) = $6)
                    and (status in ('pending', 'failed')
                         or (status = 'running' and lease_until <= now()))
-                 order by cutoff_time, symbol_id, chan_level, id
+                 order by symbol_id, chan_level, cutoff_time, id
                  for update skip locked
                  limit 1
             )
@@ -217,6 +220,8 @@ async def claim_replay_task(
             worker_id,
             lease_seconds,
             max_attempts,
+            shard_count,
+            shard_index,
         )
         if row is not None:
             await conn.execute(
