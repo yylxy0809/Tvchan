@@ -778,7 +778,7 @@ class PostgresChanWriter:
         snapshot_version: str,
         run_id: int,
     ) -> None:
-        if self.publication_profile != "historical_replay" or self.run_kind != "historical_backfill":
+        if self.publication_profile != "historical_replay" or self.run_kind != "historical_replay":
             raise ValueError("Historical replay tasks require isolated replay publication settings")
         for mode in modes:
             previous = await conn.fetchrow(
