@@ -92,7 +92,9 @@ async def create_parent_batch(
                'Official historical replay canary; isolated from baseline and online heads.'
           from chan_c_batches source
          where source.id = $1 and source.status = 'sealed'
-        on conflict (batch_key) do update set batch_key = excluded.batch_key
+        on conflict (batch_key) do update
+            set code_commit = excluded.code_commit
+          where chan_c_batches.status = 'planned'
         returning id
         """,
         source_batch_id,
@@ -277,7 +279,7 @@ async def work(args: argparse.Namespace) -> None:
             args.database_url, pool_min_size=1, pool_max_size=1, tables=MODULE_C_CHAN_TABLES,
             run_config_hash=MODULE_C_CONFIG_HASH, native_base_timeframe=True,
             publication_profile="historical_replay", publication_source="historical_replay",
-            run_kind="historical_backfill", batch_id=args.batch_id,
+            run_kind="historical_replay", batch_id=args.batch_id,
             publication_namespace="historical-replay", profile_id="module-c-historical-replay-v1",
             run_group_id=str(run_group), worker_id=worker_id,
         ) as chan_writer:
