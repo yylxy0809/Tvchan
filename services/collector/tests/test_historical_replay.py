@@ -17,7 +17,7 @@ from collector.historical_replay import (
     fail_replay_task,
     heartbeat_replay_task,
 )
-from collector.historical_replay_worker import assert_no_future_output
+from collector.historical_replay_worker import assert_no_future_output, load_scope_bars
 
 
 def _contract(cutoff: datetime | str = "2026-07-10T07:00:00+00:00") -> ReplayContract:
@@ -181,6 +181,35 @@ def test_replay_claim_uses_skip_locked_lease_and_fencing_version() -> None:
     assert "for update skip locked" in query
     assert "lease_version = task.lease_version + 1" in query
     assert "lease_until <= now()" in query
+
+
+def test_replay_claim_keeps_worker_on_its_symbol_shard() -> None:
+    connection = _Connection(row=None)
+    asyncio.run(claim_replay_task(
+        kline_writer=_Writer(connection), batch_id=9, worker_id="worker-2",
+        shard_index=2, shard_count=4,
+    ))
+    query = connection.calls[0][1].lower()
+    assert "mod(symbol_id, $5) = $6" in query
+    assert "order by symbol_id, chan_level, cutoff_time" in query
+    assert connection.calls[0][2][-2:] == (4, 2)
+
+
+def test_replay_reuses_bars_for_adjacent_cutoffs_in_same_scope() -> None:
+    class KlineWriter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_bars(self, symbol: str, level: str):
+            self.calls += 1
+            return [symbol, level]
+
+    writer = KlineWriter()
+    cache = {}
+    first = asyncio.run(load_scope_bars(writer, symbol="000001.SZ", level="1d", bars_cache=cache))
+    second = asyncio.run(load_scope_bars(writer, symbol="000001.SZ", level="1d", bars_cache=cache))
+    assert first is second
+    assert writer.calls == 1
 
 
 def test_replay_heartbeat_and_failure_are_fenced_and_structured() -> None:

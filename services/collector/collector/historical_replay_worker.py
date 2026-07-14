@@ -47,6 +47,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--worker-id", default=None)
     parser.add_argument("--lease-seconds", type=int, default=900)
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--shard-index", type=int)
+    parser.add_argument("--shard-count", type=int)
     parser.add_argument("--task-limit", type=int, default=0)
     parser.add_argument("--chan-py-path", default=os.getenv("CHAN_PY_PATH"))
     args = parser.parse_args(argv)
@@ -56,6 +58,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--batch-id is required for work and report")
     if args.cutoffs_per_scope < 1:
         parser.error("--cutoffs-per-scope must be positive")
+    if (args.shard_index is None) != (args.shard_count is None):
+        parser.error("--shard-index and --shard-count must be provided together")
+    if args.shard_count is not None and not 0 <= args.shard_index < args.shard_count:
+        parser.error("--shard-index must be between zero and --shard-count minus one")
     return args
 
 
@@ -293,6 +299,23 @@ def assert_no_future_output(response: Mapping[str, Any], *, cutoff_time: datetim
                 raise RuntimeError(f"future_data_leak:{object_type}:{value}>{cutoff_epoch}")
 
 
+async def load_scope_bars(
+    kline_writer: PostgresKlineWriter,
+    *,
+    symbol: str,
+    level: str,
+    bars_cache: dict[tuple[str, str], list[Any]] | None,
+) -> list[Any]:
+    cache_key = (symbol, level)
+    all_bars = bars_cache.get(cache_key) if bars_cache is not None else None
+    if all_bars is None:
+        all_bars = await kline_writer.get_bars(symbol, level)
+        if bars_cache is not None:
+            bars_cache.clear()
+            bars_cache[cache_key] = all_bars
+    return all_bars
+
+
 async def process_task(
     *,
     kline_writer: PostgresKlineWriter,
@@ -300,11 +323,15 @@ async def process_task(
     task: Mapping[str, Any],
     lease_seconds: int,
     chan_py_path: str | None,
+    bars_cache: dict[tuple[str, str], list[Any]] | None = None,
 ) -> None:
     level = LEVEL_NAMES[int(task["chan_level"])]
     cutoff = task["cutoff_time"].astimezone(UTC)
+    all_bars = await load_scope_bars(
+        kline_writer, symbol=str(task["symbol"]), level=level, bars_cache=bars_cache,
+    )
     bars = [
-        bar for bar in await kline_writer.get_bars(str(task["symbol"]), level)
+        bar for bar in all_bars
         if bar.complete and bar.ts <= cutoff
     ]
     if not bars:
@@ -337,6 +364,7 @@ async def work(args: argparse.Namespace) -> None:
     if not run_group:
         raise RuntimeError(f"Unknown replay batch {args.batch_id}")
     processed = 0
+    bars_cache: dict[tuple[str, str], list[Any]] = {}
     async with PostgresKlineWriter(args.database_url, pool_min_size=1, pool_max_size=1) as kline_writer:
         async with PostgresChanWriter(
             args.database_url, pool_min_size=1, pool_max_size=1, tables=MODULE_C_CHAN_TABLES,
@@ -350,6 +378,7 @@ async def work(args: argparse.Namespace) -> None:
                 task = await claim_replay_task(
                     kline_writer=kline_writer, batch_id=args.batch_id, worker_id=worker_id,
                     lease_seconds=args.lease_seconds, max_attempts=args.max_attempts,
+                    shard_index=args.shard_index, shard_count=args.shard_count,
                 )
                 if task is None:
                     break
@@ -357,6 +386,7 @@ async def work(args: argparse.Namespace) -> None:
                     await process_task(
                         kline_writer=kline_writer, chan_writer=chan_writer, task=task,
                         lease_seconds=args.lease_seconds, chan_py_path=args.chan_py_path,
+                        bars_cache=bars_cache,
                     )
                 except Exception as error:
                     await fail_replay_task(kline_writer=kline_writer, task=task, error=error)
