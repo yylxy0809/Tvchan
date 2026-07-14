@@ -207,7 +207,11 @@ export class ChanOverlayManager {
 
 function normalizeModes(modes: ChanMode[]): ChanMode[] { return [...new Set(modes.filter((mode): mode is ChanMode => mode === "confirmed" || mode === "predictive"))].sort(); }
 function cacheKey(symbol: string, timeframe: string, modes: ChanMode[]): string { return `${symbol.toUpperCase()}|${timeframe}|${modes.join(",")}`; }
-function rangeLength(range: ChanOverlayRange): number { return Math.max(1, Math.floor(range.to - range.from + 1)); }
+function rangeLength(range: ChanOverlayRange): number {
+  // The range uses epoch seconds; the API limit is a bar count.
+  // Keep the estimate bounded because visible windows include overnight gaps.
+  return Math.min(5000, Math.max(1, Math.floor(range.to - range.from + 1)));
+}
 function overlaps(a: ChanOverlayRange, b: ChanOverlayRange): boolean { return a.from <= b.to && b.from <= a.to; }
 function rangeContains(a: ChanOverlayRange, b: ChanOverlayRange): boolean { return a.from <= b.from && a.to >= b.to; }
 function rangeCovered(ranges: ChanOverlayRange[], wanted: ChanOverlayRange): boolean { return ranges.some((range) => rangeContains(range, wanted)); }

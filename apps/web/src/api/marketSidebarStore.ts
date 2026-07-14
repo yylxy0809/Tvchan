@@ -4,6 +4,7 @@ export class MarketSidebarStore {
   private snapshot: MarketSidebarSnapshot;
   private listeners = new Set<() => void>();
   private started = false;
+  private chartContextConfirmed = false;
   private disposeTransport: (() => void) | null = null;
   private streamSequences = new Map<string, number>();
   private activeStreamId: string | null = null;
@@ -21,14 +22,21 @@ export class MarketSidebarStore {
     if (this.started) return;
     this.started = true;
     this.disposeTransport = this.transport.subscribe((value) => this.acceptEvent(value));
-    await this.bootstrap(this.snapshot.context);
+    if (this.chartContextConfirmed) await this.bootstrap(this.snapshot.context);
   }
 
   confirmChartSymbol(symbol: string): void {
     const normalized = symbol.toUpperCase();
-    this.snapshot = { ...this.snapshot, context: { ...this.snapshot.context, chartSymbol: normalized, chartEpoch: this.snapshot.context.chartEpoch + 1 } };
-    this.resetStreamIdentity();
+    const symbolChanged = this.snapshot.context.chartSymbol !== normalized;
+    if (!symbolChanged && this.chartContextConfirmed) return;
+    const needsBootstrap = !this.chartContextConfirmed;
+    this.chartContextConfirmed = true;
+    if (symbolChanged) {
+      this.snapshot = { ...this.snapshot, status: { state: "unavailable" }, context: { ...this.snapshot.context, chartSymbol: normalized, chartEpoch: this.snapshot.context.chartEpoch + 1 } };
+      this.resetStreamIdentity();
+    }
     this.transport.setContext(this.snapshot.context);
+    if (this.started && needsBootstrap) void this.bootstrap(this.snapshot.context);
     this.emit();
   }
 
@@ -44,7 +52,10 @@ export class MarketSidebarStore {
 
   private acceptEvent(value: unknown): boolean {
     let event;
-    try { event = parseMarketSidebarEvent(value); } catch { return false; }
+    try { event = parseMarketSidebarEvent(value); } catch (error) {
+      this.markParserError(error);
+      return false;
+    }
     if (!this.fence(event)) return false;
     if (event.type === "sidebar_resync_required" && (
       !this.isCurrent(event.snapshot.context.chartSymbol, event.snapshot.context.chartEpoch)
@@ -65,9 +76,21 @@ export class MarketSidebarStore {
       this.snapshot = { ...this.snapshot, quotesBySymbol: quotes, sequence: event.sequence, snapshotVersion: event.snapshotVersion };
     } else if (event.type === "strength_delta") {
       this.snapshot = { ...this.snapshot, strength: event.strength, sequence: event.sequence, snapshotVersion: event.snapshotVersion };
+    } else if (event.type === "chan_strategy_delta") {
+      if (!this.isCurrent(event.symbol, event.chartEpoch)) return false;
+      const profile = this.snapshot.profileBySymbol[event.symbol] ?? unavailableProfile(event.symbol);
+      this.snapshot = {
+        ...this.snapshot,
+        profileBySymbol: {
+          ...this.snapshot.profileBySymbol,
+          [event.symbol]: { ...profile, chanStrokeStates: event.chanStrokeStates, strategySignals: event.strategySignals },
+        },
+        sequence: event.sequence,
+        snapshotVersion: event.snapshotVersion,
+      };
     } else if (this.isCurrent(event.chartSymbol, event.chartEpoch)) {
       this.snapshot = event.type === "active_profile_delta"
-        ? { ...this.snapshot, profileBySymbol: { ...this.snapshot.profileBySymbol, [event.chartSymbol]: event.profile }, sequence: event.sequence, snapshotVersion: event.snapshotVersion }
+        ? { ...this.snapshot, status: { state: "ready" }, profileBySymbol: { ...this.snapshot.profileBySymbol, [event.chartSymbol]: event.profile }, sequence: event.sequence, snapshotVersion: event.snapshotVersion }
         : { ...this.snapshot, newsBySymbol: { ...this.snapshot.newsBySymbol, [event.chartSymbol]: event.feed }, sequence: event.sequence, snapshotVersion: event.snapshotVersion };
     } else return false;
     this.streamSequences.set(event.streamId, event.sequence);
@@ -115,16 +138,53 @@ export class MarketSidebarStore {
         || request.watchlistRevision !== current.watchlistRevision
         || request.watchlistSymbols.join("|") !== current.watchlistSymbols.join("|")) return;
       // Bootstrap is a snapshot, not a realtime cursor. The next stream starts at 1.
-      this.snapshot = { ...incoming, context: { ...this.snapshot.context, watchlistRevision: incoming.context.watchlistRevision }, sequence: 0, snapshotVersion: 0 };
+      this.snapshot = { ...incoming, status: { state: "ready" }, context: { ...this.snapshot.context, watchlistRevision: incoming.context.watchlistRevision }, sequence: 0, snapshotVersion: 0 };
       this.resetStreamIdentity();
       this.emit();
-    } catch {
-      // Keep the most recent valid snapshot when bootstrap/resync is unavailable.
+    } catch (error) {
+      this.markParserError(error);
     }
+  }
+  private markParserError(error: unknown): void {
+    this.snapshot = {
+      ...this.snapshot,
+      quotesBySymbol: {},
+      profileBySymbol: {},
+      newsBySymbol: {},
+      strength: undefined,
+      status: { state: "error", message: error instanceof Error ? error.message : String(error) },
+    };
+    this.emit();
   }
   private emit(): void { this.listeners.forEach((listener) => listener()); }
 }
 
 function emptySnapshot(chartSymbol: string): MarketSidebarSnapshot {
-  return { context: { chartSymbol, chartEpoch: 0, watchlistId: "default", watchlistSymbols: [], watchlistRevision: 0 }, quotesBySymbol: {}, profileBySymbol: {}, newsBySymbol: {}, strength: undefined, snapshotVersion: 0, sequence: 0 };
+  return { context: { chartSymbol, chartEpoch: 0, watchlistId: "default", watchlistSymbols: [], watchlistRevision: 0 }, quotesBySymbol: {}, profileBySymbol: {}, newsBySymbol: {}, strength: undefined, status: { state: "unavailable" }, snapshotVersion: 0, sequence: 0 };
+}
+
+function unavailableProfile(symbol: string): MarketSidebarSnapshot["profileBySymbol"][string] {
+  return {
+    symbol,
+    name: symbol,
+    exchange: symbol.split(".")[1] ?? "",
+    code: symbol.split(".")[0],
+    assetType: "stock",
+    latestPrice: null,
+    dayChangePercent: null,
+    volume: null,
+    amount: null,
+    sector: null,
+    concepts: [],
+    marketCap: null,
+    peRatio: null,
+    turnoverRate: null,
+    fundFlow: { net: null, main: null, retail: null },
+    chanStrokeStates: [],
+    strategySignals: [],
+    source: "iwencai",
+    freshness: "unavailable",
+    asOf: "",
+    tradingDate: "unknown",
+  };
 }

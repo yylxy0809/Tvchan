@@ -7,6 +7,15 @@ export type WencaiAdminConfig = {
   user_agent?: string | null;
   pro: boolean;
   timeout_seconds: number;
+  config_version?: number;
+  api_keys: WencaiApiKeyConfig[];
+};
+
+export type WencaiApiKeyConfig = {
+  label: string;
+  key: string;
+  enabled: boolean;
+  priority: number;
 };
 
 export type ConnectivityTestResult = {

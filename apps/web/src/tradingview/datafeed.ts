@@ -394,11 +394,14 @@ export function planHistoryRequest(periodParams: {
   from: number;
   to: number;
   countBack?: number;
-}): { from: number; to: number; limit: number; guard: number } {
+  firstDataRequest?: boolean;
+}): { from?: number; to: number; limit: number; guard: number } {
   const countBack = Math.max(1, periodParams.countBack ?? 1);
   const guard = Math.min(MAX_DIRECTIONAL_GUARD_BARS, Math.ceil(countBack * 0.25));
   return {
-    from: periodParams.from,
+    // On a symbol/timeframe switch, one end-anchored countBack query avoids
+    // waiting for a ranged response followed by a second deficit request.
+    from: periodParams.firstDataRequest ? undefined : periodParams.from,
     to: periodParams.to,
     limit: countBack + guard,
     guard,

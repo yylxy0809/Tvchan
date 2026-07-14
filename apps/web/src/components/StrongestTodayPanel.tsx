@@ -2,7 +2,7 @@ import { Flame, TrendingUp } from "lucide-react";
 import type { ReactNode } from "react";
 import type { MarketSidebarSnapshot } from "../api/marketSidebar";
 
-type StrengthFreshness = "live" | "delayed" | "stale" | "unavailable";
+type StrengthFreshness = "fresh" | "stale" | "unavailable";
 
 export function StrongestTodayPanel({
   marketSnapshot,
@@ -22,37 +22,34 @@ export function StrongestTodayPanel({
         <Flame size={20} strokeWidth={1.7} />
       </header>
 
-      <div className="tv-strength-summary">
+      {strength?.score != null ? <div className="tv-strength-summary">
         <div>
           <span>强度评分</span>
-          <strong>{strength?.score ?? "--"}</strong>
+          <strong>{strength.score}</strong>
         </div>
         <div>
           <span>数据状态</span>
           <strong data-freshness={status}>{statusLabel(status)}</strong>
+          <small>{sourceLabel(strength.source)} / {strength.asOf ?? "--"}</small>
         </div>
-      </div>
+      </div> : null}
 
-      <PanelBlock title="强势标的" icon={<TrendingUp size={15} />}>
-        {strength?.leaders.length
-          ? strength.leaders.map((leader) => (
+      {strength?.leaders.length ? <PanelBlock title="强势标的" icon={<TrendingUp size={15} />}>
+        {strength.leaders.map((leader) => (
             <StrengthRow key={leader.name} label={leader.name} changePercent={leader.changePercent} />
-          ))
-          : <EmptyState status={status} />}
-      </PanelBlock>
+          ))}
+      </PanelBlock> : null}
 
-      <PanelBlock title="市场主题">
-        {strength?.themes.length
-          ? strength.themes.map((theme) => (
+      {strength?.themes.length ? <PanelBlock title="市场主题">
+        {strength.themes.map((theme) => (
             <StrengthRow
               key={theme.name}
               label={theme.name}
               changePercent={theme.changePercent}
               netInflowWan={theme.mainNetInflowWan}
             />
-          ))
-          : <EmptyState status={status} />}
-      </PanelBlock>
+          ))}
+      </PanelBlock> : null}
     </section>
   );
 }
@@ -89,11 +86,11 @@ function StrengthRow({
   const direction = changePercent === null ? "flat" : changePercent >= 0 ? "up" : "down";
   return (
     <div className="tv-strength-row">
-      <div>
+      <div className="tv-strength-row-head">
         <strong>{label}</strong>
-        {netInflowWan !== undefined ? <small>主力净流入 {formatNetInflow(netInflowWan)}</small> : null}
+        <em data-direction={direction}>{formatPercent(changePercent)}</em>
       </div>
-      <em data-direction={direction}>{formatPercent(changePercent)}</em>
+      {netInflowWan !== undefined ? <small>主力净流入 {formatNetInflow(netInflowWan)}</small> : null}
     </div>
   );
 }
@@ -109,13 +106,12 @@ function formatNetInflow(value: number | null): string {
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}万`;
 }
 
-function EmptyState({ status }: { status: StrengthFreshness }) {
-  return <div className="tv-compact-row"><span>{statusLabel(status)}</span></div>;
-}
-
 function statusLabel(status: StrengthFreshness) {
   if (status === "unavailable") return "Unavailable";
   if (status === "stale") return "Stale";
-  if (status === "delayed") return "Delayed";
-  return "Live";
+  return "Fresh";
+}
+
+function sourceLabel(source: "iwencai" | "notte") {
+  return source === "notte" ? "AnythingAPI" : "iWencai";
 }

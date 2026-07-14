@@ -25,8 +25,9 @@ import {
   type ProfileTheme,
   type StrategySignal,
   type SymbolProfile,
-  searchSymbolCatalog,
-} from "../api/marketData";
+  type SidebarStatus,
+} from "../api/marketSidebar";
+import { searchSymbolCatalog } from "../api/marketData";
 import {
   DEFAULT_WATCHLIST_GROUPS,
   FAVORITES_GROUP_ID,
@@ -46,6 +47,7 @@ type Props = {
   onWatchlistSymbolsChange(symbols: string[]): void;
   quotes: Record<string, MarketQuote>;
   profile: SymbolProfile | null;
+  sidebarStatus: SidebarStatus;
   authToken?: string;
 };
 
@@ -59,6 +61,7 @@ export function WatchlistPanel({
   onWatchlistSymbolsChange,
   quotes,
   profile,
+  sidebarStatus,
   authToken,
 }: Props) {
   const [groups, setGroups] = useLocalStorageState<WatchlistGroup[]>(
@@ -199,27 +202,24 @@ export function WatchlistPanel({
     const localResults = buildLocalSearchResults(trimmed, groups);
     setResults(localResults);
     const controller = new AbortController();
-    const timer = window.setTimeout(() => {
-      setSearching(true);
-      searchSymbolCatalog(trimmed)
-        .then((items) => {
-          if (!controller.signal.aborted) {
-            setResults(mergeSearchResults(items, localResults));
-          }
-        })
-        .catch(() => {
-          if (!controller.signal.aborted) {
-            setResults(localResults);
-          }
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) {
-            setSearching(false);
-          }
-        });
-    }, 180);
+    setSearching(true);
+    void searchSymbolCatalog(trimmed)
+      .then((items) => {
+        if (!controller.signal.aborted) {
+          setResults(mergeSearchResults(items, localResults));
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setResults(localResults);
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setSearching(false);
+        }
+      });
     return () => {
-      window.clearTimeout(timer);
       controller.abort();
     };
   }, [groups, query]);
@@ -389,6 +389,17 @@ export function WatchlistPanel({
     );
   }
 
+  const hasTradingOverview = Boolean(profile?.exchange)
+    || profile?.volume != null
+    || profile?.amount != null;
+  const hasThemes = profile?.sector != null || Boolean(profile?.concepts.length);
+  const hasValuation = profile?.marketCap != null
+    || profile?.peRatio != null
+    || profile?.turnoverRate != null;
+  const hasFundFlow = profile?.fundFlow.net != null
+    || profile?.fundFlow.main != null
+    || profile?.fundFlow.retail != null;
+
   return (
     <section className="tv-watchlist-panel" aria-label="关注列表">
       <header className="tv-panel-toolbar">
@@ -475,6 +486,9 @@ export function WatchlistPanel({
           } as CSSProperties
         }
       >
+      {sidebarStatus.state === "error" ? (
+        <p className="form-error" role="alert">iWencai data unavailable: {sidebarStatus.message}</p>
+      ) : null}
       <div className="tv-watchlist-groups-list" aria-label="关注列表分组">
         {groups.map((group) => {
           const expanded = expandedGroupIds.includes(group.id);
@@ -573,7 +587,10 @@ export function WatchlistPanel({
                           <span>{item.symbol}</span>
                           <strong>{item.name}</strong>
                         </button>
-                        <span>{formatPrice(quote?.price)}</span>
+                        <span>
+                          {formatPrice(quote?.price)}
+                          {quote ? <small data-freshness={quote.freshness}>{freshnessLabel(quote.freshness)}</small> : null}
+                        </span>
                         <span data-direction={direction}>{formatSigned(change)}</span>
                         <span data-direction={direction}>{formatPercent(percent)}</span>
                         <button
@@ -627,70 +644,69 @@ export function WatchlistPanel({
           </div>
           <MoreHorizontal size={19} />
         </div>
+        <small data-freshness={profile?.freshness ?? "unavailable"}>
+          {profile ? `${sourceLabel(profile.source)} / ${profile.asOf ?? "--"} / ${freshnessLabel(profile.freshness)}` : "iWencai / Unavailable"}
+        </small>
         <div className="tv-symbol-price-line">
           <strong>{formatPrice(profile?.latestPrice)}</strong>
           <span data-direction={directionOf(profile?.dayChangePercent ?? null)}>
             {formatPercent(profile?.dayChangePercent ?? null)}
           </span>
         </div>
-        <div className="tv-symbol-profile-section">
+        {hasTradingOverview ? <div className="tv-symbol-profile-section">
           <h3>交易概况</h3>
           <dl>
-            <div>
+            {profile?.exchange ? <div>
               <dt>交易所</dt>
-              <dd>{profile?.exchange || "--"}</dd>
-            </div>
-            <div>
+              <dd>{profile.exchange}</dd>
+            </div> : null}
+            {profile?.volume != null ? <div>
               <dt>成交量</dt>
-              <dd>{formatNumber(profile?.volume)}</dd>
-            </div>
-            <div>
+              <dd>{formatNumber(profile.volume)}</dd>
+            </div> : null}
+            {profile?.amount != null ? <div>
               <dt>成交额</dt>
-              <dd>{formatMoney(profile?.amount)}</dd>
-            </div>
+              <dd>{formatMoney(profile.amount)}</dd>
+            </div> : null}
           </dl>
-        </div>
+        </div> : null}
 
-        <div className="tv-symbol-profile-section">
+        {hasThemes ? <div className="tv-symbol-profile-section">
           <h3>板块与概念</h3>
           <div className="tv-symbol-theme-list">
-            <ThemePill label="板块" theme={profile?.sector ?? null} />
-            {profile?.concepts.length ? (
-              profile.concepts.slice(0, 4).map((theme) => (
-                <ThemePill key={theme.name} label="概念" theme={theme} />
-              ))
-            ) : (
-              <ThemePill label="概念" theme={null} />
-            )}
+            {profile?.sector ? <ThemePill label="板块" theme={profile.sector} /> : null}
+            {profile?.concepts.slice(0, 4).map((theme) => (
+              <ThemePill key={theme.name} label="概念" theme={theme} />
+            ))}
           </div>
-        </div>
+        </div> : null}
 
-        <div className="tv-symbol-profile-section">
+        {hasValuation ? <div className="tv-symbol-profile-section">
           <h3>估值与活跃度</h3>
           <dl>
-            <div>
+            {profile?.marketCap != null ? <div>
               <dt>市值</dt>
-              <dd>{formatMarketCap(profile?.marketCap)}</dd>
-            </div>
-            <div>
+              <dd>{formatMarketCap(profile.marketCap)}</dd>
+            </div> : null}
+            {profile?.peRatio != null ? <div>
               <dt>市盈率</dt>
-              <dd>{formatRatio(profile?.peRatio)}</dd>
-            </div>
-            <div>
+              <dd>{formatRatio(profile.peRatio)}</dd>
+            </div> : null}
+            {profile?.turnoverRate != null ? <div>
               <dt>换手率</dt>
-              <dd>{formatPercent(profile?.turnoverRate)}</dd>
-            </div>
+              <dd>{formatPercent(profile.turnoverRate)}</dd>
+            </div> : null}
           </dl>
-        </div>
+        </div> : null}
 
-        <div className="tv-symbol-profile-section">
+        {hasFundFlow ? <div className="tv-symbol-profile-section">
           <h3>资金流向</h3>
           <dl>
-            <FundFlowRow label="净流入" value={profile?.fundFlow.net ?? null} />
-            <FundFlowRow label="主力净流入" value={profile?.fundFlow.main ?? null} />
-            <FundFlowRow label="散户净流入" value={profile?.fundFlow.retail ?? null} />
+            {profile?.fundFlow.net != null ? <FundFlowRow label="净流入" value={profile.fundFlow.net} /> : null}
+            {profile?.fundFlow.main != null ? <FundFlowRow label="主力净流入" value={profile.fundFlow.main} /> : null}
+            {profile?.fundFlow.retail != null ? <FundFlowRow label="散户净流入" value={profile.fundFlow.retail} /> : null}
           </dl>
-        </div>
+        </div> : null}
         <div className="tv-symbol-profile-section">
           <h3>缠论状态</h3>
           <div className="tv-chan-state-list">
@@ -723,7 +739,7 @@ function ThemePill({
   return (
     <div className="tv-symbol-theme-pill">
       <span>{label}</span>
-      <strong>{theme?.name ?? "--"}</strong>
+      <strong>{theme?.name}</strong>
       <em data-direction={directionOf(theme?.changePercent ?? null)}>
         {formatPercent(theme?.changePercent ?? null)}
       </em>
@@ -743,11 +759,29 @@ function FundFlowRow({ label, value }: { label: string; value: number | null }) 
 function StrokeStateRow({ state }: { state: ChanStrokeState }) {
   return (
     <div className="tv-chan-state-pill">
-      <span>{state.label}</span>
-      <strong data-direction={directionOfStroke(state)}>{state.stateLabel}</strong>
-      <em>{state.modeLabel}</em>
+      <span>{chanLevelLabel(state.level)}笔</span>
+      <strong data-direction={directionOfStroke(state)}>{chanDirectionLabel(state.direction)}</strong>
+      <em>{chanModeLabel(state.mode)}</em>
     </div>
   );
+}
+
+function chanLevelLabel(level: ChanStrokeState["level"]): string {
+  if (level === "5f") return "5分钟";
+  if (level === "30f") return "30分钟";
+  return "日线";
+}
+
+function chanDirectionLabel(direction: ChanStrokeState["direction"]): string {
+  if (direction === "up") return "向上";
+  if (direction === "down") return "向下";
+  return "暂无数据";
+}
+
+function chanModeLabel(mode: ChanStrokeState["mode"]): string {
+  if (mode === "confirmed") return "已确认";
+  if (mode === "predictive") return "预测";
+  return "未发布";
 }
 
 function StrategySignalRow({ signal }: { signal: StrategySignal }) {
@@ -759,6 +793,10 @@ function StrategySignalRow({ signal }: { signal: StrategySignal }) {
       </strong>
     </div>
   );
+}
+
+function sourceLabel(source: "iwencai" | "notte") {
+  return source === "notte" ? "AnythingAPI" : "iWencai";
 }
 
 function directionOfStroke(state: ChanStrokeState): "up" | "down" | "flat" {
@@ -875,6 +913,12 @@ function directionOf(value?: number | null): "up" | "down" | "flat" {
 
 function formatPrice(value?: number | null): string {
   return typeof value === "number" ? value.toFixed(2) : "--";
+}
+
+function freshnessLabel(freshness: "fresh" | "stale" | "unavailable"): string {
+  if (freshness === "fresh") return "Fresh";
+  if (freshness === "stale") return "Stale";
+  return "Unavailable";
 }
 
 function formatSigned(value?: number | null): string {

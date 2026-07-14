@@ -163,7 +163,6 @@ async def _fetch_bars_db(
             if (
                 len(rows) >= limit
                 or start is not None
-                or end is not None
                 or (rows and index == len(lower_bounds) - 1)
             ):
                 return [bar_row_to_api_dict(row) for row in reversed(rows)]
@@ -237,13 +236,14 @@ async def _candidate_lower_bounds(
     if start is not None:
         return [start]
     if end is not None:
-        return [None]
-    watermark = await _ingest_watermark(
-        pool,
-        symbol_id=symbol_id,
-        timeframe_code=timeframe_code,
-    )
-    anchor = watermark or datetime.now(tz=SHANGHAI_TZ)
+        anchor = end
+    else:
+        watermark = await _ingest_watermark(
+            pool,
+            symbol_id=symbol_id,
+            timeframe_code=timeframe_code,
+        )
+        anchor = watermark or datetime.now(tz=SHANGHAI_TZ)
     days = _lookback_days(timeframe, limit)
     return [
         _subtract_lookback(anchor, days),

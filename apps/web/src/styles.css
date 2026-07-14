@@ -2311,10 +2311,7 @@ body[data-app-theme="dark"] .tv-watchlist-group-edit input {
 }
 
 .tv-strength-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 4px 10px;
+  display: block;
   margin: 0;
   padding: 7px 8px;
   border: 1px solid #e8eaef;
@@ -2323,14 +2320,11 @@ body[data-app-theme="dark"] .tv-watchlist-group-edit input {
   background: #fafbfc;
 }
 
-.tv-strength-row div {
+.tv-strength-row-head {
   min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-
-.tv-strength-row div:last-of-type {
-  justify-items: start;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .tv-strength-row strong,
@@ -2343,6 +2337,8 @@ body[data-app-theme="dark"] .tv-watchlist-group-edit input {
 }
 
 .tv-strength-row strong {
+  flex: 1;
+  min-width: 0;
   max-width: 100%;
   font-size: 12px;
 }
@@ -2354,6 +2350,8 @@ body[data-app-theme="dark"] .tv-watchlist-group-edit input {
 }
 
 .tv-strength-row small {
+  display: block;
+  margin-top: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2367,6 +2365,8 @@ body[data-app-theme="dark"] .tv-watchlist-group-edit input {
 }
 
 .tv-strength-row em {
+  flex: none;
+  margin-left: auto;
   padding: 2px 5px;
   border-radius: 3px;
   background: #f0f3fa;

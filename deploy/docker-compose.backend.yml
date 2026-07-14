@@ -94,10 +94,6 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.siliconflow.cn/v1}
       LLM_MODEL: ${LLM_MODEL:-deepseek-ai/DeepSeek-V3.2}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-20}
-      WENCAI_COOKIE: ${WENCAI_COOKIE:-}
-      WENCAI_USER_AGENT: ${WENCAI_USER_AGENT:-}
-      WENCAI_PRO: ${WENCAI_PRO:-false}
-      WENCAI_TIMEOUT_SECONDS: ${WENCAI_TIMEOUT_SECONDS:-20}
     command:
       - sh
       - -ec
@@ -179,12 +175,12 @@ services:
     command: ["python", "-m", "collector.worker", "market-fill"]
     restart: unless-stopped
 
-  market-data-provider:
-    profiles: ["market-data"]
+  iwencai-sidebar-event-worker:
+    profiles: ["sidebar-iwencai"]
     build:
       context: ..
       dockerfile: deploy/Dockerfile.collector
-    container_name: tv_backend_market_data_provider
+    container_name: tv_backend_iwencai_sidebar_event_worker
     cap_drop: ["ALL"]
     cap_add: ["SETUID", "SETGID"]
     security_opt: ["no-new-privileges:true"]
@@ -202,48 +198,18 @@ services:
       db-migrate:
         condition: service_completed_successfully
     environment:
-      <<: *collector_env
-      MARKET_DATA_PROVIDER_FACTORY: ${MARKET_DATA_PROVIDER_FACTORY:-collector.market_data.factory:create_market_data_provider}
-      MARKET_DATA_DEMAND_REPOSITORY_FACTORY: ${MARKET_DATA_DEMAND_REPOSITORY_FACTORY:-}
-      MARKET_DATA_ACTIVE_SYMBOL: ${MARKET_DATA_ACTIVE_SYMBOL:-}
-      MARKET_DATA_WATCHLIST: ${MARKET_DATA_WATCHLIST:-}
-      MARKET_DATA_MAX_CONTEXTS: ${MARKET_DATA_MAX_CONTEXTS:-1000}
-      MARKET_DATA_INTERVAL_SECONDS: ${MARKET_DATA_INTERVAL_SECONDS:-5}
-      MARKET_DATA_TIMEOUT_SECONDS: ${MARKET_DATA_TIMEOUT_SECONDS:-12}
-      MARKET_DATA_MAX_PROVIDER_CONCURRENCY: ${MARKET_DATA_MAX_PROVIDER_CONCURRENCY:-16}
-      MARKET_DATA_MAX_STRUCTURED_SYMBOLS_PER_REFRESH: ${MARKET_DATA_MAX_STRUCTURED_SYMBOLS_PER_REFRESH:-2}
-      IWENCAI_BASE_URL: ${IWENCAI_BASE_URL:-}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@timescaledb:5432/${POSTGRES_DB:-tradingview_local}
+      REDIS_URL: redis://redis:6379/0
+      IWENCAI_BASE_URL: ${IWENCAI_BASE_URL:-https://openapi.iwencai.com}
       IWENCAI_API_KEY: ${IWENCAI_API_KEY:-}
       IWENCAI_ALLOWED_HOSTS: ${IWENCAI_ALLOWED_HOSTS:-openapi.iwencai.com}
       IWENCAI_TIMEOUT_SECONDS: ${IWENCAI_TIMEOUT_SECONDS:-5}
-      IWENCAI_MASTER_DATA_RESOLVER_FACTORY: ${IWENCAI_MASTER_DATA_RESOLVER_FACTORY:-}
-      IWENCAI_TRANSPORT_FACTORY: ${IWENCAI_TRANSPORT_FACTORY:-}
-      IWENCAI_REQUEST_BUILDER_FACTORY: ${IWENCAI_REQUEST_BUILDER_FACTORY:-}
-      IWENCAI_RESPONSE_PARSER_FACTORY: ${IWENCAI_RESPONSE_PARSER_FACTORY:-}
-      WESTOCK_NORMALIZER_FACTORY: ${WESTOCK_NORMALIZER_FACTORY:-collector.market_data.westock_normalizer:create_westock_normalizer}
-      WESTOCK_BRIDGE_MODULE: ${WESTOCK_BRIDGE_MODULE:-/opt/westock/provider.mjs}
-      WESTOCK_BRIDGE_MODULE_VERSION: westock-data@1.0.4
-      WESTOCK_BRIDGE_SHA256: ${WESTOCK_BRIDGE_SHA256:-4e3e0d99a17903c864a880f4f6d378676437221609363f298d137021e684cd8a}
-      WESTOCK_TIMEOUT_SECONDS: ${WESTOCK_TIMEOUT_SECONDS:-10}
-      WESTOCK_MAX_OUTPUT_BYTES: ${WESTOCK_MAX_OUTPUT_BYTES:-1048576}
-      WESTOCK_BATCH_SIZE: ${WESTOCK_BATCH_SIZE:-100}
-      WESTOCK_MAX_TRANSPORT_CONCURRENCY: ${WESTOCK_MAX_TRANSPORT_CONCURRENCY:-16}
-      WESTOCK_PROCESS_POOL_SIZE: ${WESTOCK_PROCESS_POOL_SIZE:-5}
-    command:
-      - python
-      - -c
-      - |
-        import hashlib, os, runpy
-        path = os.environ["WESTOCK_BRIDGE_MODULE"]
-        expected = os.environ.get("WESTOCK_BRIDGE_SHA256", "")
-        if len(expected) != 64 or not os.path.isfile(path):
-            raise SystemExit("the image-bundled WeStock bridge module and pinned WESTOCK_BRIDGE_SHA256 are required")
-        with open(path, "rb") as bridge:
-            actual = hashlib.sha256(bridge.read()).hexdigest()
-        if actual != expected:
-            raise SystemExit("WeStock bridge module integrity check failed")
-        runpy.run_module("collector.market_data_provider", run_name="__main__")
-    restart: "no"
+      MARKET_DATA_PROVIDER_ORDER: ${MARKET_DATA_PROVIDER_ORDER:-notte,iwencai}
+      NOTTE_API_KEY: ${NOTTE_API_KEY:-}
+      NOTTE_FUNCTION_ID: ${NOTTE_FUNCTION_ID:-e4157137-02c9-4052-85c0-9ee5c2c91682}
+      NOTTE_TIMEOUT_SECONDS: ${NOTTE_TIMEOUT_SECONDS:-45}
+    command: ["python", "-m", "collector.worker", "iwencai-sidebar-events"]
+    restart: unless-stopped
 
   history-backfill-worker:
     build:

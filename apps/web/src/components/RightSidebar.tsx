@@ -154,6 +154,7 @@ function renderPanel(
         onWatchlistSymbolsChange={onWatchlistSymbolsChange}
         quotes={marketSnapshot.quotesBySymbol}
         profile={marketSnapshot.profileBySymbol[activeSymbol] ?? null}
+        sidebarStatus={marketSnapshot.status}
         authToken={authToken}
       />
     );

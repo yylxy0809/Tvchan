@@ -45,13 +45,19 @@ type Props = {
   adminToken: string;
 };
 
+type ActionFeedback = {
+  state: "pending" | "success" | "error";
+  message: string;
+};
+
 const DEFAULT_WENCAI_CONFIG: WencaiAdminConfig = {
   base_url: "https://openapi.iwencai.com",
   api_key: "",
+  api_keys: [],
   cookie: "",
   user_agent: "",
   pro: false,
-  timeout_seconds: 20,
+  timeout_seconds: 5,
 };
 
 export function AdminConsole({ adminToken }: Props) {
@@ -62,6 +68,7 @@ export function AdminConsole({ adminToken }: Props) {
   });
   const [wencaiConfig, setWencaiConfig] = useState<WencaiAdminConfig>(DEFAULT_WENCAI_CONFIG);
   const [wencaiTestResult, setWencaiTestResult] = useState<ConnectivityTestResult | null>(null);
+  const [wencaiFeedback, setWencaiFeedback] = useState<ActionFeedback | null>(null);
   const [llmConfig, setLlmConfig] = useState<LlmProvidersConfig>({
     active_provider_id: null,
     providers: [],
@@ -103,11 +110,16 @@ export function AdminConsole({ adminToken }: Props) {
     }
   }
 
-  async function refreshWencaiConfig() {
+  async function refreshWencaiConfig(showFeedback = false) {
+    if (showFeedback) setWencaiFeedback({ state: "pending", message: "Reloading iWencai configuration..." });
     try {
-      setWencaiConfig(await fetchWencaiConfig(adminToken));
+      const config = await fetchWencaiConfig(adminToken);
+      setWencaiConfig({ ...config, timeout_seconds: Math.min(5, config.timeout_seconds) });
+      if (showFeedback) setWencaiFeedback({ state: "success", message: "iWencai configuration reloaded." });
     } catch (nextError) {
-      setError(readError(nextError));
+      const message = readError(nextError);
+      setError(message);
+      if (showFeedback) setWencaiFeedback({ state: "error", message });
     }
   }
 
@@ -205,12 +217,16 @@ export function AdminConsole({ adminToken }: Props) {
   async function handleSaveWencaiConfig() {
     setMutating(true);
     setError(null);
+    setWencaiFeedback({ state: "pending", message: "Saving iWencai configuration..." });
     try {
       const saved = await saveWencaiConfig(adminToken, wencaiConfig);
       setWencaiConfig(saved);
       setWencaiTestResult(null);
+      setWencaiFeedback({ state: "success", message: "iWencai configuration saved." });
     } catch (nextError) {
-      setError(readError(nextError));
+      const message = readError(nextError);
+      setError(message);
+      setWencaiFeedback({ state: "error", message });
     } finally {
       setMutating(false);
     }
@@ -219,13 +235,25 @@ export function AdminConsole({ adminToken }: Props) {
   async function handleTestWencaiConfig() {
     setMutating(true);
     setError(null);
+    setWencaiFeedback({ state: "pending", message: "Testing iWencai connection..." });
     try {
-      setWencaiTestResult(await testWencaiConfig(adminToken, wencaiConfig));
+      const result = await testWencaiConfig(adminToken, wencaiConfig);
+      setWencaiTestResult(result);
+      setWencaiFeedback({ state: result.ok ? "success" : "error", message: result.message });
     } catch (nextError) {
-      setError(readError(nextError));
+      const message = readError(nextError);
+      setError(message);
+      setWencaiFeedback({ state: "error", message });
     } finally {
       setMutating(false);
     }
+  }
+
+  function updateWencaiKey(index: number, patch: Partial<WencaiAdminConfig["api_keys"][number]>) {
+    setWencaiConfig((current) => ({
+      ...current,
+      api_keys: current.api_keys.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item),
+    }));
   }
 
   async function handleSaveLlmProviders() {
@@ -425,7 +453,7 @@ export function AdminConsole({ adminToken }: Props) {
             <p className="eyebrow">问财配置</p>
             <h2>问财 API / Cookie</h2>
           </div>
-          <button className="ghost-button" type="button" onClick={() => void refreshWencaiConfig()}>
+          <button className="ghost-button" type="button" onClick={() => void refreshWencaiConfig(true)} disabled={wencaiFeedback?.state === "pending"}>
             <RefreshCw size={16} />
             <span>重新加载</span>
           </button>
@@ -442,7 +470,7 @@ export function AdminConsole({ adminToken }: Props) {
             />
           </label>
           <label className="admin-field">
-            <span>OpenAPI API Key</span>
+            <span>Legacy API Key</span>
             <input
               type="password"
               value={wencaiConfig.api_key}
@@ -452,6 +480,16 @@ export function AdminConsole({ adminToken }: Props) {
               placeholder="优先使用 IWENCAI_API_KEY"
             />
           </label>
+          {wencaiConfig.api_keys.map((apiKey, index) => (
+            <div className="admin-form-grid admin-field-wide" key={`${apiKey.label}-${index}`}>
+              <label className="admin-field"><span>Label</span><input value={apiKey.label} onChange={(event) => updateWencaiKey(index, { label: event.target.value })} /></label>
+              <label className="admin-field"><span>API Key</span><input type="password" value={apiKey.key} onChange={(event) => updateWencaiKey(index, { key: event.target.value })} autoComplete="new-password" /></label>
+              <label className="admin-field"><span>Priority</span><input type="number" value={apiKey.priority} onChange={(event) => updateWencaiKey(index, { priority: Number(event.target.value) || 0 })} /></label>
+              <label className="admin-check"><input type="checkbox" checked={apiKey.enabled} onChange={(event) => updateWencaiKey(index, { enabled: event.target.checked })} /><span>Enabled</span></label>
+              <button type="button" onClick={() => setWencaiConfig((current) => ({ ...current, api_keys: current.api_keys.filter((_, keyIndex) => keyIndex !== index) }))}><Trash2 size={15} /><span>Remove</span></button>
+            </div>
+          ))}
+          <button type="button" onClick={() => setWencaiConfig((current) => ({ ...current, api_keys: [...current.api_keys, { label: `key-${current.api_keys.length + 1}`, key: "", enabled: true, priority: nextWencaiPriority(current.api_keys) }] }))}><Plus size={15} /><span>Add key</span></button>
           <label className="admin-field admin-field-wide">
             <span>Cookie</span>
             <textarea
@@ -478,11 +516,12 @@ export function AdminConsole({ adminToken }: Props) {
             <input
               type="number"
               min={1}
+              max={5}
               value={wencaiConfig.timeout_seconds}
               onChange={(event) =>
                 setWencaiConfig((current) => ({
                   ...current,
-                  timeout_seconds: Number(event.target.value) || 20,
+                  timeout_seconds: Math.min(5, Number(event.target.value) || 5),
                 }))
               }
             />
@@ -508,6 +547,7 @@ export function AdminConsole({ adminToken }: Props) {
             <span>保存配置</span>
           </button>
           {wencaiTestResult ? <TestResultBadge result={wencaiTestResult} /> : null}
+          {wencaiFeedback ? <span className="admin-test-result" data-state={wencaiFeedback.state} role="status" aria-live="polite">{wencaiFeedback.message}</span> : null}
         </div>
       </section>
 
@@ -741,6 +781,10 @@ function splitModels(value: string): string[] {
     .split(/\r?\n|,/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function nextWencaiPriority(keys: WencaiAdminConfig["api_keys"]): number {
+  return keys.reduce((maximum, item) => Math.max(maximum, item.priority), -1) + 1;
 }
 
 function readError(value: unknown): string {

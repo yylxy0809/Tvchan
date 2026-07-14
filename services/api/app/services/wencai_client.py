@@ -5,11 +5,16 @@ import json
 import re
 import secrets
 import time
+import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
+
+
+DEFAULT_IWENCAI_ALLOWED_HOSTS = ("openapi.iwencai.com",)
 
 
 class WencaiConfigError(ValueError):
@@ -21,6 +26,18 @@ class WencaiUpstreamError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class WencaiApiKey:
+    label: str = "default"
+    key: str = field(default="", repr=False)
+    enabled: bool = True
+    priority: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.key.strip():
+            raise WencaiConfigError("WenCai API key cannot be empty")
+
+
+@dataclass(frozen=True)
 class WencaiConfig:
     base_url: str = "https://openapi.iwencai.com"
     api_key: str = ""
@@ -28,6 +45,17 @@ class WencaiConfig:
     user_agent: str | None = None
     pro: bool = False
     timeout_seconds: float = 20
+    allowed_hosts: tuple[str, ...] = DEFAULT_IWENCAI_ALLOWED_HOSTS
+    api_keys: tuple[WencaiApiKey, ...] = ()
+
+    def __post_init__(self) -> None:
+        allowed_hosts = tuple(host.strip().lower() for host in self.allowed_hosts if host.strip())
+        object.__setattr__(self, "allowed_hosts", allowed_hosts)
+        object.__setattr__(self, "base_url", normalize_iwencai_base_url(self.base_url, allowed_hosts))
+
+    def enabled_api_keys(self) -> tuple[WencaiApiKey, ...]:
+        keys = self.api_keys or ((WencaiApiKey(key=self.api_key),) if self.api_key.strip() else ())
+        return tuple(sorted((item for item in keys if item.enabled), key=lambda item: item.priority))
 
 
 @dataclass(frozen=True)
@@ -61,6 +89,9 @@ class WencaiConnectivityResult:
     latency_ms: int
     message: str
     sample_count: int
+    capability: str = "screener"
+    source: str = "iwencai"
+    error_class: str | None = None
 
 
 async def query_wencai(
@@ -70,14 +101,9 @@ async def query_wencai(
     page_size: int,
     config: WencaiConfig,
 ) -> WencaiQueryResult:
-    if config.api_key.strip():
-        payload = await asyncio.to_thread(
-            _fetch_openapi_page,
-            query=query,
-            page=page,
-            page_size=page_size,
-            config=config,
-        )
+    api_keys = config.enabled_api_keys()
+    if api_keys:
+        payload = await _query_openapi_with_pool(query=query, page=page, page_size=page_size, config=config, api_keys=api_keys)
         records = _records_from_result(payload.get("datas"))
         total = _int_from_unknown(payload.get("code_count"), default=len(records))
         items = [_normalize_item(record) for record in records]
@@ -104,6 +130,53 @@ async def query_wencai(
     )
 
 
+_POOL_STATES: dict[str, dict[str, float | int]] = {}
+
+
+def _config_fingerprint(config: WencaiConfig, api_keys: tuple[WencaiApiKey, ...]) -> str:
+    material = "|".join(f"{item.label}:{item.priority}:{item.enabled}:{item.key}" for item in api_keys)
+    return hashlib.sha256(f"{config.base_url}|{material}".encode()).hexdigest()
+
+
+async def _query_openapi_with_pool(*, query: str, page: int, page_size: int, config: WencaiConfig, api_keys: tuple[WencaiApiKey, ...]) -> dict[str, Any]:
+    fingerprint = _config_fingerprint(config, api_keys)
+    state = _POOL_STATES.setdefault(fingerprint, {})
+    now = time.monotonic()
+    available = [item for item in api_keys if state.get(_key_state_name(item), 0.0) <= now]
+    if not available:
+        raise WencaiUpstreamError("WenCai API key pool exhausted")
+    ordered = available
+    errors: list[Exception] = []
+    for item in ordered:
+        for attempt in range(2):
+            try:
+                return await asyncio.to_thread(_fetch_openapi_page, query=query, page=page, page_size=page_size, config=config, api_key=item.key)
+            except Exception as exc:
+                errors.append(exc)
+                if _is_timeout_error(exc) and attempt == 0:
+                    continue
+                cooldown = _cooldown_seconds(exc)
+                if cooldown:
+                    state[_key_state_name(item)] = time.monotonic() + cooldown
+                break
+    raise WencaiUpstreamError("WenCai API key pool exhausted") from errors[-1]
+
+
+def _key_state_name(item: WencaiApiKey) -> str:
+    return "cooldown:" + hashlib.sha256(item.key.encode()).hexdigest()
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    return "timeout" in str(exc).lower()
+
+
+def _cooldown_seconds(exc: Exception) -> float:
+    message = str(exc).lower()
+    if any(marker in message for marker in ("401", "403", "429", "quota", "exhausted")):
+        return 300.0
+    return 0.0
+
+
 async def test_wencai_config(config: WencaiConfig) -> WencaiConnectivityResult:
     start = time.perf_counter()
     try:
@@ -125,7 +198,19 @@ async def test_wencai_config(config: WencaiConfig) -> WencaiConnectivityResult:
             latency_ms=_elapsed_ms(start),
             message=str(exc),
             sample_count=0,
+            error_class=_connectivity_error_class(exc),
         )
+
+
+def _connectivity_error_class(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "401" in message or "403" in message or "api_key" in message or "cookie" in message:
+        return "authentication"
+    if "timeout" in message:
+        return "timeout"
+    if "http" in message:
+        return "upstream_http"
+    return "unavailable"
 
 
 def _fetch_all_records(*, query: str, config: WencaiConfig) -> list[dict[str, Any]]:
@@ -152,14 +237,16 @@ def _fetch_openapi_page(
     page: int,
     page_size: int,
     config: WencaiConfig,
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     result = _call_iwencai_openapi(
         query=query,
         page=str(page),
         limit=str(page_size),
-        api_key=config.api_key.strip(),
+        api_key=(api_key if api_key is not None else config.api_key).strip(),
         base_url=config.base_url.strip() or "https://openapi.iwencai.com",
         timeout=config.timeout_seconds,
+        allowed_hosts=config.allowed_hosts,
     )
     if not isinstance(result, dict):
         raise WencaiUpstreamError("问财 OpenAPI 返回格式异常")
@@ -177,6 +264,7 @@ def _call_iwencai_openapi(
     api_key: str,
     base_url: str,
     timeout: float,
+    allowed_hosts: tuple[str, ...] = DEFAULT_IWENCAI_ALLOWED_HOSTS,
 ) -> dict[str, Any]:
     trace_id = secrets.token_hex(32)
     payload = {
@@ -197,7 +285,7 @@ def _call_iwencai_openapi(
         "X-Claw-Trace-Id": trace_id,
     }
     request = urllib.request.Request(
-        _iwencai_openapi_endpoint(base_url),
+        _iwencai_openapi_endpoint(base_url, allowed_hosts),
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
         method="POST",
@@ -219,11 +307,35 @@ def _call_iwencai_openapi(
     return value
 
 
-def _iwencai_openapi_endpoint(base_url: str) -> str:
-    normalized = base_url.strip().rstrip("/")
+def _iwencai_openapi_endpoint(base_url: str, allowed_hosts: tuple[str, ...] = DEFAULT_IWENCAI_ALLOWED_HOSTS) -> str:
+    normalized = normalize_iwencai_base_url(base_url, allowed_hosts).rstrip("/")
     if normalized.endswith("/v1/query2data"):
         return normalized
     return f"{normalized}/v1/query2data"
+
+
+def normalize_iwencai_base_url(base_url: str, allowed_hosts: tuple[str, ...]) -> str:
+    """Allow API-key requests only to explicitly configured HTTPS iWencai origins."""
+    try:
+        parsed = urlsplit(base_url.strip())
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError as exc:
+        raise WencaiConfigError("WenCai base_url is invalid") from exc
+    if (
+        parsed.scheme != "https"
+        or not host
+        or host not in allowed_hosts
+        or parsed.username
+        or parsed.password
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/", "/v1/query2data")
+    ):
+        raise WencaiConfigError("WenCai base_url must use an allowed HTTPS host")
+    path = "/v1/query2data" if parsed.path == "/v1/query2data" else ""
+    return f"https://{host}{path}"
 
 
 def _call_pywencai_get(**kwargs):
