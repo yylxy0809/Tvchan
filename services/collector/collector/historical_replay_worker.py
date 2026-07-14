@@ -110,15 +110,15 @@ async def load_contract(conn: asyncpg.Connection, *, source_batch_id: int) -> Re
     row = await conn.fetchrow(
         """
         select source.config_hash,
-               full.eligibility_build_id::text as eligibility_snapshot,
+               recompute.eligibility_build_id::text as eligibility_snapshot,
                eligibility.manifest_hash as canonical_snapshot,
                max(task.target_bar_until) as cutoff_time
           from chan_c_batches source
-          join chan_c_full_recompute_batches full on full.batch_id = source.id
-          join module_c_eligibility_builds eligibility on eligibility.build_id = full.eligibility_build_id
+          join chan_c_full_recompute_batches recompute on recompute.batch_id = source.id
+          join module_c_eligibility_builds eligibility on eligibility.build_id = recompute.eligibility_build_id
           join chan_c_full_recompute_tasks task on task.batch_id = source.id and task.eligible
          where source.id = $1 and source.status = 'sealed'
-         group by source.config_hash, full.eligibility_build_id, eligibility.manifest_hash
+         group by source.config_hash, recompute.eligibility_build_id, eligibility.manifest_hash
         """,
         source_batch_id,
     )
