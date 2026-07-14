@@ -34,7 +34,7 @@ DEFAULT_OUTPUT_DIR = Path("outputs/device-b-historical-replay-20260714")
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Durable official Module C historical replay")
-    parser.add_argument("action", choices=("prepare-canary", "work", "report"))
+    parser.add_argument("action", choices=("prepare-canary", "prepare-full", "work", "report"))
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
     parser.add_argument("--batch-id", type=int)
     parser.add_argument("--source-batch-id", type=int, default=6)
@@ -213,6 +213,69 @@ async def seed_canary_tasks(
     return int(await conn.fetchval("select count(*) from chan_c_historical_replay_tasks where batch_id=$1", batch_id))
 
 
+async def seed_full_high_level_tasks(
+    conn: asyncpg.Connection,
+    *,
+    batch_id: int,
+    source_batch_id: int,
+    contract: ReplayContract,
+    cutoffs_per_scope: int,
+) -> int:
+    rows = await conn.fetch(
+        """
+        with source as (
+            select eligibility_build_id from chan_c_full_recompute_batches where batch_id = $1
+        )
+        select eligibility.symbol_id, eligibility.symbol, eligibility.timeframe as chan_level,
+               eligibility.eligible, eligibility.reasons as exclusion_reasons,
+               eligibility.covered_until, cutoff.ts as cutoff_time
+          from source
+          join module_c_eligibility eligibility on eligibility.build_id = source.eligibility_build_id
+          left join lateral (
+              select k.ts
+                from klines k
+               where k.symbol_id = eligibility.symbol_id
+                 and k.timeframe = eligibility.timeframe
+                 and k.is_complete and k.ts <= eligibility.covered_until
+               order by k.ts desc
+               limit $2
+          ) cutoff on eligibility.eligible and eligibility.timeframe in (1440, 10080, 43200)
+         where not eligibility.eligible or eligibility.timeframe in (1440, 10080, 43200)
+         order by eligibility.symbol, eligibility.timeframe, cutoff.ts
+        """,
+        source_batch_id,
+        cutoffs_per_scope,
+    )
+    manifests: list[tuple[Any, ...]] = []
+    for row in rows:
+        level = LEVEL_NAMES[int(row["chan_level"])]
+        cutoff = row["cutoff_time"] or row["covered_until"] or contract.cutoff_time
+        eligible = bool(row["eligible"] and row["cutoff_time"] is not None)
+        reasons = list(row["exclusion_reasons"] or [])
+        if row["eligible"] and row["cutoff_time"] is None:
+            reasons.append("no_complete_native_bar_at_or_before_frozen_cutoff")
+        manifests.append((
+            batch_id, int(row["symbol_id"]), str(row["symbol"]), int(row["chan_level"]),
+            "confirmed,predictive", cutoff, contract.contract_version,
+            stable_replay_identity(
+                contract, symbol=str(row["symbol"]), level=level,
+                mode="confirmed,predictive", cutoff_time=cutoff,
+            ),
+            eligible, reasons, "pending" if eligible else "excluded",
+        ))
+    await conn.executemany(
+        """
+        insert into chan_c_historical_replay_tasks (
+            batch_id, symbol_id, symbol, chan_level, mode, cutoff_time,
+            contract_version, replay_identity, eligible, exclusion_reasons, status
+        ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        on conflict (batch_id, symbol_id, chan_level, mode, cutoff_time, contract_version) do nothing
+        """,
+        manifests,
+    )
+    return int(await conn.fetchval("select count(*) from chan_c_historical_replay_tasks where batch_id=$1", batch_id))
+
+
 def assert_no_future_output(response: Mapping[str, Any], *, cutoff_time: datetime) -> None:
     cutoff_epoch = int(cutoff_time.timestamp())
     checks = (
@@ -345,24 +408,39 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 async def main(args: argparse.Namespace) -> None:
-    if args.action == "prepare-canary":
+    if args.action in {"prepare-canary", "prepare-full"}:
         conn = await asyncpg.connect(args.database_url)
         try:
             contract = await load_contract(conn, source_batch_id=args.source_batch_id)
+            full = args.action == "prepare-full"
+            batch_key = args.batch_key if not full or args.batch_key != "historical-replay-canary-20260714-v1" else "historical-replay-full-20260714-v1"
+            run_group_id = args.run_group_id if not full or args.run_group_id != "historical-replay-canary-20260714-v1" else "historical-replay-full-20260714-v1"
             batch_id = await create_parent_batch(
-                conn, source_batch_id=args.source_batch_id, batch_key=args.batch_key,
-                run_group_id=args.run_group_id, code_commit=args.code_commit,
+                conn, source_batch_id=args.source_batch_id, batch_key=batch_key,
+                run_group_id=run_group_id, code_commit=args.code_commit,
             )
             writer = type("Writer", (), {"_pool": type("Pool", (), {"acquire": lambda _self: _ConnectionAcquire(conn)})()})()
             await ensure_replay_batch(kline_writer=writer, batch_id=batch_id, contract=contract)
-            task_count = await seed_canary_tasks(
-                conn, batch_id=batch_id, source_batch_id=args.source_batch_id,
-                canary_source_batch_id=args.canary_source_batch_id, contract=contract,
-                cutoffs_per_scope=args.cutoffs_per_scope,
-            )
+            if full:
+                task_count = await seed_full_high_level_tasks(
+                    conn, batch_id=batch_id, source_batch_id=args.source_batch_id,
+                    contract=contract, cutoffs_per_scope=args.cutoffs_per_scope,
+                )
+            else:
+                task_count = await seed_canary_tasks(
+                    conn, batch_id=batch_id, source_batch_id=args.source_batch_id,
+                    canary_source_batch_id=args.canary_source_batch_id, contract=contract,
+                    cutoffs_per_scope=args.cutoffs_per_scope,
+                )
             write_json(args.output_dir / "replay_contract.json", {**contract.payload(), "contract_hash": contract.digest(), "batch_id": batch_id})
             summary = await build_report(conn, batch_id=batch_id)
-            summary.update({"scope": "20-symbol-canary", "task_count": task_count, "cutoffs_per_eligible_scope": args.cutoffs_per_scope})
+            summary.update({
+                "scope": "full-market-high-level" if full else "20-symbol-canary",
+                "task_count": task_count,
+                "cutoffs_per_eligible_scope": args.cutoffs_per_scope,
+                "deferred_levels": ["5f", "30f"] if full else [],
+                "deferred_reason": "awaiting_causal_official_strategy_forward_windows" if full else None,
+            })
             write_json(args.output_dir / "cutoff_grid_summary.json", summary)
             print(json.dumps({"batch_id": batch_id, "task_count": task_count}, sort_keys=True))
         finally:
