@@ -280,70 +280,44 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
         connection = await asyncpg.connect(args.database_url)
         try:
             for symbol, symbol_runs in runs_by_symbol.items():
-                level_runs: dict[str, Mapping[str, Any]] = {}
-                try:
-                    for run in symbol_runs:
+                for run in symbol_runs:
+                    try:
                         level = LEVEL_NAMES.get(int(run["chan_level"]))
                         if level is None:
                             raise RuntimeError(f"Unsupported published Chan level: {run['chan_level']}")
-                        level_runs[level] = run
-                    levels = sorted(level_runs, key=LEVEL_ORDER.__getitem__)
-                    modes = sorted({str(mode) for run in symbol_runs for mode in run["modes"]})
-                    bars_by_level = {
-                        level: [
-                            bar
-                            for bar in await kline_writer.get_bars(symbol, level)
-                            if (level_runs[level]["bar_from"] is None or bar.ts >= level_runs[level]["bar_from"])
-                            and bar.ts <= level_runs[level]["bar_until"]
+                        modes = sorted(str(mode) for mode in run["modes"])
+                        bars = [
+                            bar for bar in await kline_writer.get_bars(symbol, level)
+                            if (run["bar_from"] is None or bar.ts >= run["bar_from"])
+                            and bar.ts <= run["bar_until"]
                         ]
-                        for level in levels
-                    }
-                    missing = [level for level, bars in bars_by_level.items() if not bars]
-                    if missing:
-                        raise RuntimeError(f"No canonical bars matched the published run range: {','.join(missing)}")
-                    direct_response = await compute_module_c_overlay(
-                        symbol=symbol,
-                        levels=levels,
-                        modes=modes,
-                        bars_by_level=bars_by_level,
-                        chan_py_path=args.chan_py_path,
-                    )
-                    for level in levels:
-                        run = level_runs[level]
+                        if not bars:
+                            raise RuntimeError(f"No canonical bars matched the published run range: {level}")
+                        direct_response = await compute_module_c_overlay(
+                            symbol=symbol, levels=[level], modes=modes, bars_by_level={level: bars},
+                            chan_py_path=args.chan_py_path,
+                        )
                         direct = normalize_direct(filter_chan_response_level(direct_response, level))
                         persisted = await _fetch_persisted(connection, int(run["run_id"]))
-                        comparison = compare_payloads(
-                            direct, persisted, max_samples=args.max_difference_samples
-                        )
+                        comparison = compare_payloads(direct, persisted, max_samples=args.max_difference_samples)
                         config_match = str(run["config_hash"]) == MODULE_C_CONFIG_HASH
-                        bar_count = len(bars_by_level[level])
-                        bar_count_match = int(run["bar_count"] or 0) == bar_count
+                        bar_count_match = int(run["bar_count"] or 0) == len(bars)
                         results.append(
                             {
                                 **_base_result(run, symbol, level),
-                                "config_match": config_match,
-                                "bar_count": bar_count,
-                                "bar_count_match": bar_count_match,
-                                **comparison,
-                                "error": None,
+                                "config_match": config_match, "bar_count": len(bars),
+                                "bar_count_match": bar_count_match, **comparison, "error": None,
                                 "passed": config_match and bar_count_match and comparison["difference_count"] == 0,
                             }
                         )
-                except Exception as error:
-                    for run in symbol_runs:
+                    except Exception as error:
                         level = LEVEL_NAMES.get(int(run["chan_level"]), str(run["chan_level"]))
-                        results.append(
-                            {
-                                **_base_result(run, symbol, level),
-                                "config_match": str(run["config_hash"]) == MODULE_C_CONFIG_HASH,
-                                "bar_count": 0,
-                                "bar_count_match": False,
-                                "difference_count": 1,
-                                "objects": {},
-                                "error": str(error)[:1000],
-                                "passed": False,
-                            }
-                        )
+                        results.append({
+                            **_base_result(run, symbol, level),
+                            "config_match": str(run["config_hash"]) == MODULE_C_CONFIG_HASH,
+                            "bar_count": 0, "bar_count_match": False, "difference_count": 1,
+                            "objects": {}, "error": str(error)[:1000], "passed": False,
+                        })
         finally:
             await connection.close()
 
@@ -401,6 +375,8 @@ def _write_report(output_dir: Path, report: Mapping[str, Any]) -> None:
     markdown = "\n".join(lines)
     _atomic_write(output_dir / "canary_ab_report.json", json_text)
     _atomic_write(output_dir / "canary_ab_report.md", markdown)
+    _atomic_write(output_dir / "canary_ab_summary.json", json_text)
+    _atomic_write(output_dir / "canary_ab_summary.md", markdown)
 
 
 def _atomic_write(path: Path, content: str) -> None:
