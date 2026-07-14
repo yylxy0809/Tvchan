@@ -7,7 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "test:contract": "npx --yes tsx --test src/api/chanOverlayManager.contract.test.ts src/api/chanRealtimeOverlayBridge.contract.test.ts src/api/chanRealtimeLive.contract.test.ts src/tradingview/chanStudy.contract.test.ts src/tradingview/datafeed.contract.test.ts src/api/chartDataManager.contract.test.ts src/api/marketData.contract.test.ts src/api/marketSidebar.contract.test.ts src/components/StrongestTodayPanel.contract.test.tsx src/components/StockNewsPanel.contract.test.tsx"
+    "test:contract": "npx --yes tsx --test src/api/chanOverlayManager.contract.test.ts src/api/chanRealtimeOverlayBridge.contract.test.ts src/api/chanRealtimeLive.contract.test.ts src/tradingview/chanStudy.contract.test.ts src/tradingview/datafeed.contract.test.ts src/api/chartDataManager.contract.test.ts src/api/marketData.contract.test.ts src/api/marketSidebar.contract.test.ts src/components/StrongestTodayPanel.contract.test.tsx src/components/StockNewsPanel.contract.test.tsx src/components/WatchlistPanel.contract.test.tsx src/components/AdminConsole.contract.test.tsx"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

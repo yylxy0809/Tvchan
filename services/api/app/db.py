@@ -29,6 +29,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             min_size=1,
             max_size=1,
         )
+    repository = getattr(app.state, "market_sidebar_repository", None)
+    set_db_pool = getattr(repository, "set_db_pool", None)
+    if set_db_pool is not None:
+        set_db_pool(app.state.db_pool)
     try:
         yield
     finally:

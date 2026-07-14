@@ -554,14 +554,6 @@ class RealtimeBarSocketClient {
     }
     if (message.subscription_id) {
       const subscription = this.sidebarSubscriptions.get(message.subscription_id);
-      if (subscription) {
-        const sequence = message.sequence ?? message.seq;
-        if (Number.isSafeInteger(sequence)) subscription.context.afterSequence = sequence as number;
-        const snapshotVersion = (message as { snapshot_version?: unknown }).snapshot_version;
-        if (typeof snapshotVersion === "number" && Number.isSafeInteger(snapshotVersion)) {
-          subscription.context.snapshotVersion = snapshotVersion;
-        }
-      }
       subscription?.listeners.forEach((listener) => listener(message));
       return;
     }

@@ -18,6 +18,7 @@ from app.models import (
 )
 from app.routes import chart_ws
 from app.routes import realtime
+from app.market_sidebar.service import SidebarContext
 
 
 def test_realtime_rejects_bad_token() -> None:
@@ -314,6 +315,66 @@ def test_realtime_parses_redis_bar_update() -> None:
         "timeframe": "5f",
         "bar": {"time": 1},
     }
+
+
+def test_sidebar_update_parser_accepts_local_publications_and_filters_context() -> None:
+    context = SidebarContext(
+        "connection", "right-sidebar", "000001.SZ", 4, (),
+        frozenset({"chan_strategy"}), watchlist_revision=3,
+    )
+    local = realtime._parse_sidebar_update('{"type":"chan_head_update","symbol":"000001.SZ"}')
+    current = realtime._parse_sidebar_update('{"source":"iwencai","chart_symbol":"000001.SZ","chart_epoch":4,"watchlist_revision":3}')
+    stale = realtime._parse_sidebar_update('{"source":"iwencai","chart_symbol":"000001.SZ","chart_epoch":3,"watchlist_revision":3}')
+
+    assert local == {"type": "chan_head_update", "symbol": "000001.SZ", "source": "local_db"}
+    assert realtime._sidebar_update_matches(local, context)
+    assert realtime._sidebar_update_matches(current, context)
+    assert not realtime._sidebar_update_matches(stale, context)
+
+
+def test_sidebar_relay_marks_ready_only_after_subscription(monkeypatch) -> None:
+    class PubSub:
+        def __init__(self): self.subscribed = False
+        async def subscribe(self, *_channels): self.subscribed = True
+        def listen(self):
+            async def iterator():
+                await asyncio.Event().wait()
+                yield {}
+            return iterator()
+        async def unsubscribe(self, *_channels): pass
+        async def aclose(self): pass
+
+    class Redis:
+        def __init__(self): self.pubsub_instance = PubSub()
+        def pubsub(self): return self.pubsub_instance
+        async def aclose(self): pass
+
+    async def scenario():
+        client = Redis()
+        async def fake_create(_url): return client
+        monkeypatch.setattr(realtime, "_try_create_redis_client", fake_create)
+        ready = asyncio.Event()
+        context = SidebarContext("connection", "sidebar", "000001.SZ", 1, (), frozenset())
+        task = asyncio.create_task(realtime._relay_sidebar_updates(asyncio.Queue(), "redis://test", context, ready))
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        assert client.pubsub_instance.subscribed
+        task.cancel()
+        try: await task
+        except asyncio.CancelledError: pass
+
+    asyncio.run(scenario())
+
+
+def test_sidebar_relay_does_not_mark_ready_when_redis_is_unavailable(monkeypatch) -> None:
+    async def scenario():
+        async def no_redis(_url): return None
+        monkeypatch.setattr(realtime, "_try_create_redis_client", no_redis)
+        ready = asyncio.Event()
+        context = SidebarContext("connection", "sidebar", "000001.SZ", 1, (), frozenset())
+        await realtime._relay_sidebar_updates(asyncio.Queue(), "redis://test", context, ready)
+        assert not ready.is_set()
+
+    asyncio.run(scenario())
 
 
 def test_realtime_matches_subscriptions() -> None:

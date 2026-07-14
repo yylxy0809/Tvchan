@@ -65,6 +65,11 @@ _WORKERS: dict[str, WorkerSpec] = {
         module="collector.backfill",
         description="Legacy direct pytdx backfill command kept for runbook compatibility.",
     ),
+    "iwencai-sidebar-events": WorkerSpec(
+        name="iwencai-sidebar-events",
+        module="collector.market_data_provider",
+        description="Event-driven iWencai sidebar snapshot worker.",
+    ),
 }
 
 

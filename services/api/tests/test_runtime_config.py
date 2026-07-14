@@ -95,6 +95,40 @@ def test_admin_can_update_runtime_config_and_increment_version() -> None:
     assert pool.rows["frontend.features"]["value"] == body["value"]
 
 
+def test_generic_runtime_config_cannot_bypass_wencai_https_host_allowlist() -> None:
+    pool = FakeRuntimeConfigPool()
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"), pool)
+
+    response = client.put(
+        "/api/v1/admin/runtime-config/wencai.config",
+        json={"value": {"base_url": "http://127.0.0.1:8080", "api_key": "secret"}},
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    assert response.status_code == 422
+    assert "allowed HTTPS host" in response.json()["detail"]
+    assert "wencai.config" not in pool.rows
+
+
+def test_wencai_config_exposes_runtime_config_version() -> None:
+    pool = FakeRuntimeConfigPool(
+        {
+            "wencai.config": {
+                "key": "wencai.config",
+                "value": {"api_key": "secret"},
+                "version": 4,
+                "updated_at": datetime(2026, 7, 1, tzinfo=UTC),
+            }
+        }
+    )
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"), pool)
+
+    response = client.get("/api/v1/admin/wencai/config", headers={"Authorization": "Bearer admin-token"})
+
+    assert response.status_code == 200
+    assert response.json()["config_version"] == 4
+
+
 def test_user_token_cannot_update_runtime_config() -> None:
     pool = FakeRuntimeConfigPool()
     client = _client(Settings(api_token="api-token", admin_api_token="admin-token"), pool)

@@ -1,445 +1,192 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import logging
 import os
 import signal
 import time
-from dataclasses import asdict, dataclass, is_dataclass
-from datetime import datetime
-from enum import Enum
-from typing import Any, Mapping, Protocol
+from dataclasses import asdict, is_dataclass
+from datetime import date
+from typing import Any, Awaitable, Callable, Mapping
 
-from .market_data import MarketDataResult, UnifiedMarketDataProvider
-
-
-_LOG = logging.getLogger(__name__)
+from .market_data import MarketDataCoordinator, MarketDataResult, SidebarContext
+from .market_data.factory import create_market_data_provider
+from .market_data.trading_day_cache import RedisTradingDayCache, TradingCalendar, WeekdayTradingCalendar
 
 
-@dataclass(frozen=True, slots=True)
-class MarketDemand:
-    active_symbols: tuple[str, ...]
-    watchlist_symbols: tuple[str, ...] = ()
+REFRESH_CHANNEL = "market:sidebar:refresh_requests"
+REFRESH_STREAM = REFRESH_CHANNEL
+UPDATE_CHANNEL = "market:sidebar:updates"
+WENCAI_CONFIG_KEY = "wencai.config"
+_EVENT_TYPES = frozenset({"sidebar_refresh_requested"})
+_MAX_SYMBOLS = 500
+_PENDING_MIN_IDLE_MS = 60_000
+_PENDING_CLAIM_INTERVAL_SECONDS = 60
+_PENDING_BATCH_SIZE = 10
 
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "active_symbols",
-            tuple(dict.fromkeys(symbol.strip().upper() for symbol in self.active_symbols if symbol.strip())),
-        )
-        object.__setattr__(
-            self,
-            "watchlist_symbols",
-            tuple(dict.fromkeys(symbol.strip().upper() for symbol in self.watchlist_symbols if symbol.strip())),
-        )
+logger = logging.getLogger(__name__)
 
 
-class DemandRepository(Protocol):
-    async def get_demand(self) -> MarketDemand: ...
+class PostgresWencaiConfigLoader:
+    def __init__(self, pool: Any, env: Mapping[str,str] = os.environ) -> None: self._pool,self._env=pool,env
+    async def load(self) -> tuple[int, dict[str, str]]:
+        row = await self._pool.fetchrow("select value, version from runtime_config where key = $1", WENCAI_CONFIG_KEY)
+        if row is None:
+            api_key,base_url=self._env.get("IWENCAI_API_KEY",""),self._env.get("IWENCAI_BASE_URL","")
+            if not api_key or not base_url:raise ValueError("wencai.config or environment configuration is required")
+            keys=[{"label":"default","key":api_key,"enabled":True,"priority":0}]
+            return 0,{"IWENCAI_API_KEY":api_key,"IWENCAI_API_KEYS":json.dumps(keys),"IWENCAI_BASE_URL":base_url,"IWENCAI_TIMEOUT_SECONDS":self._env.get("IWENCAI_TIMEOUT_SECONDS","5")}
+        value = row["value"] if isinstance(row, Mapping) else row[0]
+        version = row["version"] if isinstance(row, Mapping) else row[1]
+        if isinstance(value, str): value = json.loads(value)
+        if not isinstance(value, Mapping): raise ValueError("wencai.config is invalid")
+        api_key, base_url = str(value.get("api_key") or "").strip(), str(value.get("base_url") or "").strip()
+        api_keys=value.get("api_keys") or ([{"label":"default","key":api_key,"enabled":True,"priority":0}] if api_key else [])
+        if not isinstance(api_keys,list) or not any(isinstance(item,Mapping) and item.get("key") and item.get("enabled",True) for item in api_keys) or not base_url: raise ValueError("wencai.config is incomplete")
+        timeout = min(5.0, float(value.get("timeout_seconds") or 5))
+        return int(version), {"IWENCAI_API_KEY": api_key or str(api_keys[0]["key"]), "IWENCAI_API_KEYS": json.dumps(api_keys), "IWENCAI_BASE_URL": base_url, "IWENCAI_TIMEOUT_SECONDS": str(timeout)}
 
 
-class StaticDemandRepository:
-    def __init__(self, demand: MarketDemand) -> None:
-        self._demand = demand
-
-    async def get_demand(self) -> MarketDemand:
-        return self._demand
-
-
-class RedisDemandRepository:
-    def __init__(
-        self,
-        redis: Any,
-        *,
-        max_contexts: int = 1000,
-        scan_count: int = 100,
-        max_pages: int = 20,
-        timeout_seconds: float = 0.25,
-        max_context_bytes: int = 16_384,
-        max_watchlist_symbols: int = 100,
-        max_symbol_length: int = 32,
-    ) -> None:
-        if min(max_contexts, scan_count, max_pages, max_context_bytes, max_watchlist_symbols, max_symbol_length) <= 0 or timeout_seconds <= 0:
-            raise ValueError("Redis demand scan limits must be positive")
-        self._redis = redis
-        self._max_contexts = max_contexts
-        self._scan_count = scan_count
-        self._max_pages = max_pages
-        self._timeout_seconds = timeout_seconds
-        self._max_context_bytes = max_context_bytes
-        self._max_watchlist_symbols = max_watchlist_symbols
-        self._max_symbol_length = max_symbol_length
-
-    async def get_demand(self) -> MarketDemand:
-        cursor: int | str = 0
-        keys: list[str] = []
-        started = time.monotonic()
-        pages = 0
-        while True:
-            elapsed = time.monotonic() - started
-            if pages >= self._max_pages or elapsed >= self._timeout_seconds:
-                _LOG.warning(
-                    "market_data_demand_scan_truncated",
-                    extra={"event": "demand_scan_truncated", "reason": "page_budget" if pages >= self._max_pages else "time_budget", "pages": pages, "contexts": len(keys)},
-                )
-                break
-            try:
-                async with asyncio.timeout(self._timeout_seconds - elapsed):
-                    cursor, page = await self._redis.scan(
-                        cursor=cursor, match="market:sidebar:demand:*", count=self._scan_count
-                    )
-            except TimeoutError:
-                _LOG.warning(
-                    "market_data_demand_scan_truncated",
-                    extra={"event": "demand_scan_truncated", "reason": "time_budget", "pages": pages, "contexts": len(keys)},
-                )
-                break
-            pages += 1
-            remaining = self._max_contexts - len(keys)
-            keys.extend(page[:remaining])
-            if not cursor or len(keys) >= self._max_contexts:
-                if len(keys) >= self._max_contexts and cursor:
-                    _LOG.warning(
-                        "market_data_demand_scan_truncated",
-                        extra={"event": "demand_scan_truncated", "reason": "context_budget", "pages": pages, "contexts": len(keys)},
-                    )
-                break
-        if not keys:
-            return MarketDemand(())
-        records = await self._redis.mget(keys)
-        active: list[str] = []
-        watchlist: list[str] = []
-        for raw in records:
-            if isinstance(raw, bytes):
-                if len(raw) > self._max_context_bytes:
-                    self._log_context_truncation("record_size")
-                    continue
-                try:
-                    raw = raw.decode("utf-8")
-                except UnicodeDecodeError:
-                    continue
-            if not isinstance(raw, str) or len(raw.encode("utf-8")) > self._max_context_bytes:
-                self._log_context_truncation("record_size")
-                continue
-            try:
-                value = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(value, dict):
-                continue
-            chart_symbol = value.get("chart_symbol")
-            symbols = value.get("watchlist_symbols")
-            updated_at = value.get("updated_at")
-            if not isinstance(chart_symbol, str) or not 0 < len(chart_symbol) <= self._max_symbol_length or not chart_symbol.strip():
-                continue
-            if not isinstance(symbols, list):
-                continue
-            if len(symbols) > self._max_watchlist_symbols:
-                self._log_context_truncation("watchlist_budget")
-                symbols = symbols[:self._max_watchlist_symbols]
-            if not all(isinstance(symbol, str) and 0 < len(symbol) <= self._max_symbol_length and symbol.strip() for symbol in symbols):
-                continue
-            if not isinstance(updated_at, str) or not updated_at:
-                continue
-            active.append(chart_symbol)
-            watchlist.extend(symbols)
-        return MarketDemand(tuple(active), tuple(watchlist))
-
-    @staticmethod
-    def _log_context_truncation(reason: str) -> None:
-        _LOG.warning("market_data_demand_context_truncated", extra={"event": "demand_context_truncated", "reason": reason})
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeConfig:
-    interval_seconds: float = 5.0
-    timeout_seconds: float = 12.0
-    max_symbols: int = 200
-    max_provider_concurrency: int = 16
-    max_structured_symbols_per_refresh: int = 2
-
-    def __post_init__(self) -> None:
-        if min(
-            self.interval_seconds,
-            self.timeout_seconds,
-            self.max_symbols,
-            self.max_provider_concurrency,
-            self.max_structured_symbols_per_refresh,
-        ) <= 0:
-            raise ValueError("runtime intervals must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessConfig:
-    provider_factory: str
-    demand_factory: str | None
-    demand: MarketDemand | None
-    redis_url: str
-    runtime: RuntimeConfig
-    max_contexts: int
-    max_demand_scan_pages: int
-    demand_scan_timeout_seconds: float
-    max_demand_context_bytes: int
-    max_demand_watchlist_symbols: int
-    max_demand_symbol_length: int
-
-
-_TTLS = {"quote": 30, "profile": 86_400, "finance": 86_400, "fund": 600, "strength": 120, "news": 86_400}
-_NEWS_REFRESH_SUCCESS_SECONDS = 900.0
-_NEWS_REFRESH_FAILURE_SECONDS = 60.0
-_NEWS_REFRESH_AUTH_FAILURE_SECONDS = 3600.0
+def parse_sidebar_event(raw: Any) -> SidebarContext | None:
+    if isinstance(raw, bytes): raw = raw.decode("utf-8", errors="ignore")
+    if isinstance(raw, str):
+        try: raw = json.loads(raw)
+        except json.JSONDecodeError: return None
+    if not isinstance(raw, Mapping) or raw.get("type") not in _EVENT_TYPES: return None
+    chart_symbol = raw.get("chart_symbol")
+    symbols = raw.get("watchlist_symbols", [])
+    if not isinstance(chart_symbol, str) or not isinstance(symbols, list) or len(symbols) > _MAX_SYMBOLS: return None
+    if not chart_symbol or len(chart_symbol) > 32 or any(not isinstance(item, str) or not item or len(item) > 32 for item in symbols): return None
+    try:
+        epoch, revision = int(raw.get("chart_epoch", 0)), int(raw.get("watchlist_revision", 0))
+        return SidebarContext(chart_symbol.upper(), epoch, tuple(item.upper() for item in symbols), revision)
+    except (TypeError, ValueError): return None
 
 
 class MarketDataProviderRuntime:
-    def __init__(self, provider: UnifiedMarketDataProvider, demand_repository: DemandRepository, redis: Any, config: RuntimeConfig) -> None:
-        self._provider = provider
-        self._demand_repository = demand_repository
-        self._redis = redis
-        self._config = config
-        self._structured_cursor = 0
-        self._news_retry_at: dict[str, float] = {}
+    """Blocking Redis Pub/Sub consumer. Only received refresh events may call iWencai."""
+    def __init__(self, redis: Any, config_loader: Any, *, provider_factory: Callable[..., Any] = create_market_data_provider, env: Mapping[str, str] = os.environ, calendar: TradingCalendar | None = None) -> None:
+        self._redis, self._config_loader, self._provider_factory, self._env = redis, config_loader, provider_factory, dict(env)
+        self._calendar = calendar or WeekdayTradingCalendar()
+        self._version: int | None = None
+        self._coordinator: MarketDataCoordinator | None = None
 
-    async def refresh_once(self) -> bool:
-        try:
-            async with asyncio.timeout(self._config.timeout_seconds):
-                demand = await self._demand_repository.get_demand()
-                if not demand.active_symbols:
-                    return False
-                demand = self._bound_demand(demand)
-                symbols = tuple(dict.fromkeys((*demand.active_symbols, *demand.watchlist_symbols)))
-                structured_symbols = self._next_structured_symbols(demand.active_symbols)
-                monotonic_now = time.monotonic()
-                news_symbols = tuple(
-                    symbol for symbol in structured_symbols
-                    if monotonic_now >= self._news_retry_at.get(symbol, 0.0)
-                )
-                limiter = asyncio.Semaphore(self._config.max_provider_concurrency)
-                quotes, profiles, funds, strength, due_news_items = await asyncio.gather(
-                    self._limited(limiter, self._provider.get_quotes, symbols),
-                    self._bounded_map(structured_symbols, limiter, self._provider.get_profile),
-                    self._bounded_map(structured_symbols, limiter, self._provider.get_capital_flow),
-                    self._limited(limiter, self._provider.get_market_strength),
-                    self._bounded_map(news_symbols, limiter, self._provider.get_news),
-                )
-                news_by_symbol = dict(zip(news_symbols, due_news_items, strict=True))
-                for symbol, result in news_by_symbol.items():
-                    delay = (
-                        _NEWS_REFRESH_SUCCESS_SECONDS
-                        if _available(result)
-                        else _NEWS_REFRESH_AUTH_FAILURE_SECONDS
-                        if getattr(result, "error", None) == "authentication"
-                        else _NEWS_REFRESH_FAILURE_SECONDS
-                    )
-                    self._news_retry_at[symbol] = monotonic_now + delay
-                news_items = [news_by_symbol.get(symbol) for symbol in structured_symbols]
-                snapshots = self._build_snapshots(
-                    demand, structured_symbols, quotes, profiles, funds, strength, news_items
-                )
-                if not snapshots:
-                    return False
-                pipeline = self._redis.pipeline(transaction=True)
-                for key, domain, payload in snapshots:
-                    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=_json_default)
-                    pipeline.set(key, encoded, ex=_TTLS[domain])
-                    pipeline.publish(key, encoded)
-                await pipeline.execute()
-                return True
-        except Exception as exc:
-            _LOG.warning(
-                "market_data_refresh_failed",
-                extra={"event": "refresh_failed", "error_type": type(exc).__name__},
-            )
-            return False
+    async def handle_message(self, raw: Any) -> bool:
+        context = parse_sidebar_event(raw)
+        if context is None: return False
+        coordinator = await self._coordinator_for_current_config()
+        snapshot = await coordinator.load_context(context)
+        # API listeners only need a valid source-tagged notification; cache is the payload authority.
+        if coordinator.changed:
+            await self._redis.publish(UPDATE_CHANNEL, json.dumps({"source": "iwencai", "chart_symbol": context.chart_symbol, "chart_epoch": context.chart_epoch, "watchlist_revision": context.watchlist_revision}, separators=(",", ":")))
+        return snapshot is not None
 
-    def _bound_demand(self, demand: MarketDemand) -> MarketDemand:
-        symbols = tuple(dict.fromkeys((*demand.active_symbols, *demand.watchlist_symbols)))
-        if len(symbols) <= self._config.max_symbols:
-            return demand
-        retained = set(symbols[:self._config.max_symbols])
-        active = tuple(symbol for symbol in demand.active_symbols if symbol in retained)
-        watchlist = tuple(symbol for symbol in demand.watchlist_symbols if symbol in retained)
-        _LOG.warning(
-            "market_data_demand_truncated",
-            extra={"event": "demand_truncated", "requested_symbols": len(symbols), "retained_symbols": len(retained)},
-        )
-        return MarketDemand(active, watchlist)
+    async def listen(self, stop: asyncio.Event) -> None:
+        from redis.exceptions import TimeoutError as RedisTimeoutError
 
-    def _next_structured_symbols(self, symbols: tuple[str, ...]) -> tuple[str, ...]:
-        if len(symbols) <= self._config.max_structured_symbols_per_refresh:
-            self._structured_cursor = 0
-            return symbols
-        start = self._structured_cursor % len(symbols)
-        count = self._config.max_structured_symbols_per_refresh
-        selected = tuple(symbols[(start + offset) % len(symbols)] for offset in range(count))
-        self._structured_cursor = (start + count) % len(symbols)
-        return selected
-
-    async def _limited(self, limiter: asyncio.Semaphore, call, *args):
-        async with limiter:
-            return await call(*args)
-
-    async def _bounded_map(self, symbols, limiter: asyncio.Semaphore, call):
-        results: list[Any] = [None] * len(symbols)
-        next_index = 0
-
-        async def worker() -> None:
-            nonlocal next_index
-            while next_index < len(symbols):
-                index = next_index
-                next_index += 1
-                results[index] = await self._limited(limiter, call, symbols[index])
-
-        await asyncio.gather(*(worker() for _ in range(min(self._config.max_provider_concurrency, len(symbols)))))
-        return results
-
-    def _build_snapshots(self, demand, structured_symbols, quotes, profiles, funds, strength, news_items):
-        snapshots: list[tuple[str, str, dict[str, Any]]] = []
-        for symbol in tuple(dict.fromkeys((*demand.active_symbols, *demand.watchlist_symbols))):
-            result = quotes.get(symbol)
-            if _available(result):
-                snapshots.append((f"market:quote:{symbol}", "quote", _result_payload(result)))
-        for symbol, profile, fund, news in zip(structured_symbols, profiles, funds, news_items, strict=True):
-            if _available(profile):
-                base = _result_payload(profile)
-                identity = {key: value for key, value in base.items() if key not in {"market_cap", "pe_ratio", "pb_ratio", "turnover_rate"}}
-                finance = {key: base.get(key) for key in ("symbol", "market_cap", "pe_ratio", "pb_ratio", "turnover_rate")}
-                finance.update(_metadata_payload(profile))
-                snapshots.extend(((f"market:profile:{symbol}", "profile", identity), (f"market:finance:{symbol}", "finance", finance)))
-            if _available(fund):
-                snapshots.append((f"market:fund:{symbol}", "fund", _result_payload(fund)))
-            if _available(news):
-                payload = _metadata_payload(news)
-                payload["items"] = [_to_json(item) for item in news.value]
-                snapshots.append((f"market:news:{symbol}", "news", payload))
-        if _available(strength):
-            snapshots.append(("market:strength:latest", "strength", _result_payload(strength)))
-        return snapshots
-
-    async def run(self, stop: asyncio.Event) -> None:
+        group,consumer="iwencai-sidebar","collector"
+        try: await self._redis.xgroup_create(REFRESH_STREAM,group,id="0",mkstream=True)
+        except Exception: pass
+        await self._replay_pending(group, consumer)
+        last_claim = 0.0
         while not stop.is_set():
-            await self.refresh_once()
-            if stop.is_set():
-                break
             try:
-                await asyncio.wait_for(stop.wait(), timeout=self._config.interval_seconds)
-            except TimeoutError:
-                pass
+                if time.monotonic() - last_claim >= _PENDING_CLAIM_INTERVAL_SECONDS:
+                    await self._claim_pending(group, consumer)
+                    last_claim = time.monotonic()
+                entries=await self._redis.xreadgroup(group,consumer,{REFRESH_STREAM:">"},count=1,block=4000)
+            except RedisTimeoutError:
+                continue
+            for _,messages in entries:
+                await self._process_stream_messages(group, messages)
+
+    async def _replay_pending(self, group: str, consumer: str) -> None:
+        """Retry this consumer's unacknowledged work before accepting new entries."""
+        while True:
+            try:
+                entries = await self._redis.xreadgroup(
+                    group, consumer, {REFRESH_STREAM: "0"}, count=_PENDING_BATCH_SIZE
+                )
+            except Exception:
+                logger.exception("Redis Stream pending replay failed", extra={"stream": REFRESH_STREAM, "group": group})
+                return
+            if not entries:
+                return
+            acknowledged = 0
+            for _, messages in entries:
+                acknowledged += await self._process_stream_messages(group, messages)
+            if not acknowledged:
+                return
+
+    async def _claim_pending(self, group: str, consumer: str) -> None:
+        """Claim abandoned entries from another worker after a bounded idle period."""
+        start_id = "0-0"
+        while True:
+            try:
+                next_id, messages, _ = await self._redis.xautoclaim(
+                    REFRESH_STREAM,
+                    group,
+                    consumer,
+                    _PENDING_MIN_IDLE_MS,
+                    start_id,
+                    count=_PENDING_BATCH_SIZE,
+                )
+            except Exception:
+                logger.exception("Redis Stream pending claim failed", extra={"stream": REFRESH_STREAM, "group": group})
+                return
+            await self._process_stream_messages(group, messages)
+            if next_id == "0-0" or next_id == start_id:
+                return
+            start_id = next_id
+
+    async def _process_stream_messages(self, group: str, messages: list[tuple[Any, Mapping[Any, Any]]]) -> int:
+        acknowledged = 0
+        for message_id, fields in messages:
+            raw = _stream_payload(fields)
+            try:
+                processed = await self.handle_message(raw)
+                if not processed:
+                    logger.error("Redis Stream message was not processed; leaving pending", extra={"stream": REFRESH_STREAM, "group": group, "message_id": message_id})
+                    continue
+                await self._redis.xack(REFRESH_STREAM, group, message_id)
+                acknowledged += 1
+            except Exception:
+                logger.exception("Redis Stream message processing failed; leaving pending", extra={"stream": REFRESH_STREAM, "group": group, "message_id": message_id})
+        return acknowledged
+
+    async def _coordinator_for_current_config(self) -> MarketDataCoordinator:
+        version, config = await self._config_loader.load()
+        if self._coordinator is None or self._version != version:
+            provider = self._provider_factory(env={**self._env, **config})
+            self._coordinator = MarketDataCoordinator(provider, cache=RedisTradingDayCache(self._redis), calendar=self._calendar)
+            self._version = version
+        return self._coordinator
 
 
-def config_from_env(env: Mapping[str, str] = os.environ) -> ProcessConfig:
-    provider_factory = env.get("MARKET_DATA_PROVIDER_FACTORY", "").strip()
-    if not provider_factory:
-        raise ValueError("MARKET_DATA_PROVIDER_FACTORY is required")
-    demand_factory = env.get("MARKET_DATA_DEMAND_REPOSITORY_FACTORY", "").strip() or None
-    active = env.get("MARKET_DATA_ACTIVE_SYMBOL", "").strip()
-    demand = None
-    if active:
-        watchlist = tuple(value.strip() for value in env.get("MARKET_DATA_WATCHLIST", "").split(",") if value.strip())
-        demand = MarketDemand((active,), watchlist)
-    max_contexts = int(env.get("MARKET_DATA_MAX_CONTEXTS", "1000"))
-    if max_contexts <= 0:
-        raise ValueError("MARKET_DATA_MAX_CONTEXTS must be positive")
-    max_demand_scan_pages = int(env.get("MARKET_DATA_MAX_DEMAND_SCAN_PAGES", "20"))
-    demand_scan_timeout_seconds = float(env.get("MARKET_DATA_DEMAND_SCAN_TIMEOUT_SECONDS", "0.25"))
-    if max_demand_scan_pages <= 0 or demand_scan_timeout_seconds <= 0:
-        raise ValueError("MARKET_DATA demand scan limits must be positive")
-    max_demand_context_bytes = int(env.get("MARKET_DATA_MAX_DEMAND_CONTEXT_BYTES", "16384"))
-    max_demand_watchlist_symbols = int(env.get("MARKET_DATA_MAX_DEMAND_WATCHLIST_SYMBOLS", "100"))
-    max_demand_symbol_length = int(env.get("MARKET_DATA_MAX_DEMAND_SYMBOL_LENGTH", "32"))
-    if min(max_demand_context_bytes, max_demand_watchlist_symbols, max_demand_symbol_length) <= 0:
-        raise ValueError("MARKET_DATA demand record limits must be positive")
-    return ProcessConfig(
-        provider_factory, demand_factory, demand,
-        env.get("REDIS_URL", "redis://127.0.0.1:6379/0"),
-        RuntimeConfig(
-            float(env.get("MARKET_DATA_INTERVAL_SECONDS", "5")),
-            float(env.get("MARKET_DATA_TIMEOUT_SECONDS", "12")),
-            int(env.get("MARKET_DATA_MAX_SYMBOLS", "200")),
-            int(env.get("MARKET_DATA_MAX_PROVIDER_CONCURRENCY", "16")),
-            int(env.get("MARKET_DATA_MAX_STRUCTURED_SYMBOLS_PER_REFRESH", "2")),
-        ),
-        max_contexts,
-        max_demand_scan_pages,
-        demand_scan_timeout_seconds,
-        max_demand_context_bytes,
-        max_demand_watchlist_symbols,
-        max_demand_symbol_length,
-    )
-
-
-def _load_factory(path: str):
-    module_name, separator, name = path.partition(":")
-    if not separator or not module_name or not name:
-        raise ValueError("factory must use module:callable syntax")
-    factory = getattr(importlib.import_module(module_name), name)
-    if not callable(factory):
-        raise TypeError("configured factory is not callable")
-    return factory
+def _stream_payload(fields: Mapping[Any, Any]) -> Any:
+    """Accept redis-py clients configured with bytes or decoded response fields."""
+    return fields.get("payload") or fields.get("data") or fields.get(b"payload") or fields.get(b"data")
 
 
 async def _main() -> None:
-    config = config_from_env()
-    provider = _load_factory(config.provider_factory)()
+    import asyncpg
     import redis.asyncio as redis
-    client = redis.from_url(config.redis_url, decode_responses=True)
-    if config.demand_factory:
-        repository = _load_factory(config.demand_factory)()
-    elif config.demand:
-        repository = StaticDemandRepository(config.demand)
-    else:
-        repository = RedisDemandRepository(
-            client,
-            max_contexts=config.max_contexts,
-            max_pages=config.max_demand_scan_pages,
-            timeout_seconds=config.demand_scan_timeout_seconds,
-            max_context_bytes=config.max_demand_context_bytes,
-            max_watchlist_symbols=config.max_demand_watchlist_symbols,
-            max_symbol_length=config.max_demand_symbol_length,
-        )
+    redis_client = redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
+    pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for name in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(name, stop.set)
-        except NotImplementedError:
-            signal.signal(name, lambda *_: loop.call_soon_threadsafe(stop.set))
-    try:
-        await MarketDataProviderRuntime(provider, repository, client, config.runtime).run(stop)
+        try: loop.add_signal_handler(name, stop.set)
+        except NotImplementedError: signal.signal(name, lambda *_: loop.call_soon_threadsafe(stop.set))
+    try: await MarketDataProviderRuntime(redis_client, PostgresWencaiConfigLoader(pool)).listen(stop)
     finally:
-        close = getattr(provider, "close", None)
-        if close:
-            result = close()
-            if asyncio.iscoroutine(result):
-                await result
-        await client.aclose()
+        await redis_client.aclose(); await pool.close()
 
 
-def _available(result: MarketDataResult[Any] | None) -> bool:
-    return result is not None and result.value is not None
+async def main(argv: list[str] | None = None) -> None:
+    if argv: raise ValueError("iwencai-sidebar-events accepts no arguments")
+    await _main()
 
 
-def _metadata_payload(result: MarketDataResult[Any]) -> dict[str, Any]:
-    metadata = result.metadata
-    return {"source": metadata.source, "provider_version": metadata.provider_version, "provider_ts": metadata.provider_ts, "received_at": metadata.received_at, "freshness": metadata.freshness, "error": result.error}
-
-
-def _result_payload(result: MarketDataResult[Any]) -> dict[str, Any]:
-    payload = _to_json(result.value)
-    payload.update(_metadata_payload(result))
-    return payload
-
-
-def _to_json(value: Any) -> Any:
-    return asdict(value) if is_dataclass(value) else value
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, (datetime, Enum)):
-        return value.isoformat() if isinstance(value, datetime) else value.value
-    raise TypeError(f"unsupported JSON value: {type(value).__name__}")
-
-
-if __name__ == "__main__":
-    asyncio.run(_main())
+if __name__ == "__main__": asyncio.run(main())

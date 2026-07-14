@@ -1,7 +1,80 @@
 import { apiUrl } from "../config";
 import { chartDataManager, type RealtimeSidebarContext } from "./chartDataManager";
-import type { MarketQuote, SymbolProfile } from "./marketData";
 import type { NewsItem, StockNewsFeed } from "./marketContracts";
+
+export type SidebarFreshness = "fresh" | "stale" | "unavailable";
+
+export type ExternalSidebarSource = "iwencai" | "notte";
+
+export type ExternalMetadata = {
+  source: ExternalSidebarSource;
+  freshness: SidebarFreshness;
+  asOf: string;
+  tradingDate: string;
+};
+
+export type SidebarStatus = {
+  state: "ready" | "unavailable" | "error";
+  message?: string;
+};
+
+export type MarketQuote = ExternalMetadata & {
+  symbol: string;
+  name: string;
+  exchange: string;
+  price: number | null;
+  previousClose: number | null;
+  change: number | null;
+  changePercent: number | null;
+  volume: number | null;
+  amount: number | null;
+  time: number | null;
+};
+
+export type ProfileTheme = {
+  name: string;
+  changePercent: number | null;
+};
+
+export type ChanStrokeState = {
+  level: "1d" | "30f" | "5f";
+  label: string;
+  direction: "up" | "down" | "unknown";
+  stateLabel: string;
+  mode: "confirmed" | "predictive" | null;
+  modeLabel: string;
+  confirmed: boolean | null;
+  anchorTime: number | null;
+  anchorPrice: number | null;
+};
+
+export type StrategySignal = {
+  key: string;
+  label: string;
+  value: string;
+  tone: "up" | "down" | "neutral";
+  source: "local_db";
+};
+
+export type SymbolProfile = ExternalMetadata & {
+  symbol: string;
+  name: string;
+  exchange: string;
+  code: string;
+  assetType: string;
+  latestPrice: number | null;
+  dayChangePercent: number | null;
+  volume: number | null;
+  amount: number | null;
+  sector: ProfileTheme | null;
+  concepts: ProfileTheme[];
+  marketCap: number | null;
+  peRatio: number | null;
+  turnoverRate: number | null;
+  fundFlow: { net: number | null; main: number | null; retail: number | null };
+  chanStrokeStates: ChanStrokeState[];
+  strategySignals: StrategySignal[];
+};
 
 export type SidebarContext = {
   chartSymbol: string;
@@ -17,6 +90,7 @@ export type MarketSidebarSnapshot = {
   profileBySymbol: Record<string, SymbolProfile>;
   newsBySymbol: Record<string, StockNewsFeed>;
   strength?: MarketStrengthSnapshot;
+  status: SidebarStatus;
   snapshotVersion: number;
   sequence: number;
 };
@@ -24,6 +98,7 @@ export type MarketSidebarSnapshot = {
 export type MarketSidebarEvent =
   | (MarketSidebarEventContext & { type: "watchlist_quote_delta"; quotes: MarketQuote[] })
   | (MarketSidebarEventContext & { type: "active_profile_delta"; profile: SymbolProfile })
+  | (MarketSidebarEventContext & { type: "chan_strategy_delta"; symbol: string; chanStrokeStates: ChanStrokeState[]; strategySignals: StrategySignal[] })
   | (MarketSidebarEventContext & { type: "news_delta"; feed: StockNewsFeed })
   | (MarketSidebarEventContext & { type: "strength_delta"; strength: MarketStrengthSnapshot })
   | (MarketSidebarEventContext & { type: "sidebar_resync_required"; snapshot: MarketSidebarSnapshot });
@@ -43,8 +118,10 @@ export type MarketStrengthSnapshot = {
   score: number | null;
   leaders: Array<{ name: string; changePercent: number | null }>;
   themes: Array<{ name: string; changePercent: number | null; mainNetInflowWan: number | null }>;
-  source: string;
-  freshness: "live" | "delayed" | "stale" | "unavailable";
+  source: ExternalSidebarSource;
+  freshness: SidebarFreshness;
+  asOf: string;
+  tradingDate: string;
 };
 
 export interface MarketSidebarTransport {
@@ -70,13 +147,24 @@ export function createHttpMarketSidebarTransport(token: string): MarketSidebarTr
       watchlistId: context.watchlistId,
       watchlistRevision: context.watchlistRevision,
       watchlistSymbols: context.watchlistSymbols,
-      channels: ["watchlist_quotes", "active_profile", "strength", "news"],
+      channels: ["watchlist_quotes", "active_profile", "strength", "news", "chan_strategy"],
       afterSequence: cursor.epoch === context.chartEpoch ? cursor.sequence : 0,
       snapshotVersion: cursor.epoch === context.chartEpoch ? cursor.snapshotVersion : 0,
     };
   };
 
   const receive = (event: unknown) => {
+    const eventType = event && typeof event === "object"
+      ? optionalString((event as { type?: unknown }).type)
+      : undefined;
+    if (!eventType || ![
+      "watchlist_quote_delta",
+      "active_profile_delta",
+      "strength_delta",
+      "news_delta",
+      "chan_strategy_delta",
+      "sidebar_resync_required",
+    ].includes(eventType)) return;
     if (listener(event) && event && typeof event === "object" && context) {
       const wire = event as { sequence?: unknown; snapshot_version?: unknown; chart_epoch?: unknown };
       const streamId = optionalString((wire as { stream_id?: unknown }).stream_id);
@@ -173,6 +261,7 @@ export function parseMarketSidebarBootstrap(value: unknown): MarketSidebarSnapsh
     profileBySymbol: { [chartSymbol]: profile },
     newsBySymbol,
     strength: parseStrength(root.strongest_preview),
+    status: { state: "ready" },
     snapshotVersion: integer(root.snapshot_version, "snapshot_version"),
     sequence: integer(root.sequence, "sequence"),
   };
@@ -196,6 +285,17 @@ export function parseMarketSidebarEvent(value: unknown): MarketSidebarEvent {
   }
   if (type === "strength_delta") return { type, ...eventContext, strength: parseStrength(root.strength) };
   if (type === "active_profile_delta") return { type, ...eventContext, profile: parseProfile(root.profile) };
+  if (type === "chan_strategy_delta") {
+    const profile = record(root.profile, "event.profile");
+    const symbol = string(profile.symbol, "event.profile.symbol").toUpperCase();
+    return {
+      type,
+      ...eventContext,
+      symbol,
+      chanStrokeStates: parseLocalChanState(profile.chan_state),
+      strategySignals: parseLocalStrategySignals(profile.strategy_signals),
+    };
+  }
   if (type === "news_delta") return { type, ...eventContext, feed: parseNews(root.news, chartSymbol, chartEpoch) };
   if (type === "sidebar_resync_required") {
     const snapshot = parseMarketSidebarBootstrap(root.snapshot);
@@ -218,8 +318,8 @@ function parseQuote(value: unknown, symbolHint?: string): MarketQuote {
   const item = record(value, "quote");
   const symbol = optionalString(item.symbol) ?? symbolHint?.toUpperCase();
   if (!symbol) throw new Error("quote.symbol must be a string when no map key is available");
-  const unavailable = item.freshness === "unavailable";
   return {
+    ...parseExternalMetadata(item, "quote"),
     symbol,
     name: optionalString(item.name) ?? symbol,
     exchange: optionalString(item.exchange) ?? inferExchange(symbol),
@@ -230,7 +330,6 @@ function parseQuote(value: unknown, symbolHint?: string): MarketQuote {
     volume: readNullableNumber(item.volume, "quote.volume"),
     amount: readNullableNumber(item.amount, "quote.amount"),
     time: readNullableNumber(item.time, "quote.time"),
-    source: unavailable ? "placeholder" : "bundle-adapter",
   };
 }
 
@@ -244,6 +343,7 @@ function parseProfile(value: unknown): SymbolProfile {
   const themes = Array.isArray(item.themes) ? item.themes.map(parseTheme).filter((theme): theme is { name: string; changePercent: number | null } => theme !== null) : [];
   const industry = optionalString(identity.industry);
   return {
+    ...parseExternalMetadata(item, "profile"),
     symbol,
     name: optionalString(identity.name) ?? quote.name,
     exchange: optionalString(identity.exchange) ?? quote.exchange,
@@ -263,24 +363,18 @@ function parseProfile(value: unknown): SymbolProfile {
       main: readNullableNumber(capitalFlow.main_net_inflow, "profile.capital_flow.main_net_inflow"),
       retail: readNullableNumber(capitalFlow.small_net_inflow, "profile.capital_flow.small_net_inflow"),
     },
-    chanStrokeStates: [],
-    strategySignals: Array.isArray(item.strategy_signals) ? item.strategy_signals as SymbolProfile["strategySignals"] : [],
-    dataSource: `${optionalString(identity.source) ?? "normalized_snapshot"}/${optionalString(identity.freshness) ?? "unavailable"}`,
+    chanStrokeStates: parseLocalChanState(item.chan_state),
+    strategySignals: parseLocalStrategySignals(item.strategy_signals),
   };
 }
 
 function parseStrength(value: unknown): MarketStrengthSnapshot {
   const item = record(value, "strength");
-  const freshness = optionalString(item.freshness) ?? "unavailable";
-  if (freshness !== "live" && freshness !== "delayed" && freshness !== "stale" && freshness !== "unavailable") {
-    throw new Error("strength.freshness is invalid");
-  }
   return {
     score: readNullableNumber(item.score, "strength.score"),
     leaders: parseStrengthLeaders(item),
     themes: parseStrengthThemes(item),
-    source: optionalString(item.source) ?? "normalized_snapshot",
-    freshness,
+    ...parseExternalMetadata(item, "strength"),
   };
 }
 
@@ -313,8 +407,8 @@ function parseStrengthThemes(item: Record<string, unknown>): MarketStrengthSnaps
 
 function parseNews(value: unknown, symbol: string, epoch: number): StockNewsFeed {
   const item = record(value, "news");
-  const itemSymbol = string(item.symbol, "news.symbol").toUpperCase();
-  if (itemSymbol !== symbol || integer(item.chart_epoch, "news.chart_epoch") !== epoch) throw new Error("news context mismatch");
+  const itemSymbol = optionalString(item.symbol)?.toUpperCase();
+  if ((itemSymbol && itemSymbol !== symbol) || (item.chart_epoch !== undefined && integer(item.chart_epoch, "news.chart_epoch") !== epoch)) throw new Error("news context mismatch");
   if (!Array.isArray(item.items)) throw new Error("news.items must be an array");
   const items = item.items.map((value, index): NewsItem => {
     const news = record(value, `news.items[${index}]`);
@@ -342,8 +436,66 @@ function parseNews(value: unknown, symbol: string, epoch: number): StockNewsFeed
       ...(relatedSymbols.length > 0 ? { relatedSymbols } : {}),
     };
   });
-  const status = optionalString(item.status) ?? "unavailable";
-  return { symbol, source: optionalString(item.source) ?? "iwencai_news_search", asOf: optionalString(item.as_of) ?? "", stale: status === "stale" || status === "unavailable", warnings: status === "unavailable" ? ["news unavailable"] : undefined, stockNews: items, globalNews: [] };
+  const metadata = parseExternalMetadata(item, "news");
+  return { symbol, source: metadata.source, asOf: metadata.asOf ?? "", stale: metadata.freshness !== "fresh", warnings: metadata.freshness === "unavailable" ? ["news unavailable"] : undefined, stockNews: items, globalNews: [] };
+}
+
+function parseExternalMetadata(value: Record<string, unknown>, label: string): ExternalMetadata {
+  if (value.source !== "iwencai" && value.source !== "notte") throw new Error(`${label}.source must be iwencai or notte`);
+  const freshness = string(value.freshness, `${label}.freshness`);
+  if (freshness !== "fresh" && freshness !== "stale" && freshness !== "unavailable") {
+    throw new Error(`${label}.freshness is invalid`);
+  }
+  return {
+    source: value.source,
+    freshness,
+    asOf: string(value.as_of ?? value.asOf, `${label}.as_of`),
+    tradingDate: string(value.trading_date ?? value.tradingDate, `${label}.trading_date`),
+  };
+}
+
+function parseLocalChanState(value: unknown): ChanStrokeState[] {
+  const item = record(value, "profile.chan_state");
+  if (item.source !== "local_db") throw new Error("profile.chan_state.source must be local_db");
+  if (!Array.isArray(item.stroke_states)) throw new Error("profile.chan_state.stroke_states must be an array");
+  return item.stroke_states.map((value, index) => {
+    const state = record(value, `profile.chan_state.stroke_states[${index}]`);
+    const level = string(state.level, `profile.chan_state.stroke_states[${index}].level`);
+    if (level !== "1d" && level !== "30f" && level !== "5f") throw new Error("profile.chan_state level is invalid");
+    const direction = string(state.direction, `profile.chan_state.stroke_states[${index}].direction`);
+    if (direction !== "up" && direction !== "down" && direction !== "unknown") throw new Error("profile.chan_state direction is invalid");
+    const modeValue = state.mode;
+    const mode = modeValue === null ? null : string(modeValue, `profile.chan_state.stroke_states[${index}].mode`);
+    if (mode !== null && mode !== "confirmed" && mode !== "predictive") throw new Error("profile.chan_state mode is invalid");
+    return {
+      level,
+      label: string(state.label, `profile.chan_state.stroke_states[${index}].label`),
+      direction,
+      stateLabel: string(state.state_label ?? state.stateLabel, `profile.chan_state.stroke_states[${index}].state_label`),
+      mode,
+      modeLabel: string(state.mode_label ?? state.modeLabel, `profile.chan_state.stroke_states[${index}].mode_label`),
+      confirmed: readNullableBoolean(state.confirmed, `profile.chan_state.stroke_states[${index}].confirmed`),
+      anchorTime: readNullableInteger(state.anchor_time ?? state.anchorTime, `profile.chan_state.stroke_states[${index}].anchor_time`),
+      anchorPrice: readNullableNumber(state.anchor_price ?? state.anchorPrice, `profile.chan_state.stroke_states[${index}].anchor_price`),
+    };
+  });
+}
+
+function parseLocalStrategySignals(value: unknown): StrategySignal[] {
+  if (!Array.isArray(value)) throw new Error("profile.strategy_signals must be an array");
+  return value.map((signal, index) => {
+    const item = record(signal, `profile.strategy_signals[${index}]`);
+    if (item.source !== "local_db") throw new Error("profile.strategy_signals.source must be local_db");
+    const tone = string(item.tone, `profile.strategy_signals[${index}].tone`);
+    if (tone !== "up" && tone !== "down" && tone !== "neutral") throw new Error("profile.strategy_signals.tone is invalid");
+    return {
+      key: string(item.key, `profile.strategy_signals[${index}].key`),
+      label: string(item.label, `profile.strategy_signals[${index}].label`),
+      value: string(item.value, `profile.strategy_signals[${index}].value`),
+      tone,
+      source: "local_db",
+    };
+  });
 }
 
 function parseTheme(value: unknown): { name: string; changePercent: number | null } | null {
@@ -377,6 +529,15 @@ function integer(value: unknown, label: string): number {
 function readNullableNumber(value: unknown, label: string): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${label} must be a finite number or null`);
+  return value;
+}
+function readNullableInteger(value: unknown, label: string): number | null {
+  if (value === null || value === undefined) return null;
+  return integer(value, label);
+}
+function readNullableBoolean(value: unknown, label: string): boolean | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean or null`);
   return value;
 }
 function optionalString(value: unknown): string | undefined {

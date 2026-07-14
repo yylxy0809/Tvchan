@@ -15,7 +15,7 @@ from app.repositories.chan_screener import (
 from app.repositories import runtime_config as runtime_config_repository
 from app.services.llm_config import WENCAI_CONFIG_KEY, resolve_active_llm_provider
 from app.services.llm_client import parse_chan_query_with_llm
-from app.services.wencai_client import WencaiConfig, WencaiConfigError, WencaiUpstreamError, query_wencai
+from app.services.wencai_client import WencaiApiKey, WencaiConfig, WencaiConfigError, WencaiUpstreamError, query_wencai
 
 router = APIRouter(prefix="/screener", tags=["screener"], dependencies=[Depends(require_token)])
 
@@ -115,11 +115,13 @@ async def _load_wencai_config(pool, *, settings: Settings) -> WencaiConfig:
             value = row["value"]
             return WencaiConfig(
                 base_url=str(value.get("base_url") or settings.iwencai_base_url),
-                api_key=str(value.get("api_key") or settings.iwencai_api_key),
+                api_key=str(value.get("api_key") or ""),
                 cookie=str(value.get("cookie") or ""),
                 user_agent=str(value.get("user_agent") or "") or None,
                 pro=bool(value.get("pro", False)),
                 timeout_seconds=float(value.get("timeout_seconds") or 20),
+                allowed_hosts=settings.iwencai_allowed_hosts,
+                api_keys=_runtime_api_keys(value),
             )
     return WencaiConfig(
         base_url=settings.iwencai_base_url,
@@ -128,6 +130,23 @@ async def _load_wencai_config(pool, *, settings: Settings) -> WencaiConfig:
         user_agent=settings.wencai_user_agent or None,
         pro=settings.wencai_pro,
         timeout_seconds=settings.wencai_timeout_seconds,
+        allowed_hosts=settings.iwencai_allowed_hosts,
+    )
+
+
+def _runtime_api_keys(value: dict) -> tuple[WencaiApiKey, ...]:
+    raw = value.get("api_keys")
+    if not isinstance(raw, list):
+        return ()
+    return tuple(
+        WencaiApiKey(
+            label=str(item.get("label") or "default"),
+            key=str(item.get("key") or ""),
+            enabled=bool(item.get("enabled", True)),
+            priority=int(item.get("priority", 0)),
+        )
+        for item in raw
+        if isinstance(item, dict)
     )
 
 

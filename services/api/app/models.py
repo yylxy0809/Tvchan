@@ -255,6 +255,13 @@ class RuntimeConfigUpdateRequest(BaseModel):
     value: Any
 
 
+class WencaiApiKeyConfig(BaseModel):
+    label: str = Field(default="default", min_length=1, max_length=128)
+    key: str = ""
+    enabled: bool = True
+    priority: int = 0
+
+
 class WencaiConfigResponse(BaseModel):
     base_url: str = "https://openapi.iwencai.com"
     api_key: str = ""
@@ -262,6 +269,8 @@ class WencaiConfigResponse(BaseModel):
     user_agent: str | None = None
     pro: bool = False
     timeout_seconds: float = 20
+    config_version: int = 0
+    api_keys: list[WencaiApiKeyConfig] = Field(default_factory=list)
 
 
 class WencaiConfigUpdateRequest(BaseModel):
@@ -271,6 +280,7 @@ class WencaiConfigUpdateRequest(BaseModel):
     user_agent: str | None = None
     pro: bool = False
     timeout_seconds: float = 20
+    api_keys: list[WencaiApiKeyConfig] | None = None
 
 
 class ConnectivityTestResponse(BaseModel):
@@ -278,6 +288,9 @@ class ConnectivityTestResponse(BaseModel):
     latency_ms: int
     message: str
     sample_count: int = 0
+    capability: str = "screener"
+    source: str = "iwencai"
+    error_class: str | None = None
 
 
 class LlmProviderResponse(BaseModel):

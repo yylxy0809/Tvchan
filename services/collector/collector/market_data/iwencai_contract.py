@@ -1,124 +1,61 @@
 from __future__ import annotations
-
-import re
-import secrets
-import math
-from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Mapping
+import math, secrets
+from collections.abc import Mapping
+from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
-if TYPE_CHECKING:
-    from .iwencai import NewsRequest
+QUERY_PATH = "/v1/query2data"
+NEWS_PATH = "/v1/comprehensive/search"
+MAX_ROWS = 500
+MAX_TEXT = 2048
+CAPABILITIES = frozenset({"hithink-market-query", "hithink-business-query", "hithink-finance-query", "hithink-industry-query", "hithink-sector-selector", "hithink-astock-selector", "hithink-zhishu-query", "news-search"})
 
+class SchemaError(ValueError): pass
 
-SEARCH_PATH = "/v1/comprehensive/search"
-DEFAULT_RESULT_SIZE = 50
-_TRACE_ID = re.compile(r"^[0-9a-f]{64}$")
-_CHINA_TIMEZONE = timezone(timedelta(hours=8))
+def build_endpoint(base_url: str, allowed_hosts: tuple[str, ...], *, news: bool = False) -> str:
+    parsed = urlsplit(base_url); host = parsed.hostname.lower() if parsed.hostname else None
+    if parsed.scheme != "https" or not host or parsed.username or parsed.password or parsed.port not in (None,443) or parsed.query or parsed.fragment or parsed.path not in ("","/") or host not in allowed_hosts: raise ValueError("Iwencai base URL must be an allowed HTTPS origin")
+    return urlunsplit(("https", parsed.netloc, NEWS_PATH if news else QUERY_PATH, "", ""))
 
+def build_request(query: str, api_key: str, capability: str, *, limit: int = 50) -> dict[str,object]:
+    if capability not in CAPABILITIES or not query or len(query)>MAX_TEXT or not 0<limit<=MAX_ROWS: raise ValueError("invalid Iwencai request")
+    headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","X-Claw-Call-Type":"normal","X-Claw-Skill-Id":capability,"X-Claw-Skill-Version":"1.0.0","X-Claw-Plugin-Id":"none","X-Claw-Plugin-Version":"none","X-Claw-Trace-Id":secrets.token_hex(32)}
+    body={"query":query,"channels":["news"],"app_id":"AIME_SKILL","size":limit} if capability=="news-search" else {"query":query,"page":"1","limit":str(limit),"is_cache":"1","expand_index":"true"}
+    return {"method":"POST","headers":headers,"json":body}
 
-class SchemaError(ValueError):
-    pass
+def parse_rows(payload: object, *, news: bool = False) -> tuple[dict[str,object],...]:
+    if not isinstance(payload,Mapping): raise SchemaError("invalid Iwencai response")
+    rows = payload.get("data") if news else payload.get("datas")
+    if news and payload.get("status_code") != 0: raise SchemaError("invalid news response")
+    if not isinstance(rows,list) or len(rows)>MAX_ROWS: raise SchemaError("invalid Iwencai rows")
+    if any(not isinstance(row,Mapping) for row in rows):raise SchemaError("invalid Iwencai row")
+    return tuple({str(k):_safe(v) for k,v in row.items() if isinstance(k,str) and len(k)<=100} for row in rows)
 
+def number(row: Mapping[str,object], *keys:str)->float|None:
+    value=_field(row,keys)
+    if isinstance(value,str): value=value.strip().replace(",","").rstrip("%")
+    try: result=float(value)
+    except (TypeError,ValueError): return None
+    return result if math.isfinite(result) else None
+def text(row: Mapping[str,object], *keys:str)->str|None:
+    value=_field(row,keys); return value.strip() if isinstance(value,str) and value.strip() and len(value)<=MAX_TEXT else None
+def provider_timestamp(row:Mapping[str,object])->datetime|None:
+    value=text(row,"as_of","更新时间","时间","publish_time")
+    if not value:return None
+    try: parsed=datetime.fromisoformat(value.replace("Z","+00:00"))
+    except ValueError:return None
+    return parsed if parsed.tzinfo else None
+def _field(row,keys): return next((row[k] for k in keys if k in row),None)
+def _safe(value):
+    if value is None or isinstance(value,(bool,int)): return value
+    if isinstance(value,float):
+        if not math.isfinite(value): raise SchemaError("non-finite number")
+        return value
+    if isinstance(value,str) and len(value)<=MAX_TEXT and "\x00" not in value:return value
+    if isinstance(value,Mapping): return {str(k):_safe(v) for k,v in value.items() if isinstance(k,str)}
+    if isinstance(value,list) and len(value)<=100:return [_safe(v) for v in value]
+    raise SchemaError("invalid field")
 
-def build_search_endpoint(base_url: str, allowed_hosts: tuple[str, ...]) -> str:
-    parsed = urlsplit(base_url)
-    try:
-        host = parsed.hostname.lower() if parsed.hostname else None
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("Iwencai base URL must be an allowed HTTPS origin") from exc
-    if (
-        parsed.scheme.lower() != "https"
-        or host is None
-        or parsed.username
-        or parsed.password
-        or port not in (None, 443)
-        or parsed.query
-        or parsed.fragment
-        or parsed.path not in ("", "/")
-        or host not in allowed_hosts
-    ):
-        raise ValueError("Iwencai base URL must be an allowed HTTPS origin")
-    return urlunsplit(("https", parsed.netloc, SEARCH_PATH, "", ""))
-
-
-def build_search_request(request: NewsRequest, api_key: str) -> Mapping[str, object]:
-    trace_id = secrets.token_hex(32)
-    if not _TRACE_ID.fullmatch(trace_id):  # pragma: no cover - guards a security invariant.
-        raise RuntimeError("failed to generate Iwencai trace id")
-    return {
-        "method": "POST",
-        "headers": {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "X-Claw-Call-Type": "fresh",
-            "X-Claw-Skill-Id": "news-search",
-            "X-Claw-Skill-Version": "2.0.0",
-            "X-Claw-Plugin-Id": "none",
-            "X-Claw-Plugin-Version": "none",
-            "X-Claw-Trace-Id": trace_id,
-        },
-        "json": {
-            "query": request.query,
-            "channels": ["news"],
-            "app_id": "AIME_SKILL",
-            "size": DEFAULT_RESULT_SIZE,
-        },
-    }
-
-
-def parse_search_response(payload: object) -> object:
-    if not isinstance(payload, Mapping) or payload.get("status_code") != 0:
-        raise SchemaError("invalid Iwencai response")
-    data = payload.get("data")
-    if not isinstance(data, list):
-        raise SchemaError("invalid Iwencai response data")
-    return {"items": [_normalize_item(item) for item in data]}
-
-
-def _normalize_item(item: object) -> dict[str, str]:
-    if not isinstance(item, Mapping):
-        raise SchemaError("invalid Iwencai news item")
-    required_text = ("id", "title", "summary", "url")
-    if any(not isinstance(item.get(field), str) or not item[field].strip() for field in required_text):
-        raise SchemaError("invalid Iwencai news item")
-    if not isinstance(item.get("publish_time"), (str, int, float)):
-        raise SchemaError("invalid Iwencai news item")
-    extra = item.get("extra")
-    if not isinstance(extra, Mapping):
-        raise SchemaError("invalid Iwencai news item")
-    source = extra.get("real_publish_source") or extra.get("publish_source")
-    if not isinstance(source, str) or not source.strip():
-        raise SchemaError("invalid Iwencai news item")
-    url = urlsplit(item["url"])
-    if url.scheme.lower() not in ("http", "https") or not url.netloc or url.username or url.password:
-        raise SchemaError("invalid Iwencai news item")
-    return {
-        "id": item["id"].strip(),
-        "title": item["title"].strip(),
-        "summary": item["summary"].strip(),
-        "url": item["url"].strip(),
-        "published_at": _parse_publish_time(item["publish_time"]),
-        "source_name": source.strip(),
-    }
-
-
-def _parse_publish_time(value: str | int | float) -> str:
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
-            raise SchemaError("invalid Iwencai publish_time")
-        try:
-            return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
-        except (OverflowError, OSError, ValueError) as exc:
-            raise SchemaError("invalid Iwencai publish_time") from exc
-    try:
-        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_CHINA_TIMEZONE)
-    except ValueError:
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise SchemaError("invalid Iwencai publish_time") from exc
-        if parsed.tzinfo is None:
-            raise SchemaError("Iwencai publish_time must include a timezone")
-    return parsed.isoformat()
+# Backward-compatible names used by construction tests.
+build_query_endpoint = build_endpoint
+def build_query_request(query,api_key,*,limit=50): return build_request(query,api_key,"hithink-market-query",limit=limit)

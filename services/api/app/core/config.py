@@ -48,6 +48,11 @@ class Settings:
     }
     wencai_cookie: str = os.getenv("WENCAI_COOKIE", "")
     iwencai_base_url: str = os.getenv("IWENCAI_BASE_URL", "https://openapi.iwencai.com")
+    iwencai_allowed_hosts: tuple[str, ...] = tuple(
+        host.strip().lower()
+        for host in os.getenv("IWENCAI_ALLOWED_HOSTS", "openapi.iwencai.com").split(",")
+        if host.strip()
+    )
     iwencai_api_key: str = os.getenv("IWENCAI_API_KEY", "")
     wencai_user_agent: str = os.getenv("WENCAI_USER_AGENT", "")
     wencai_pro: bool = os.getenv("WENCAI_PRO", "false").lower() in {

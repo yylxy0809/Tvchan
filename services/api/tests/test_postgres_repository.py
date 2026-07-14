@@ -51,6 +51,26 @@ def test_monthly_candidate_bounds_do_not_overflow_for_the_api_maximum_limit() ->
     asyncio.run(scenario())
 
 
+def test_end_only_history_request_uses_bounded_lookback_candidates() -> None:
+    async def scenario():
+        end = datetime(2026, 7, 6, 9, 35, tzinfo=SHANGHAI_TZ)
+        bounds = await _candidate_lower_bounds(
+            FakePool(FakeConn()),
+            symbol_id=1,
+            timeframe_code=TIMEFRAME_TO_DB["5f"],
+            timeframe="5f",
+            start=None,
+            end=end,
+            limit=279,
+        )
+
+        assert bounds[0] is not None
+        assert bounds[0] < end
+        assert bounds[-1] is None
+
+    asyncio.run(scenario())
+
+
 class FakeAcquire:
     def __init__(self, conn) -> None:
         self.conn = conn

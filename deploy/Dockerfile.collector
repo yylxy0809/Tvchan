@@ -9,19 +9,12 @@ WORKDIR /app
 COPY services/collector/requirements.txt /tmp/collector-requirements.txt
 COPY services/api/requirements.txt /tmp/api-requirements.txt
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm \
-    && node -e "if (Number(process.versions.node.split('.')[0]) < 18) throw new Error('Node.js 18+ is required')" \
-    && expected_integrity='sha512-Cr4IS69wJ6aFdaDv7Sh/Zwf1FEj+8BHxegIltjWg4bswjV2SfbG9VmM0YN4SwfaLJlP1INzM0Ed3LXP+3WpjSA==' \
-    && test "$(npm view westock-data-clawhub@1.0.4 dist.integrity)" = "$expected_integrity" \
-    && npm install --prefix /opt/westock --ignore-scripts --omit=dev westock-data-clawhub@1.0.4 \
-    && node -e "const lock=require('/opt/westock/package-lock.json'); if(lock.packages['node_modules/westock-data-clawhub']?.integrity !== process.argv[1]) throw new Error('westock-data-clawhub registry integrity check failed')" "$expected_integrity" \
     && pip install --no-cache-dir -r /tmp/collector-requirements.txt -r /tmp/api-requirements.txt \
     && rm -rf /var/lib/apt/lists/*
 
 COPY libs/protocol/python /app/libs/protocol/python
 COPY services/api /app/services/api
 COPY services/collector /app/services/collector
-COPY deploy/market-data-provider/westock_cli_provider.mjs /opt/westock/provider.mjs
 
 WORKDIR /app/services/collector
 

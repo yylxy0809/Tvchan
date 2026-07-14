@@ -96,6 +96,49 @@ def test_wencai_service_prefers_openapi_provider(monkeypatch: pytest.MonkeyPatch
     assert [item.code for item in result.items] == ["600001", "000002"]
 
 
+def test_wencai_service_rotates_enabled_keys_by_priority_and_never_exposes_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import wencai_client
+    from app.services.wencai_client import WencaiApiKey, WencaiConfig, query_wencai
+
+    attempted: list[str] = []
+
+    def fake_openapi(**kwargs):
+        attempted.append(kwargs["api_key"])
+        if kwargs["api_key"] == "first-secret":
+            raise wencai_client.WencaiUpstreamError("WenCai OpenAPI HTTP 429: quota exhausted")
+        return {"code_count": 0, "datas": []}
+
+    monkeypatch.setattr(wencai_client, "_call_iwencai_openapi", fake_openapi)
+    config = WencaiConfig(api_keys=(
+        WencaiApiKey(label="primary", key="first-secret", priority=1),
+        WencaiApiKey(label="backup", key="second-secret", priority=2),
+        WencaiApiKey(label="disabled", key="disabled-secret", enabled=False, priority=0),
+    ))
+
+    assert asyncio.run(query_wencai(query="test", page=1, page_size=1, config=config)).total == 0
+    assert attempted == ["first-secret", "second-secret"]
+    assert "first-secret" not in repr(config)
+
+
+def test_wencai_service_retries_timeout_once_before_switching_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import wencai_client
+    from app.services.wencai_client import WencaiApiKey, WencaiConfig, query_wencai
+
+    attempted: list[str] = []
+
+    def fake_openapi(**kwargs):
+        attempted.append(kwargs["api_key"])
+        if kwargs["api_key"] == "first-secret":
+            raise wencai_client.WencaiUpstreamError("timeout")
+        return {"code_count": 0, "datas": []}
+
+    monkeypatch.setattr(wencai_client, "_call_iwencai_openapi", fake_openapi)
+    config = WencaiConfig(api_keys=(WencaiApiKey(key="first-secret"), WencaiApiKey(key="second-secret", priority=1)))
+
+    asyncio.run(query_wencai(query="test", page=1, page_size=1, config=config))
+    assert attempted == ["first-secret", "first-secret", "second-secret"]
+
+
 def test_wencai_service_calls_live_provider_and_paginates(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services import wencai_client
     from app.services.wencai_client import WencaiConfig, query_wencai
@@ -189,6 +232,8 @@ def test_wencai_admin_test_uses_submitted_config_without_saving(monkeypatch: pyt
     body = response.json()
     assert body["ok"] is True
     assert body["sample_count"] == 1
+    assert body["source"] == "iwencai"
+    assert body["capability"] == "screener"
     assert "wencai.config" not in pool.rows
 
 
@@ -236,3 +281,19 @@ def test_wencai_admin_config_masks_cookie_and_preserves_existing_secret() -> Non
     assert pool.rows["wencai.config"]["value"]["api_key"] == "sk-test123456"
     assert pool.rows["wencai.config"]["value"]["cookie"] == "abcdef123456"
     assert pool.rows["wencai.config"]["value"]["user_agent"] == "new-ua"
+
+
+def test_wencai_admin_rejects_non_https_or_non_allowlisted_base_url_without_saving() -> None:
+    pool = FakeRuntimeConfigPool()
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"), pool)
+
+    for path in ("/api/v1/admin/wencai/config", "/api/v1/admin/wencai/test"):
+        response = client.request(
+            "PUT" if path.endswith("config") else "POST",
+            path,
+            json={"base_url": "http://127.0.0.1:8080", "api_key": "secret"},
+            headers={"Authorization": "Bearer admin-token"},
+        )
+        assert response.status_code == 422
+        assert "allowed HTTPS host" in response.json()["detail"]
+    assert "wencai.config" not in pool.rows

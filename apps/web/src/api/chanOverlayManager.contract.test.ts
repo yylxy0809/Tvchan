@@ -35,6 +35,25 @@ test("uses only the backend display levels for each chart timeframe", () => {
   assert.deepEqual(chanLevelsForTimeframe("bad"), []);
 });
 
+test("caps overlay limits derived from long epoch-second ranges", async () => {
+  let observedLimit = 0;
+  const manager = new ChanOverlayManager(async (_symbol, _timeframe, limit) => {
+    observedLimit = limit;
+    return overlay();
+  });
+
+  await manager.fetchFresh({
+    symbol: "000001.SZ",
+    timeframe: "5f",
+    from: 1_700_000_000,
+    to: 1_701_000_000,
+    modes: ["confirmed"],
+  });
+
+  assert.equal(observedLimit, 5000);
+  manager.dispose();
+});
+
 test("debounces rapid ranges and paints only the latest request", async () => {
   let calls = 0;
   const manager = new ChanOverlayManager(async () => { calls += 1; return overlay(); });

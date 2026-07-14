@@ -18,6 +18,9 @@ test("history planner honors from/to/countBack without fixed prefetch", () => {
   assert.deepEqual(planHistoryRequest({ from: 1, to: 2, countBack: 6_000 }), {
     from: 1, to: 2, limit: 6_200, guard: 200,
   });
+  assert.deepEqual(planHistoryRequest({ from: 100, to: 200, countBack: 80, firstDataRequest: true }), {
+    from: undefined, to: 200, limit: 100, guard: 20,
+  });
 });
 
 test("identical newer seq reaches manager fence so delayed differing seq cannot paint", async () => {

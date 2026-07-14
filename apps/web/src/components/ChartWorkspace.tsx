@@ -125,9 +125,10 @@ export function ChartWorkspace({
 
   const confirmChartSymbol = useCallback((symbol: string) => {
     const normalized = symbol.toUpperCase();
-    if (confirmedChartSymbolRef.current === normalized) return;
-    confirmedChartSymbolRef.current = normalized;
-    setConfirmedChartSymbol(normalized);
+    if (confirmedChartSymbolRef.current !== normalized) {
+      confirmedChartSymbolRef.current = normalized;
+      setConfirmedChartSymbol(normalized);
+    }
     marketSidebarStore.confirmChartSymbol(normalized);
   }, [marketSidebarStore]);
 
@@ -468,6 +469,12 @@ export function ChartWorkspace({
         }
         widgetRef.current = widget;
         const widgetIsCurrent = () => !cancelled && widgetRef.current === widget;
+        const widgetSymbol = getWidgetSymbol(widget);
+        if (widgetSymbol) {
+          currentSymbolRef.current = widgetSymbol;
+          setCurrentSymbol((previous) => (previous === widgetSymbol ? previous : widgetSymbol));
+          confirmChartSymbol(widgetSymbol);
+        }
         if (!await installAsyncSubscription(
           () => subscribeWidgetSymbolChanges(widget, (nextSymbol) => {
             if (activeOverlay && activeOverlay.context.symbol !== nextSymbol.toUpperCase()) teardownActiveOverlay();
@@ -513,33 +520,6 @@ export function ChartWorkspace({
         const to = initialBars[initialBars.length - 1]?.time;
         if (from !== undefined && to !== undefined) {
           requestOverlay(initialSymbol, initialTimeframe, from, to, initialBars);
-        } else {
-          // The library can finish its first history request before its visible
-          // range callback is subscribed. Reuse the bar manager cache to start
-          // the first bounded overlay request instead of leaving the chart bare.
-          void chartDataManager.getBars({
-            symbol: initialSymbol,
-            timeframe: initialTimeframe,
-            limit: DEFAULT_BAR_WINDOW_SIZE,
-          }).then((response) => {
-            if (!widgetIsCurrent() || response.bars.length === 0) return;
-            const first = response.bars[0]?.time;
-            const last = response.bars[response.bars.length - 1]?.time;
-            if (first === undefined || last === undefined) return;
-            latestHistoryWindow = {
-              symbol: initialSymbol,
-              timeframe: initialTimeframe,
-              limit: Math.max(DEFAULT_BAR_WINDOW_SIZE, response.bars.length),
-              from: first,
-              to: last,
-              bars: response.bars,
-            };
-            requestOverlay(initialSymbol, initialTimeframe, first, last, response.bars);
-          }).catch((error) => {
-            if (widgetIsCurrent()) {
-              recordTvDebug("chan.overlay.initial-bars.error", String(error));
-            }
-          });
         }
       })
       .catch(() => {
@@ -590,14 +570,8 @@ export function ChartWorkspace({
   function handleSelectSymbol(symbol: string) {
     const normalized = symbol.toUpperCase();
     currentSymbolRef.current = normalized;
-    confirmChartSymbol(normalized);
-    void chartDataManager.getBars({
-      symbol: normalized,
-      timeframe: currentTimeframeRef.current,
-      limit: DEFAULT_BAR_WINDOW_SIZE,
-    }).catch(() => {
-      // TradingView's own history request remains the fallback.
-    });
+    // The TradingView symbol callback confirms the chart switch before the
+    // sidebar changes context; clicking a watchlist row is only a request.
     setCurrentSymbol(normalized);
   }
 
