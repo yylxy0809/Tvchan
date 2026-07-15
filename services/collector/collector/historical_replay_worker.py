@@ -358,18 +358,18 @@ async def seed_intraday_strategy_tasks(
             select distinct level.symbol_id, level.symbol,
                    level.timeframe as chan_level, kline.ts as cutoff_time
               from eligible_levels level
-              join windows window on window.symbol_id = level.symbol_id
+              join windows strategy_window on strategy_window.symbol_id = level.symbol_id
               join klines kline
                 on kline.symbol_id = level.symbol_id
                and kline.timeframe = level.timeframe
                and kline.is_complete
-               and kline.ts >= window.start_time
-               and kline.ts <= window.end_time
+               and kline.ts >= strategy_window.start_time
+               and kline.ts <= strategy_window.end_time
                and kline.ts <= level.covered_until
         )
         select coalesce(
-                   (select jsonb_agg(to_jsonb(window) order by window.symbol_id, window.start_time, window.daily_setup_fingerprint)
-                      from windows window),
+                   (select jsonb_agg(to_jsonb(strategy_window) order by strategy_window.symbol_id, strategy_window.start_time, strategy_window.daily_setup_fingerprint)
+                      from windows strategy_window),
                    '[]'::jsonb
                ) as windows,
                coalesce(
