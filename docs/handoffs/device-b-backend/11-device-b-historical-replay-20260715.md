@@ -1,8 +1,11 @@
 # Device B Historical Replay / Official Backtest Handoff
 
-Date: 2026-07-15  
-Branch: `codex/device-b-historical-replay-execution-20260714`  
-Frozen cutoff: `2026-07-03T07:00:00Z`  
+Date: 2026-07-15
+
+Branch: `codex/device-b-historical-replay-execution-20260714`
+
+Frozen cutoff: `2026-07-03T07:00:00Z`
+
 Replay batch: `9`
 
 ## Outcome
@@ -55,4 +58,3 @@ Minimum unblock condition: produce at least one causal official predictive weekl
 - Added migrations 037-039 schema, durable replay batch/task/head state, isolated replay runs/heads and append-only historical lifecycle events.
 - K-lines were read only. No K-line row, valid run or valid head was deleted.
 - Replay output is isolated by publication profile/run group. Code rollback is a normal commit revert; database history should remain retained for audit and must not be destructively rolled back.
-
