@@ -34,7 +34,7 @@ DEFAULT_OUTPUT_DIR = Path("outputs/device-b-historical-replay-20260714")
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Durable official Module C historical replay")
-    parser.add_argument("action", choices=("prepare-canary", "prepare-full", "work", "report"))
+    parser.add_argument("action", choices=("prepare-canary", "prepare-full", "prepare-intraday", "work", "report"))
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
     parser.add_argument("--batch-id", type=int)
     parser.add_argument("--source-batch-id", type=int, default=6)
@@ -54,8 +54,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if not args.database_url:
         parser.error("--database-url or DATABASE_URL is required")
-    if args.action in {"work", "report"} and not args.batch_id:
-        parser.error("--batch-id is required for work and report")
+    if args.action in {"prepare-intraday", "work", "report"} and not args.batch_id:
+        parser.error("--batch-id is required for prepare-intraday, work and report")
     if args.cutoffs_per_scope < 1:
         parser.error("--cutoffs-per-scope must be positive")
     if (args.shard_index is None) != (args.shard_count is None):
@@ -282,6 +282,148 @@ async def seed_full_high_level_tasks(
     return int(await conn.fetchval("select count(*) from chan_c_historical_replay_tasks where batch_id=$1", batch_id))
 
 
+async def seed_intraday_strategy_tasks(
+    conn: asyncpg.Connection,
+    *,
+    batch_id: int,
+    source_batch_id: int,
+    contract: ReplayContract,
+) -> dict[str, Any]:
+    """Expand native 5F/30F bars only inside causal official strategy windows."""
+    row = await conn.fetchrow(
+        """
+        with eligible_levels as materialized (
+            select eligibility.symbol_id, eligibility.symbol,
+                   eligibility.timeframe, eligibility.covered_until
+              from module_c_eligibility eligibility
+             where eligibility.build_id = (
+                       select eligibility_build_id
+                         from chan_c_full_recompute_batches
+                        where batch_id = $1
+                   )
+               and eligibility.timeframe in (5, 30)
+               and eligibility.eligible
+        ), eligible_symbols as materialized (
+            select symbol_id
+              from eligible_levels
+             group by symbol_id
+            having count(distinct timeframe) = 2
+        ), signals as materialized (
+            select identity.fingerprint, identity.symbol_id, identity.chan_level,
+                   identity.bsp_type, identity.point_time, identity.price_x1000,
+                   event.effective_time
+              from chan_structure_lifecycle_events event
+              join chan_structure_identity identity using (fingerprint)
+              join eligible_symbols eligible on eligible.symbol_id = identity.symbol_id
+             where event.event_type = 'first_seen'
+               and event.provenance->>'publication_profile' = 'historical_replay'
+               and identity.structure_type = 'signal'
+               and identity.side_or_direction = 'buy'
+               and identity.chan_level in (1440, 10080)
+               and event.effective_time <= $2
+        ), windows as materialized (
+            select daily.fingerprint as daily_setup_fingerprint,
+                   daily.symbol_id,
+                   daily.effective_time as start_time,
+                   least(daily.effective_time + interval '5 days', $2::timestamptz) as end_time
+              from signals daily
+             where daily.chan_level = 1440
+               and daily.bsp_type in ('2', '2s')
+               and exists (
+                   select 1 from signals daily_b1
+                    where daily_b1.symbol_id = daily.symbol_id
+                      and daily_b1.chan_level = 1440
+                      and daily_b1.bsp_type = '1'
+                      and daily_b1.point_time < daily.point_time
+                      and daily_b1.price_x1000 < daily.price_x1000
+                      and daily_b1.effective_time <= daily.effective_time
+               )
+               and exists (
+                   select 1 from signals weekly_b2
+                    where weekly_b2.symbol_id = daily.symbol_id
+                      and weekly_b2.chan_level = 10080
+                      and weekly_b2.bsp_type = '2'
+                      and weekly_b2.effective_time <= daily.effective_time
+                      and exists (
+                          select 1 from signals weekly_b1
+                           where weekly_b1.symbol_id = weekly_b2.symbol_id
+                             and weekly_b1.chan_level = 10080
+                             and weekly_b1.bsp_type = '1'
+                             and weekly_b1.point_time < weekly_b2.point_time
+                             and weekly_b1.price_x1000 < weekly_b2.price_x1000
+                             and weekly_b1.effective_time <= weekly_b2.effective_time
+                      )
+               )
+        ), tasks as materialized (
+            select distinct level.symbol_id, level.symbol,
+                   level.timeframe as chan_level, kline.ts as cutoff_time
+              from eligible_levels level
+              join windows window on window.symbol_id = level.symbol_id
+              join klines kline
+                on kline.symbol_id = level.symbol_id
+               and kline.timeframe = level.timeframe
+               and kline.is_complete
+               and kline.ts >= window.start_time
+               and kline.ts <= window.end_time
+               and kline.ts <= level.covered_until
+        )
+        select coalesce(
+                   (select jsonb_agg(to_jsonb(window) order by window.symbol_id, window.start_time, window.daily_setup_fingerprint)
+                      from windows window),
+                   '[]'::jsonb
+               ) as windows,
+               coalesce(
+                   (select jsonb_agg(to_jsonb(task) order by task.symbol_id, task.chan_level, task.cutoff_time)
+                      from tasks task),
+                   '[]'::jsonb
+               ) as tasks
+        """,
+        source_batch_id,
+        contract.cutoff_time,
+    )
+    windows = row["windows"]
+    tasks = row["tasks"]
+    if isinstance(windows, str):
+        windows = json.loads(windows)
+    if isinstance(tasks, str):
+        tasks = json.loads(tasks)
+    manifests = []
+    for task in tasks:
+        cutoff = datetime.fromisoformat(str(task["cutoff_time"]).replace("Z", "+00:00"))
+        level = LEVEL_NAMES[int(task["chan_level"])]
+        manifests.append((
+            batch_id, int(task["symbol_id"]), str(task["symbol"]), int(task["chan_level"]),
+            "confirmed,predictive", cutoff, contract.contract_version,
+            stable_replay_identity(
+                contract, symbol=str(task["symbol"]), level=level,
+                mode="confirmed,predictive", cutoff_time=cutoff,
+            ),
+            True, [], "pending",
+        ))
+    if manifests:
+        await conn.executemany(
+            """
+            insert into chan_c_historical_replay_tasks (
+                batch_id, symbol_id, symbol, chan_level, mode, cutoff_time,
+                contract_version, replay_identity, eligible, exclusion_reasons, status
+            ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            on conflict (batch_id, symbol_id, chan_level, mode, cutoff_time, contract_version) do nothing
+            """,
+            manifests,
+        )
+    planned = int(await conn.fetchval(
+        "select count(*) from chan_c_historical_replay_tasks where batch_id=$1 and chan_level in (5,30) and eligible",
+        batch_id,
+    ))
+    return {
+        "contract": "weekly_daily_b2_official_v1 causal 5-day forward window",
+        "episode_count": len(windows),
+        "symbol_count": len({int(window["symbol_id"]) for window in windows}),
+        "planned_task_count": planned,
+        "windows": windows,
+    }
+
+
 def assert_no_future_output(response: Mapping[str, Any], *, cutoff_time: datetime) -> None:
     cutoff_epoch = int(cutoff_time.timestamp())
     checks = (
@@ -438,6 +580,21 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 async def main(args: argparse.Namespace) -> None:
+    if args.action == "prepare-intraday":
+        conn = await asyncpg.connect(args.database_url)
+        try:
+            contract = await load_contract(conn, source_batch_id=args.source_batch_id)
+            plan = await seed_intraday_strategy_tasks(
+                conn,
+                batch_id=args.batch_id,
+                source_batch_id=args.source_batch_id,
+                contract=contract,
+            )
+            write_json(args.output_dir / "strategy_forward_windows.json", plan)
+            print(json.dumps({key: plan[key] for key in ("episode_count", "symbol_count", "planned_task_count")}, sort_keys=True))
+        finally:
+            await conn.close()
+        return
     if args.action in {"prepare-canary", "prepare-full"}:
         conn = await asyncpg.connect(args.database_url)
         try:
