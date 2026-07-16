@@ -20,7 +20,7 @@ SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 def test_missing_watermark_still_bounds_weekly_chunk_scan() -> None:
     async def scenario():
         bounds = await _candidate_lower_bounds(
-            FakePool(FakeConn()),
+            FakePool(FakeConn(), watermark=None),
             symbol_id=1,
             timeframe_code=TIMEFRAME_TO_DB["1w"],
             timeframe="1w",
@@ -83,8 +83,16 @@ class FakeAcquire:
 
 
 class FakePool:
-    def __init__(self, conn) -> None:
+    def __init__(
+        self,
+        conn,
+        *,
+        watermark=datetime(2026, 7, 6, tzinfo=UTC),
+        timeframe_exists=True,
+    ) -> None:
         self.conn = conn
+        self.watermark = watermark
+        self.timeframe_exists = timeframe_exists
 
     def acquire(self):
         return FakeAcquire(self.conn)
@@ -95,6 +103,12 @@ class FakePool:
     async def fetchval(self, query, *args):
         if "from symbols" in query:
             return 1
+        if "from scheme2_ingest_watermarks" in query:
+            return self.watermark
+        if "select exists" in query and "from klines" in query:
+            self.conn.queries.append(query)
+            self.conn.args.append(args)
+            return self.timeframe_exists
         return None
 
 
@@ -121,6 +135,80 @@ class FakeConn:
                 "revision": 0,
             }
         ]
+
+
+def test_known_symbol_without_timeframe_watermark_returns_empty_before_kline_scan() -> None:
+    async def scenario():
+        conn = FakeConn()
+        rows = await get_bars_db(
+            FakePool(conn, watermark=None, timeframe_exists=False),
+            symbol="920047.BJ",
+            timeframe="5f",
+            start=None,
+            end=None,
+            limit=300,
+        )
+
+        assert rows == []
+        assert len(conn.queries) == 1
+        assert "select exists" in conn.queries[0].lower()
+        assert conn.args == [(1, TIMEFRAME_TO_DB["5f"])]
+
+    asyncio.run(scenario())
+
+
+def test_missing_watermark_does_not_hide_existing_timeframe_rows() -> None:
+    async def scenario():
+        conn = FakeConn()
+        rows = await get_bars_db(
+            FakePool(conn, watermark=None, timeframe_exists=True),
+            symbol="920047.BJ",
+            timeframe="5f",
+            start=None,
+            end=None,
+            limit=300,
+        )
+
+        assert rows
+        assert any("with canonical as" in query.lower() for query in conn.queries)
+
+    asyncio.run(scenario())
+
+
+def test_present_watermark_skips_timeframe_existence_probe() -> None:
+    async def scenario():
+        conn = FakeConn()
+        rows = await get_bars_db(
+            FakePool(conn, timeframe_exists=False),
+            symbol="000001.SZ",
+            timeframe="5f",
+            start=None,
+            end=None,
+            limit=300,
+        )
+
+        assert rows
+        assert not any("select exists" in query.lower() for query in conn.queries)
+
+    asyncio.run(scenario())
+
+
+def test_explicit_window_skips_empty_probe_without_a_watermark() -> None:
+    async def scenario():
+        conn = FakeConn()
+        rows = await get_bars_db(
+            FakePool(conn, watermark=None, timeframe_exists=False),
+            symbol="920047.BJ",
+            timeframe="5f",
+            start=datetime(2026, 7, 1, tzinfo=UTC),
+            end=datetime(2026, 7, 2, tzinfo=UTC),
+            limit=300,
+        )
+
+        assert rows
+        assert not any("select exists" in query.lower() for query in conn.queries)
+
+    asyncio.run(scenario())
 
 
 def test_get_bars_db_excludes_seed_when_real_source_exists_for_stored_timeframe() -> None:

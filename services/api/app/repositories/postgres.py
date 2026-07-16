@@ -243,7 +243,16 @@ async def _candidate_lower_bounds(
             symbol_id=symbol_id,
             timeframe_code=timeframe_code,
         )
-        anchor = watermark or datetime.now(tz=SHANGHAI_TZ)
+        if watermark is None:
+            if not await _timeframe_has_rows(
+                pool,
+                symbol_id=symbol_id,
+                timeframe_code=timeframe_code,
+            ):
+                return []
+            anchor = datetime.now(tz=SHANGHAI_TZ)
+        else:
+            anchor = watermark
     days = _lookback_days(timeframe, limit)
     return [
         _subtract_lookback(anchor, days),
@@ -269,6 +278,25 @@ async def _ingest_watermark(pool, *, symbol_id: int, timeframe_code: int) -> dat
         """,
         symbol_id,
         timeframe_code,
+    )
+
+
+async def _timeframe_has_rows(
+    pool, *, symbol_id: int, timeframe_code: int
+) -> bool:
+    return bool(
+        await pool.fetchval(
+            """
+            select exists (
+                select 1
+                from klines
+                where symbol_id = $1 and timeframe = $2
+                limit 1
+            )
+            """,
+            symbol_id,
+            timeframe_code,
+        )
     )
 
 
