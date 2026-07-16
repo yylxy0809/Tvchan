@@ -256,7 +256,7 @@ function Test-ProductionNoBundlePath {
     $missingSources = @()
     foreach ($relative in $relativePaths) {
         $path = Join-Path $SourceRoot $relative
-        if (Test-Path -LiteralPath $path) { $sources[$relative] = Get-Content -Raw -LiteralPath $path }
+        if (Test-Path -LiteralPath $path) { $sources[$relative] = Get-Content -Raw -Encoding UTF8 -LiteralPath $path }
         else { $missingSources += $relative }
     }
     $scan = Invoke-TypeScriptBundleScan -Sources $sources -NodePath $NodePath -TypeScriptPath $TypeScriptCompilerPath -ScannerPath (Join-Path $PSScriptRoot "chart-windowed-overlay\source-scan.mjs") -TimeoutSeconds $SourceScanTimeoutSeconds -RequireProductionScopes
