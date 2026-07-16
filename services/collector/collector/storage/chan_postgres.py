@@ -230,7 +230,10 @@ class PostgresChanWriter:
         bar_count: int,
         response: dict[str, Any],
         full_recompute_task: dict[str, Any] | None = None,
+        historical_replay_task: dict[str, Any] | None = None,
     ) -> dict[str, int]:
+        if full_recompute_task is not None and historical_replay_task is not None:
+            raise ValueError("Only one fenced task type may publish a run")
         assert self._pool is not None
         async with self._pool.acquire() as conn:
             symbol_id = await conn.fetchval(
@@ -251,9 +254,13 @@ class PostgresChanWriter:
                 level if self.native_base_timeframe else "5f"
             )
             runs_table = self.tables["runs"]
-            run_identity = hashlib.sha256(
-                f"{self.run_group_id}|{symbol}|{level}|{snapshot_version}".encode("utf-8")
-            ).hexdigest()
+            run_identity = (
+                str(historical_replay_task["replay_identity"])
+                if historical_replay_task is not None
+                else hashlib.sha256(
+                    f"{self.run_group_id}|{symbol}|{level}|{snapshot_version}".encode("utf-8")
+                ).hexdigest()
+            )
 
             async def insert_run(*, resumable: bool) -> int:
                 conflict_sql = """
@@ -295,7 +302,8 @@ class PostgresChanWriter:
                     self.publication_source,
                 )
 
-            run_id = None if full_recompute_task is not None else await insert_run(resumable=False)
+            fenced_task = full_recompute_task or historical_replay_task
+            run_id = None if fenced_task is not None else await insert_run(resumable=False)
             try:
                 async with conn.transaction():
                     if full_recompute_task is not None:
@@ -317,6 +325,28 @@ class PostgresChanWriter:
                         if fenced != 1:
                             raise StaleChanHeadError(
                                 f"Full-recompute task fence failed for symbol_id={symbol_id} level={level_code}"
+                            )
+                        run_id = await insert_run(resumable=True)
+                    elif historical_replay_task is not None:
+                        fenced = await conn.fetchval(
+                            """
+                            select 1
+                              from chan_c_historical_replay_tasks
+                             where id = $1 and batch_id = $2 and symbol_id = $3 and chan_level = $4
+                               and status = 'running' and claim_token = $5
+                               and lease_version = $6 and lease_until > now()
+                             for update
+                            """,
+                            historical_replay_task["id"],
+                            historical_replay_task["batch_id"],
+                            symbol_id,
+                            level_code,
+                            historical_replay_task["claim_token"],
+                            historical_replay_task["lease_version"],
+                        )
+                        if fenced != 1:
+                            raise StaleChanHeadError(
+                                f"Historical replay task fence failed for task_id={historical_replay_task['id']}"
                             )
                         run_id = await insert_run(resumable=True)
                     stroke_count = await self._insert_stroke_like(
@@ -359,40 +389,53 @@ class PostgresChanWriter:
                         """,
                         run_id,
                     )
-                    await self._upsert_published_heads(
-                        conn,
-                        symbol_id=symbol_id,
-                        level_code=level_code,
-                        modes=modes,
-                        base_timeframe_code=base_timeframe_code,
-                        bar_from=bar_from,
-                        bar_until=bar_until,
-                        bar_count=bar_count,
-                        snapshot_version=snapshot_version,
-                        run_id=run_id,
-                        status="published",
-                        last_error=None,
-                        expected_heads=(
-                            _read_extra(full_recompute_task.get("expected_heads"))
-                            if full_recompute_task is not None
-                            else None
-                        ),
-                        publication_claim_token=(
-                            str(full_recompute_task["claim_token"])
-                            if full_recompute_task is not None
-                            else None
-                        ),
-                    )
-                    await self._upsert_recompute_watermarks(
-                        conn,
-                        symbol_id=symbol_id,
-                        level_code=level_code,
-                        modes=modes,
-                        base_timeframe_code=base_timeframe_code,
-                        last_computed_bar_end=bar_until,
-                        dirty_from_bar_end=None,
-                        last_error=None,
-                    )
+                    if historical_replay_task is not None:
+                        await self._publish_historical_replay_heads(
+                            conn,
+                            task=historical_replay_task,
+                            symbol_id=symbol_id,
+                            level_code=level_code,
+                            modes=modes,
+                            base_timeframe_code=base_timeframe_code,
+                            bar_until=bar_until,
+                            snapshot_version=snapshot_version,
+                            run_id=run_id,
+                        )
+                    else:
+                        await self._upsert_published_heads(
+                            conn,
+                            symbol_id=symbol_id,
+                            level_code=level_code,
+                            modes=modes,
+                            base_timeframe_code=base_timeframe_code,
+                            bar_from=bar_from,
+                            bar_until=bar_until,
+                            bar_count=bar_count,
+                            snapshot_version=snapshot_version,
+                            run_id=run_id,
+                            status="published",
+                            last_error=None,
+                            expected_heads=(
+                                _read_extra(full_recompute_task.get("expected_heads"))
+                                if full_recompute_task is not None
+                                else None
+                            ),
+                            publication_claim_token=(
+                                str(full_recompute_task["claim_token"])
+                                if full_recompute_task is not None
+                                else None
+                            ),
+                        )
+                        await self._upsert_recompute_watermarks(
+                            conn,
+                            symbol_id=symbol_id,
+                            level_code=level_code,
+                            modes=modes,
+                            base_timeframe_code=base_timeframe_code,
+                            last_computed_bar_end=bar_until,
+                            dirty_from_bar_end=None,
+                            last_error=None,
+                        )
                     if full_recompute_task is not None:
                         completed = await conn.execute(
                             """
@@ -422,8 +465,34 @@ class PostgresChanWriter:
                             raise StaleChanHeadError(
                                 f"Full-recompute completion fence failed for symbol_id={symbol_id} level={level_code}"
                             )
+                    elif historical_replay_task is not None:
+                        completed = await conn.execute(
+                            """
+                            update chan_c_historical_replay_tasks
+                               set status = 'completed', run_id = $4, bar_count = $5,
+                                   stroke_count = $6, segment_count = $7, center_count = $8,
+                                   signal_count = $9, worker_id = null, claim_token = null,
+                                   lease_until = null, lease_heartbeat_at = null,
+                                   finished_at = now(), updated_at = now()
+                             where id = $1 and status = 'running' and claim_token = $2
+                               and lease_version = $3 and lease_until > now()
+                            """,
+                            historical_replay_task["id"],
+                            historical_replay_task["claim_token"],
+                            historical_replay_task["lease_version"],
+                            run_id,
+                            bar_count,
+                            stroke_count,
+                            segment_count,
+                            center_count,
+                            signal_count,
+                        )
+                        if not completed.endswith(" 1"):
+                            raise StaleChanHeadError(
+                                f"Historical replay completion fence failed for task_id={historical_replay_task['id']}"
+                            )
             except Exception as exc:
-                if run_id is not None and full_recompute_task is None:
+                if run_id is not None and fenced_task is None:
                     await conn.execute(
                         f"""
                         update {runs_table}
@@ -433,7 +502,7 @@ class PostgresChanWriter:
                         run_id,
                         str(exc)[:2000],
                     )
-                if full_recompute_task is None:
+                if fenced_task is None:
                     await self._upsert_recompute_watermarks(
                         conn,
                         symbol_id=symbol_id,
@@ -695,6 +764,89 @@ class PostgresChanWriter:
             "signals": signal_count,
             **committed_head,
         }
+
+    async def _publish_historical_replay_heads(
+        self,
+        conn,
+        *,
+        task: dict[str, Any],
+        symbol_id: int,
+        level_code: int,
+        modes: list[str],
+        base_timeframe_code: int,
+        bar_until: datetime,
+        snapshot_version: str,
+        run_id: int,
+    ) -> None:
+        if self.publication_profile != "historical_replay" or self.run_kind != "historical_replay":
+            raise ValueError("Historical replay tasks require isolated replay publication settings")
+        for mode in modes:
+            previous = await conn.fetchrow(
+                """
+                select run_id, cutoff_time
+                  from chan_c_historical_replay_heads
+                 where batch_id = $1 and symbol_id = $2 and chan_level = $3 and mode = $4
+                   and cutoff_time < $5
+                 order by cutoff_time desc
+                 limit 1
+                """,
+                task["batch_id"],
+                symbol_id,
+                level_code,
+                mode,
+                bar_until,
+            )
+            inserted = await conn.fetchrow(
+                """
+                insert into chan_c_historical_replay_heads (
+                    batch_id, task_id, symbol_id, chan_level, mode, cutoff_time,
+                    run_id, config_hash, contract_version, replay_identity
+                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                on conflict (batch_id, symbol_id, chan_level, mode, cutoff_time) do nothing
+                returning run_id
+                """,
+                task["batch_id"],
+                task["id"],
+                symbol_id,
+                level_code,
+                mode,
+                bar_until,
+                run_id,
+                self.run_config_hash,
+                task["contract_version"],
+                task["replay_identity"],
+            )
+            if inserted is None:
+                existing = await conn.fetchval(
+                    """
+                    select run_id from chan_c_historical_replay_heads
+                     where batch_id = $1 and symbol_id = $2 and chan_level = $3
+                       and mode = $4 and cutoff_time = $5
+                    """,
+                    task["batch_id"],
+                    symbol_id,
+                    level_code,
+                    mode,
+                    bar_until,
+                )
+                if int(existing) != int(run_id):
+                    raise StaleChanHeadError(
+                        f"Historical replay head conflict for task_id={task['id']} mode={mode}"
+                    )
+                continue
+            await self._append_head_history_outbox(
+                conn,
+                symbol_id=symbol_id,
+                level_code=level_code,
+                mode=mode,
+                base_timeframe_code=base_timeframe_code,
+                old_run_id=int(previous["run_id"]) if previous else None,
+                new_run_id=run_id,
+                old_base_to_bar_end=previous["cutoff_time"] if previous else None,
+                new_base_to_bar_end=bar_until,
+                snapshot_version=snapshot_version,
+                claim_token=str(task["claim_token"]),
+            )
 
     async def _upsert_published_heads(
         self,
