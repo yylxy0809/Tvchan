@@ -25,6 +25,17 @@ def _markdown(title: str, payload: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_official_dataset_manifest(report: dict) -> dict:
+    return {
+        "as_of_time": AS_OF.isoformat(),
+        "publication_profile": "historical_replay",
+        "source_ratio": 1.0,
+        "counts_by_level": report["official_events_by_level"],
+        "future_rows": 0,
+        "decision": report["decision"],
+    }
+
+
 async def _run(output_dir: Path) -> dict:
     pool = await create_pool(min_size=1, max_size=2)
     try:
@@ -131,7 +142,7 @@ async def _run(output_dir: Path) -> dict:
     fail_rows = [{"symbol": item["symbol"], "failed_gate": "predictive_weekly_b2_visible", "reason": "official_predictive_weekly_b2_unavailable"} for item in failures]
     (output_dir / "fail_samples.jsonl").write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in fail_rows), encoding="utf-8")
     (output_dir / "candidate_samples.jsonl").write_text("", encoding="utf-8")
-    manifest = {"as_of_time": AS_OF.isoformat(), "publication_profile": "historical_replay", "source_ratio": 1.0, "counts_by_level": report["official_events_by_level"], "future_rows": 0, "decision": "GO"}
+    manifest = _build_official_dataset_manifest(report)
     _write_json(output_dir / "official_dataset_manifest.json", manifest)
     _write_json(output_dir / "diagnostic_dataset_manifest.json", {"as_of_time": AS_OF.isoformat(), "count": 0, "excluded_from_official": True})
     metrics = {"strategy_code": report["strategy_code"], "status": "not_run", "trade_count": 0, "metrics": None, "reason": "strict_upstream_gate_empty", "input_hash": report["input_hash"], "decision": "NO_GO"}

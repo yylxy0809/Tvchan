@@ -1,3 +1,4 @@
+from app.cli.run_official_historical_gate import _build_official_dataset_manifest
 from app.engine.official_historical_gate import build_official_historical_gate
 
 
@@ -21,3 +22,12 @@ def test_gate_fails_closed_when_predictive_weekly_b2_is_unavailable():
     assert report["decision"] == "NO_GO"
     assert report["gate_counts_monotonic"] is True
     assert "official_predictive_weekly_b2_unavailable" in report["blockers"]
+
+
+def test_official_manifest_uses_the_fail_closed_gate_decision():
+    manifest = _build_official_dataset_manifest({
+        "decision": "NO_GO",
+        "official_events_by_level": [],
+    })
+
+    assert manifest["decision"] == "NO_GO"
