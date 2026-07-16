@@ -89,7 +89,7 @@ def _client(settings: Settings, pool: FakeTokenPool | None = None) -> TestClient
     return client
 
 
-def test_login_uses_api_token_as_admin_when_admin_token_is_not_configured() -> None:
+def test_login_keeps_api_token_as_user_when_admin_token_is_not_configured() -> None:
     client = _client(Settings(api_token="api-token", admin_api_token=""))
 
     response = client.post("/api/v1/auth/login", json={"token": "api-token"})
@@ -97,9 +97,9 @@ def test_login_uses_api_token_as_admin_when_admin_token_is_not_configured() -> N
     assert response.status_code == 200
     assert response.json() == {
         "valid": True,
-        "role": "admin",
-        "display_name": "Administrator",
-        "label": "admin",
+        "role": "user",
+        "display_name": "API token",
+        "label": "api-token",
         "token_id": None,
     }
 

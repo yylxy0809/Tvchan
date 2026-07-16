@@ -9,7 +9,7 @@ import {
   type ChanStyleSettings,
 } from "./chanStyles";
 
-export type ChanLevel = "5f" | "30f" | "1d";
+export type ChanLevel = "5f" | "30f" | "1d" | "1w" | "1m";
 export type ChanMode = "confirmed" | "predictive";
 export type ChanOverlayPart = "strokes" | "segments" | "centers" | "signals" | "channels";
 
@@ -21,7 +21,7 @@ export type ChanOverlaySettings = {
   styles: ChanStyleSettings;
 };
 
-export const CHAN_LEVELS: ChanLevel[] = ["5f", "30f", "1d"];
+export const CHAN_LEVELS: ChanLevel[] = ["5f", "30f", "1d", "1w", "1m"];
 export const CHAN_MODES: ChanMode[] = ["confirmed", "predictive"];
 export const CHAN_PARTS: ChanOverlayPart[] = ["strokes", "segments", "centers", "signals", "channels"];
 
@@ -30,6 +30,8 @@ export const DEFAULT_CHAN_OVERLAY_SETTINGS: ChanOverlaySettings = {
     "5f": true,
     "30f": true,
     "1d": true,
+    "1w": true,
+    "1m": true,
   },
   modes: {
     confirmed: true,
@@ -63,6 +65,8 @@ export function mergeChanOverlaySettings(value: unknown): ChanOverlaySettings {
       "5f": readBoolean(incoming.levels, "5f", true),
       "30f": readBoolean(incoming.levels, "30f", true),
       "1d": readBoolean(incoming.levels, "1d", true),
+      "1w": readBoolean(incoming.levels, "1w", true),
+      "1m": readBoolean(incoming.levels, "1m", true),
     },
     modes: {
       confirmed: readBoolean(incoming.modes, "confirmed", true),

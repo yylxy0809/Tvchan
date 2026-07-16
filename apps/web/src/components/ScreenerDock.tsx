@@ -28,8 +28,10 @@ import { getSymbolProfileMarketFields } from "../api/marketData";
 import {
   addSymbolsToFavorites,
   createGroupWithSymbols,
+  type WatchlistGroup,
   type WatchlistItem,
 } from "../api/watchlistStore";
+import { saveUserSetting } from "../api/userSettings";
 import {
   type ScreenerTabId,
 } from "../features/featureRegistry";
@@ -37,6 +39,8 @@ import { useScreenerDockFeatures } from "../features/runtimeFeatureRegistry";
 
 type Props = {
   onSelectSymbol(symbol: string): void;
+  onOpenPanel?(): void;
+  authToken?: string;
 };
 
 type ScreenerTab = ScreenerTabId;
@@ -45,7 +49,7 @@ const DEFAULT_QUERY = "5日，15日，60日均线多头排列，当日股价突�
 const MIN_PANEL_HEIGHT = 240;
 const MAX_PANEL_OFFSET = 96;
 
-export function ScreenerDock({ onSelectSymbol }: Props) {
+export function ScreenerDock({ onSelectSymbol, onOpenPanel, authToken }: Props) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<ScreenerTab>("wencai");
   const [panelHeight, setPanelHeight] = useState(380);
@@ -55,6 +59,9 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
   const [conditions, setConditions] = useState<string[]>([]);
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [rows, setRows] = useState<WencaiScreenerRow[]>([]);
+  const [wencaiPage, setWencaiPage] = useState(1);
+  const [wencaiPageSize, setWencaiPageSize] = useState(50);
+  const [wencaiTotal, setWencaiTotal] = useState(0);
   const [selected, setSelected] = useState<string[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [chanQuery, setChanQuery] = useState("日线级别趋势上涨中，30f级别盘整下跌，5f级别线段上涨");
@@ -66,6 +73,7 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
   const [chanMessage, setChanMessage] = useState<string | null>(null);
   const [chanParser, setChanParser] = useState<string>("rules");
   const screenerFeatures = useScreenerDockFeatures();
+  const chanRequestIdRef = useRef(0);
 
   const selectedRows = useMemo(
     () => rows.filter((row) => selected.includes(row.symbol)),
@@ -75,6 +83,7 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
     () => chanRows.filter((row) => chanSelected.includes(row.symbol)),
     [chanRows, chanSelected],
   );
+  const wencaiTotalPages = Math.max(1, Math.ceil(wencaiTotal / wencaiPageSize));
   const bodyStyleRef = useRef<{ cursor: string; userSelect: string } | null>(null);
 
   useEffect(() => {
@@ -88,6 +97,12 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
       setOpen(false);
     }
   }, [screenerFeatures, tab]);
+
+  function openScreenerPanel(nextTab: ScreenerTab) {
+    setTab(nextTab);
+    setOpen(true);
+    onOpenPanel?.();
+  }
 
   function updatePanelHeightFromClientY(clientY: number) {
     const maxHeight = Math.max(
@@ -136,25 +151,32 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
 
   async function handleSubmit(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
+    await runWencaiQuery(1, wencaiPageSize);
+  }
+
+  async function runWencaiQuery(nextPage: number, nextPageSize: number) {
     const trimmed = query.trim();
     if (!trimmed) {
       setMessage("请输入选股条件");
       return;
     }
-    setOpen(true);
-    setTab("wencai");
+    openScreenerPanel("wencai");
     setLoading(true);
     setMessage(null);
     try {
-      const response = await queryWencaiScreener(trimmed);
+      const response = await queryWencaiScreener(trimmed, nextPage, nextPageSize);
       setConditions(response.conditions);
       setSuggestions(response.suggestions);
       setRows(response.rows);
+      setWencaiPage(response.page);
+      setWencaiPageSize(response.pageSize);
+      setWencaiTotal(response.total);
       setSelected(response.rows.slice(0, 3).map((row) => row.symbol));
       setMessage(`已选出 ${response.total} 只 A 股`);
     } catch (error) {
       setRows([]);
       setSelected([]);
+      setWencaiTotal(0);
       setMessage(error instanceof Error ? error.message : "问财选股失败");
     } finally {
       setLoading(false);
@@ -168,34 +190,47 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
       setChanMessage("请输入缠论选股条件");
       return;
     }
-    setOpen(true);
-    setTab("chan");
+    openScreenerPanel("chan");
     setChanLoading(true);
     setChanMessage(null);
+    const requestId = chanRequestIdRef.current + 1;
+    chanRequestIdRef.current = requestId;
     try {
       const response = await queryChanScreener(trimmed, 100, "current");
-      const enrichedItems = await enrichChanScreenerRows(response.items);
-      setChanRows(enrichedItems);
-      setChanSelected(enrichedItems.slice(0, 3).map((row) => row.symbol));
+      if (chanRequestIdRef.current !== requestId) {
+        return;
+      }
+      setChanRows(response.items);
+      setChanSelected(response.items.slice(0, 3).map((row) => row.symbol));
       setChanConditions(
         response.conditions.map((condition) => condition.raw || describeChanCondition(condition)),
       );
       setChanUnsupported(response.unsupported);
       setChanParser(response.parser);
       setChanMessage(
-        `已选出 ${enrichedItems.length} 个标的，解析方式：${response.parser === "llm" ? "大模型" : "规则"}`,
+        `已选出 ${response.items.length} 个标的，解析方式：${response.parser === "llm" ? "大模型" : "规则"}`,
       );
       if (response.parser_error) {
-        setChanMessage(`已选出 ${enrichedItems.length} 个标的，模型解析失败后使用规则解析`);
+        setChanMessage(`已选出 ${response.items.length} 个标的，模型解析失败后使用规则解析`);
       }
+      void enrichChanScreenerRows(response.items).then((enrichedItems) => {
+        if (chanRequestIdRef.current === requestId) {
+          setChanRows(enrichedItems);
+        }
+      });
     } catch (error) {
+      if (chanRequestIdRef.current !== requestId) {
+        return;
+      }
       setChanRows([]);
       setChanSelected([]);
       setChanConditions([]);
       setChanUnsupported([]);
       setChanMessage(error instanceof Error ? error.message : "缠论选股失败");
     } finally {
-      setChanLoading(false);
+      if (chanRequestIdRef.current === requestId) {
+        setChanLoading(false);
+      }
     }
   }
 
@@ -219,8 +254,8 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
       setMessage("请先选择标的");
       return;
     }
-    addSymbolsToFavorites(items);
-    setMessage(`已加入自选：${items.length} 只`);
+    const groups = addSymbolsToFavorites(items);
+    syncWatchlistGroups(groups, `已加入自选：${items.length} 只，可在右侧关注列表查看`, setMessage);
   }
 
   function handleCreateBoard() {
@@ -229,13 +264,8 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
       setMessage("请先选择标的");
       return;
     }
-    const defaultName = `问财-${compactQuery(query)}`;
-    const name = window.prompt("请输入新板块分组名称", defaultName);
-    if (name === null) {
-      return;
-    }
-    createGroupWithSymbols(name, items);
-    setMessage(`已创建板块并加入：${items.length} 只`);
+    const groups = createGroupWithSymbols(`问财-${compactQuery(query)}`, items);
+    syncWatchlistGroups(groups, `已创建板块并加入：${items.length} 只，可在右侧关注列表查看`, setMessage);
   }
 
   function toggleChanSelected(symbol: string) {
@@ -252,29 +282,48 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
     );
   }
 
-  function handleAddChanFavorites() {
-    const items = toWatchlistItems(selectedChanRows);
+  async function handleAddChanFavorites() {
+    const resolvedRows = await resolveSelectedChanRowsForWatchlist();
+    const items = toWatchlistItems(resolvedRows);
     if (items.length === 0) {
       setChanMessage("请先选择标的");
       return;
     }
-    addSymbolsToFavorites(items);
-    setChanMessage(`已加入自选：${items.length} 只`);
+    const groups = addSymbolsToFavorites(items);
+    syncWatchlistGroups(groups, `已加入自选：${items.length} 只，可在右侧关注列表查看`, setChanMessage);
   }
 
-  function handleCreateChanBoard() {
-    const items = toWatchlistItems(selectedChanRows);
+  async function handleCreateChanBoard() {
+    const resolvedRows = await resolveSelectedChanRowsForWatchlist();
+    const items = toWatchlistItems(resolvedRows);
     if (items.length === 0) {
       setChanMessage("请先选择标的");
       return;
     }
-    const defaultName = `缠论-${compactQuery(chanQuery)}`;
-    const name = window.prompt("请输入新板块分组名称", defaultName);
-    if (name === null) {
+    const groups = createGroupWithSymbols(`缠论-${compactQuery(chanQuery)}`, items);
+    syncWatchlistGroups(groups, `已创建板块并加入：${items.length} 只，可在右侧关注列表查看`, setChanMessage);
+  }
+
+  async function resolveSelectedChanRowsForWatchlist(): Promise<ChanScreenerRow[]> {
+    if (selectedChanRows.length === 0 || !selectedChanRows.some(isChanNameFallback)) {
+      return selectedChanRows;
+    }
+    setChanMessage("正在补全标的名称...");
+    return enrichChanScreenerRows(selectedChanRows);
+  }
+
+  function syncWatchlistGroups(
+    groups: WatchlistGroup[],
+    successMessage: string,
+    setStatus: (message: string) => void,
+  ) {
+    setStatus(successMessage);
+    if (!authToken) {
       return;
     }
-    createGroupWithSymbols(name, items);
-    setChanMessage(`已创建板块并加入：${items.length} 只`);
+    void saveUserSetting(authToken, "watchlist", { groups }).catch(() => {
+      setStatus(`${successMessage}；服务端同步失败，已保存在本机`);
+    });
   }
 
   return (
@@ -325,6 +374,8 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
                       setRows([]);
                       setSelected([]);
                       setConditions([]);
+                      setWencaiPage(1);
+                      setWencaiTotal(0);
                       setMessage(null);
                     }}
                   >
@@ -360,9 +411,39 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
                 <div className="wencai-result-toolbar">
                   <div>
                     <strong>选出A股</strong>
-                    <em>{rows.length}</em>
+                    <em>{wencaiTotal}</em>
+                    <span>
+                      第 {wencaiPage} / {wencaiTotalPages} 页，本页 {rows.length} 条
+                    </span>
                     {message ? <span>{message}</span> : null}
                   </div>
+                  <select
+                    value={wencaiPageSize}
+                    onChange={(event) => {
+                      const nextPageSize = Number(event.target.value);
+                      void runWencaiQuery(1, nextPageSize);
+                    }}
+                    disabled={loading}
+                    aria-label="问财每页数量"
+                  >
+                    <option value={20}>20 / 页</option>
+                    <option value={50}>50 / 页</option>
+                    <option value={100}>100 / 页</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => void runWencaiQuery(wencaiPage - 1, wencaiPageSize)}
+                    disabled={loading || wencaiPage <= 1}
+                  >
+                    上一页
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void runWencaiQuery(wencaiPage + 1, wencaiPageSize)}
+                    disabled={loading || wencaiPage >= wencaiTotalPages}
+                  >
+                    下一页
+                  </button>
                   <button type="button" onClick={handleAddFavorites}>
                     <Star size={15} />
                     <span>加自选</span>
@@ -408,9 +489,9 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
                         {row.code}
                       </button>
                       <strong>{row.name}</strong>
-                      <span>{row.price.toFixed(2)}</span>
-                      <span data-direction={row.changePercent >= 0 ? "up" : "down"}>
-                        {formatPercent(row.changePercent)}
+                      <span>{formatNullablePrice(row.price)}</span>
+                      <span data-direction={directionOf(row.changePercent)}>
+                        {formatNullablePercent(row.changePercent)}
                       </span>
                       <span>{row.buySignal}</span>
                       <span>{row.technicalShape}</span>
@@ -495,11 +576,11 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
                     {chanMessage ? <span>{chanMessage}</span> : null}
                     <span>解析：{chanParser === "llm" ? "大模型" : "规则"}</span>
                   </div>
-                  <button type="button" onClick={handleAddChanFavorites}>
+                  <button type="button" onClick={() => void handleAddChanFavorites()}>
                     <Star size={15} />
                     <span>加自选</span>
                   </button>
-                  <button type="button" onClick={handleCreateChanBoard}>
+                  <button type="button" onClick={() => void handleCreateChanBoard()}>
                     <Plus size={15} />
                     <span>加板块</span>
                   </button>
@@ -569,8 +650,7 @@ export function ScreenerDock({ onSelectSymbol }: Props) {
               type="button"
               data-active={tab === feature.id}
               onClick={() => {
-                setTab(feature.id);
-                setOpen(true);
+                openScreenerPanel(feature.id);
               }}
               onDoubleClick={() => setOpen(false)}
             >
@@ -597,24 +677,101 @@ function toWatchlistItems(
 async function enrichChanScreenerRows(
   rows: ChanScreenerRow[],
 ): Promise<ChanScreenerRow[]> {
+  const wencaiRows = await loadWencaiRowsForChanSymbols(rows);
   return Promise.all(
     rows.map(async (row) => {
+      const wencaiRow = wencaiRows.get(row.symbol.toUpperCase());
+      const resolvedName = resolveChanRowName(row, wencaiRow);
       try {
-        const profileFields = await getSymbolProfileMarketFields(row.symbol, row.name);
+        const profileFields = await getSymbolProfileMarketFields(row.symbol, resolvedName);
         return {
           ...row,
+          name: resolvedName,
           market: {
             ...row.market,
+            price: row.market.price ?? wencaiRow?.price ?? null,
+            change_percent: row.market.change_percent ?? wencaiRow?.changePercent ?? null,
             industry: row.market.industry ?? profileFields.industry,
             fund_net_inflow:
               row.market.fund_net_inflow ?? profileFields.fundNetInflow,
           },
         };
       } catch {
-        return row;
+        return {
+          ...row,
+          name: resolvedName,
+          market: {
+            ...row.market,
+            price: row.market.price ?? wencaiRow?.price ?? null,
+            change_percent: row.market.change_percent ?? wencaiRow?.changePercent ?? null,
+          },
+        };
       }
     }),
   );
+}
+
+async function loadWencaiRowsForChanSymbols(
+  rows: ChanScreenerRow[],
+): Promise<Map<string, WencaiScreenerRow>> {
+  const pending = rows.filter(isChanNameFallback);
+  if (pending.length === 0) {
+    return new Map();
+  }
+  const chunks = chunkCodesForWencaiQuery(pending.map((row) => row.code));
+  const responses = await Promise.allSettled(
+    chunks.map((codes) =>
+      queryWencaiScreener(`${codes.join(" 或 ")} 股票简称 最新价 涨跌幅`, 1, 100),
+    ),
+  );
+  const result = new Map<string, WencaiScreenerRow>();
+  responses.forEach((response) => {
+    if (response.status !== "fulfilled") {
+      return;
+    }
+    response.value.rows.forEach((row) => {
+      result.set(row.symbol.toUpperCase(), row);
+    });
+  });
+  return result;
+}
+
+function resolveChanRowName(
+  row: ChanScreenerRow,
+  wencaiRow: WencaiScreenerRow | undefined,
+): string {
+  if (wencaiRow && !isCodeLikeName(wencaiRow.name, row.code, row.symbol)) {
+    return wencaiRow.name;
+  }
+  return row.name || row.code;
+}
+
+function isChanNameFallback(row: ChanScreenerRow): boolean {
+  return isCodeLikeName(row.name, row.code, row.symbol);
+}
+
+function isCodeLikeName(name: string | undefined, code: string, symbol: string): boolean {
+  const normalized = (name ?? "").trim().toUpperCase();
+  return !normalized || normalized === code.toUpperCase() || normalized === symbol.toUpperCase();
+}
+
+function chunkCodesForWencaiQuery(codes: string[]): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  codes.forEach((code) => {
+    const candidate = [...current, code];
+    const query = `${candidate.join(" 或 ")} 股票简称 最新价 涨跌幅`;
+    if (current.length > 0 && query.length > 480) {
+      chunks.push(current);
+      current = [code];
+    } else {
+      current = candidate;
+    }
+  });
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+  return chunks;
 }
 
 function compactQuery(query: string): string {

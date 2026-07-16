@@ -13,7 +13,6 @@ services:
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - ${POSTGRES_DATA_HOST_PATH:-tv_backend_pgdata}:/var/lib/postgresql/data
-      - ${POSTGRES_CHAN_C_TABLESPACE_HOST_PATH:-G:/tv-a-share-db/postgres-tablespaces}:/var/lib/postgresql/tablespaces_g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-tradingview_local}"]
       interval: 10s
@@ -82,7 +81,7 @@ services:
         condition: service_completed_successfully
     environment:
       APP_ENV: ${APP_ENV:-production}
-      API_TOKEN: ${API_TOKEN:-dev-local-token}
+      API_TOKEN: ${API_TOKEN:-}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       CORS_ORIGIN_REGEX: ${CORS_ORIGIN_REGEX:-}
@@ -95,10 +94,19 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.siliconflow.cn/v1}
       LLM_MODEL: ${LLM_MODEL:-deepseek-ai/DeepSeek-V3.2}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-20}
-      WENCAI_COOKIE: ${WENCAI_COOKIE:-}
-      WENCAI_USER_AGENT: ${WENCAI_USER_AGENT:-}
-      WENCAI_PRO: ${WENCAI_PRO:-false}
-      WENCAI_TIMEOUT_SECONDS: ${WENCAI_TIMEOUT_SECONDS:-20}
+    command:
+      - sh
+      - -ec
+      - |
+        if [ "$$APP_ENV" = "production" ]; then
+          case "$$API_TOKEN" in
+            ""|dev-local-token|change-me|change-me-before-long-running|replace-me|your-api-token)
+              echo "API_TOKEN must be a non-placeholder secret when APP_ENV=production" >&2
+              exit 1
+              ;;
+          esac
+        fi
+        exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
     ports:
       - "${API_BIND:-0.0.0.0}:${API_PORT:-8001}:8001"
     healthcheck:
@@ -165,6 +173,42 @@ services:
       MARKET_FILL_LOOP: ${MARKET_FILL_LOOP:-1}
       MARKET_FILL_LOOP_INTERVAL: ${MARKET_FILL_LOOP_INTERVAL:-60}
     command: ["python", "-m", "collector.worker", "market-fill"]
+    restart: unless-stopped
+
+  iwencai-sidebar-event-worker:
+    profiles: ["sidebar-iwencai"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.collector
+    container_name: tv_backend_iwencai_sidebar_event_worker
+    cap_drop: ["ALL"]
+    cap_add: ["SETUID", "SETGID"]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 2.0
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@timescaledb:5432/${POSTGRES_DB:-tradingview_local}
+      REDIS_URL: redis://redis:6379/0
+      IWENCAI_BASE_URL: ${IWENCAI_BASE_URL:-https://openapi.iwencai.com}
+      IWENCAI_API_KEY: ${IWENCAI_API_KEY:-}
+      IWENCAI_ALLOWED_HOSTS: ${IWENCAI_ALLOWED_HOSTS:-openapi.iwencai.com}
+      IWENCAI_TIMEOUT_SECONDS: ${IWENCAI_TIMEOUT_SECONDS:-5}
+      MARKET_DATA_PROVIDER_ORDER: ${MARKET_DATA_PROVIDER_ORDER:-notte,iwencai}
+      NOTTE_API_KEY: ${NOTTE_API_KEY:-}
+      NOTTE_FUNCTION_ID: ${NOTTE_FUNCTION_ID:-e4157137-02c9-4052-85c0-9ee5c2c91682}
+      NOTTE_TIMEOUT_SECONDS: ${NOTTE_TIMEOUT_SECONDS:-45}
+    command: ["python", "-m", "collector.worker", "iwencai-sidebar-events"]
     restart: unless-stopped
 
   history-backfill-worker:

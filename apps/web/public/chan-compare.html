@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>缠论模块 B / C 轻量对比</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #071019;
+        --panel: #101a27;
+        --border: #29415a;
+        --text: #e6f1ff;
+        --muted: #91a6bb;
+        --accent: #40c4ff;
+        --up: #00a889;
+        --down: #ff3f55;
+        --level-5f: #f5a623;
+        --level-30f: #11bfb3;
+        --level-1d: #ef5b93;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--border);
+        background: rgba(16, 26, 39, 0.96);
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 15px;
+        letter-spacing: 0.04em;
+      }
+
+      form {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      input,
+      select,
+      button {
+        height: 30px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #071019;
+        color: var(--text);
+        padding: 0 8px;
+      }
+
+      button {
+        cursor: pointer;
+        background: #0f5f88;
+        border-color: #1885bd;
+        font-weight: 700;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        height: calc(100vh - 52px);
+      }
+
+      section {
+        min-width: 0;
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+      }
+
+      section:last-child {
+        border-right: 0;
+      }
+
+      .title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 12px;
+        font-size: 13px;
+        color: var(--muted);
+        background: #0b1420;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .title strong {
+        color: var(--accent);
+      }
+
+      .engine {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .chart {
+        flex: 1;
+        min-height: 0;
+        background: #ffffff;
+      }
+
+      svg {
+        display: block;
+        width: 100%;
+        height: 100%;
+        background: #ffffff;
+      }
+
+      .status {
+        padding: 8px 12px;
+        min-height: 34px;
+        color: var(--muted);
+        border-top: 1px solid var(--border);
+        background: #0b1420;
+        font-size: 12px;
+      }
+
+      .legend {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .error {
+        color: #ff8f8f;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>缠论模块 B / C 轻量对比</h1>
+      <form id="controls">
+        <label for="symbol">标的</label>
+        <input id="symbol" name="symbol" value="000001.SZ" />
+        <label for="interval">周期</label>
+        <select id="interval" name="interval">
+          <option value="5f">5f</option>
+          <option value="30f">30f</option>
+          <option value="1d">1d</option>
+        </select>
+        <label for="limit">K线根数</label>
+        <input id="limit" name="limit" type="number" min="50" max="5000" value="300" />
+        <button type="submit">刷新对比</button>
+        <span class="legend">橙=5f，青=30f，粉=日线；矩形为中枢。</span>
+      </form>
+    </header>
+    <main>
+      <section>
+        <div class="title">
+          <strong>模块 B</strong>
+          <span id="engine-b" class="engine">API 8004</span>
+        </div>
+        <div class="chart"><svg id="chart-b" role="img" aria-label="模块 B"></svg></div>
+        <div id="status-b" class="status">等待加载</div>
+      </section>
+      <section>
+        <div class="title">
+          <strong>模块 C</strong>
+          <span id="engine-c" class="engine">API 8003</span>
+        </div>
+        <div class="chart"><svg id="chart-c" role="img" aria-label="模块 C"></svg></div>
+        <div id="status-c" class="status">等待加载</div>
+      </section>
+    </main>
+    <script>
+      const TOKEN = "dev-local-token";
+      const API_B = "http://127.0.0.1:8004";
+      const API_C = "http://127.0.0.1:8003";
+      const LEVEL_STYLE = {
+        "5f": { color: "#f5a623", width: 1.2, opacity: 0.8 },
+        "30f": { color: "#11bfb3", width: 1.8, opacity: 0.9 },
+        "1d": { color: "#ef5b93", width: 2.4, opacity: 0.95 },
+      };
+
+      const params = new URLSearchParams(window.location.search);
+      const symbolInput = document.querySelector("#symbol");
+      const intervalInput = document.querySelector("#interval");
+      const limitInput = document.querySelector("#limit");
+      symbolInput.value = params.get("symbol") || "000001.SZ";
+      intervalInput.value = params.get("interval") || "1d";
+      limitInput.value = params.get("limit") || "300";
+
+      document.querySelector("#controls").addEventListener("submit", (event) => {
+        event.preventDefault();
+        updateUrl();
+        void refresh();
+      });
+
+      window.addEventListener("resize", () => void refresh());
+
+      function updateUrl() {
+        const query = new URLSearchParams({
+          symbol: cleanSymbol(),
+          interval: intervalInput.value,
+          limit: cleanLimit().toString(),
+        });
+        window.history.replaceState(null, "", `/chan-compare.html?${query.toString()}`);
+      }
+
+      function cleanSymbol() {
+        return (symbolInput.value || "000001.SZ").trim().toUpperCase();
+      }
+
+      function cleanLimit() {
+        const parsed = Number.parseInt(limitInput.value, 10);
+        if (!Number.isFinite(parsed)) {
+          return 300;
+        }
+        return Math.max(50, Math.min(5000, parsed));
+      }
+
+      async function refresh() {
+        const symbol = cleanSymbol();
+        const timeframe = intervalInput.value;
+        const limit = cleanLimit();
+        await Promise.all([
+          renderPanel("b", API_B, symbol, timeframe, limit),
+          renderPanel("c", API_C, symbol, timeframe, limit),
+        ]);
+      }
+
+      async function renderPanel(key, apiBase, symbol, timeframe, limit) {
+        const svg = document.querySelector(`#chart-${key}`);
+        const status = document.querySelector(`#status-${key}`);
+        const engine = document.querySelector(`#engine-${key}`);
+        status.textContent = "加载中...";
+        status.classList.remove("error");
+        svg.textContent = "";
+        try {
+          const [barsResponse, overlay] = await Promise.all([
+            fetchJson(`${apiBase}/api/v3/chart/bars?${new URLSearchParams({ symbol, timeframe, limit })}`),
+            fetchJson(`${apiBase}/api/v3/chart/overlay?${new URLSearchParams({
+              symbol,
+              timeframe,
+              limit,
+              levels: "5f,30f,1d",
+              modes: "confirmed",
+            })}`),
+          ]);
+          const bars = Array.isArray(barsResponse.bars) ? barsResponse.bars : [];
+          draw(svg, bars, overlay);
+          const levelCounts = countByLevel(overlay.strokes || []);
+          engine.textContent = `${apiBase} | ${overlay.engine || "unknown"}`;
+          status.textContent = `K线 ${bars.length} 根；笔 ${overlay.strokes?.length || 0} 条；中枢 ${overlay.centers?.length || 0} 个；级别 ${Object.entries(levelCounts).map(([k, v]) => `${k}:${v}`).join(" / ") || "--"}`;
+        } catch (error) {
+          engine.textContent = `${apiBase} | 加载失败`;
+          status.textContent = error instanceof Error ? error.message : String(error);
+          status.classList.add("error");
+        }
+      }
+
+      async function fetchJson(url) {
+        const response = await fetch(url, {
+          headers: { Authorization: `Bearer ${TOKEN}` },
+        });
+        if (!response.ok) {
+          throw new Error(`${url} -> HTTP ${response.status}`);
+        }
+        return response.json();
+      }
+
+      function draw(svg, bars, overlay) {
+        const rect = svg.getBoundingClientRect();
+        const width = Math.max(600, Math.floor(rect.width || 900));
+        const height = Math.max(420, Math.floor(rect.height || 600));
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.textContent = "";
+
+        const pad = { left: 52, right: 18, top: 18, bottom: 34 };
+        const plot = {
+          left: pad.left,
+          right: width - pad.right,
+          top: pad.top,
+          bottom: height - pad.bottom,
+          width: width - pad.left - pad.right,
+          height: height - pad.top - pad.bottom,
+        };
+        if (bars.length === 0) {
+          addText(svg, width / 2, height / 2, "无K线数据", "#667");
+          return;
+        }
+
+        const times = bars.map((bar) => Number(bar.time)).filter(Number.isFinite);
+        const minTime = Math.min(...times);
+        const maxTime = Math.max(...times);
+        const prices = [];
+        for (const bar of bars) {
+          prices.push(Number(bar.high), Number(bar.low));
+        }
+        for (const stroke of overlay.strokes || []) {
+          prices.push(Number(stroke.start?.price), Number(stroke.end?.price));
+        }
+        for (const center of overlay.centers || []) {
+          prices.push(Number(center.high), Number(center.low));
+        }
+        const cleanPrices = prices.filter(Number.isFinite);
+        const minPrice = Math.min(...cleanPrices);
+        const maxPrice = Math.max(...cleanPrices);
+        const pricePad = Math.max((maxPrice - minPrice) * 0.08, 0.01);
+        const low = minPrice - pricePad;
+        const high = maxPrice + pricePad;
+
+        const x = (time) => {
+          if (maxTime === minTime) return plot.left + plot.width / 2;
+          return plot.left + ((Number(time) - minTime) / (maxTime - minTime)) * plot.width;
+        };
+        const y = (price) => plot.bottom - ((Number(price) - low) / (high - low)) * plot.height;
+
+        drawGrid(svg, plot, low, high, y);
+        drawBars(svg, bars, x, y, plot);
+        drawCenters(svg, overlay.centers || [], x, y, plot);
+        drawStrokes(svg, overlay.strokes || [], x, y, plot);
+      }
+
+      function drawGrid(svg, plot, low, high, y) {
+        for (let i = 0; i <= 6; i += 1) {
+          const price = low + ((high - low) * i) / 6;
+          const yy = y(price);
+          addLine(svg, plot.left, yy, plot.right, yy, "#edf1f5", 1, 1);
+          addText(svg, 6, yy + 4, price.toFixed(2), "#637083");
+        }
+      }
+
+      function drawBars(svg, bars, x, y, plot) {
+        const barWidth = Math.max(2, Math.min(8, plot.width / Math.max(bars.length, 1) * 0.58));
+        for (const bar of bars) {
+          const xx = x(bar.time);
+          const open = Number(bar.open);
+          const high = Number(bar.high);
+          const low = Number(bar.low);
+          const close = Number(bar.close);
+          const color = close >= open ? "var(--up)" : "var(--down)";
+          addLine(svg, xx, y(low), xx, y(high), color, 1, 1);
+          const top = Math.min(y(open), y(close));
+          const bodyHeight = Math.max(1, Math.abs(y(open) - y(close)));
+          const body = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+          body.setAttribute("x", String(xx - barWidth / 2));
+          body.setAttribute("y", String(top));
+          body.setAttribute("width", String(barWidth));
+          body.setAttribute("height", String(bodyHeight));
+          body.setAttribute("fill", color);
+          svg.appendChild(body);
+        }
+      }
+
+      function drawCenters(svg, centers, x, y, plot) {
+        for (const center of centers) {
+          const level = String(center.level || "");
+          const style = LEVEL_STYLE[level] || LEVEL_STYLE["30f"];
+          const start = Number(center.begin_base_ts ?? center.start_time);
+          const end = Number(center.end_base_ts ?? center.end_time);
+          const high = Number(center.high);
+          const low = Number(center.low);
+          if (![start, end, high, low].every(Number.isFinite)) continue;
+          const left = clamp(Math.min(x(start), x(end)), plot.left, plot.right);
+          const right = clamp(Math.max(x(start), x(end)), plot.left, plot.right);
+          if (right <= plot.left || left >= plot.right) continue;
+          const top = y(high);
+          const height = Math.max(2, y(low) - top);
+          const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+          rect.setAttribute("x", String(left));
+          rect.setAttribute("y", String(top));
+          rect.setAttribute("width", String(Math.max(2, right - left)));
+          rect.setAttribute("height", String(height));
+          rect.setAttribute("fill", style.color);
+          rect.setAttribute("fill-opacity", "0.22");
+          rect.setAttribute("stroke", style.color);
+          rect.setAttribute("stroke-width", "1");
+          rect.setAttribute("stroke-opacity", "0.75");
+          svg.appendChild(rect);
+        }
+      }
+
+      function drawStrokes(svg, strokes, x, y, plot) {
+        const ordered = [...strokes].sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+        for (const stroke of ordered) {
+          const level = String(stroke.level || "");
+          const style = LEVEL_STYLE[level] || LEVEL_STYLE["30f"];
+          const startTime = Number(stroke.start?.base_ts ?? stroke.begin_base_ts ?? stroke.start?.time);
+          const endTime = Number(stroke.end?.base_ts ?? stroke.end_base_ts ?? stroke.end?.time);
+          const startPrice = Number(stroke.start?.price);
+          const endPrice = Number(stroke.end?.price);
+          if (![startTime, endTime, startPrice, endPrice].every(Number.isFinite)) continue;
+          const x1 = x(startTime);
+          const x2 = x(endTime);
+          if (Math.max(x1, x2) < plot.left || Math.min(x1, x2) > plot.right) continue;
+          addLine(svg, x1, y(startPrice), x2, y(endPrice), style.color, style.width, style.opacity);
+          addText(svg, x2 + 3, y(endPrice) - 3, level, style.color);
+        }
+      }
+
+      function addLine(svg, x1, y1, x2, y2, color, width, opacity) {
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", String(x1));
+        line.setAttribute("y1", String(y1));
+        line.setAttribute("x2", String(x2));
+        line.setAttribute("y2", String(y2));
+        line.setAttribute("stroke", color);
+        line.setAttribute("stroke-width", String(width));
+        line.setAttribute("stroke-opacity", String(opacity));
+        svg.appendChild(line);
+      }
+
+      function addText(svg, x, y, text, color) {
+        const node = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        node.setAttribute("x", String(x));
+        node.setAttribute("y", String(y));
+        node.setAttribute("fill", color);
+        node.setAttribute("font-size", "11");
+        node.textContent = text;
+        svg.appendChild(node);
+      }
+
+      function countByLevel(items) {
+        return items.reduce((acc, item) => {
+          const level = String(item.level || "unknown");
+          acc[level] = (acc[level] || 0) + 1;
+          return acc;
+        }, {});
+      }
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      void refresh();
+    </script>
+  </body>
+</html>

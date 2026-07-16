@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 
 @dataclass(frozen=True)
 class Settings:
-    app_env: str = os.getenv("APP_ENV", "development")
-    api_token: str = os.getenv("API_TOKEN", "dev-local-token")
-    admin_api_token: str = os.getenv("ADMIN_API_TOKEN", "")
+    app_env: str = field(default_factory=lambda: os.getenv("APP_ENV", "development"))
+    api_token: str = field(default_factory=lambda: os.getenv("API_TOKEN", "dev-local-token"))
+    admin_api_token: str = field(default_factory=lambda: os.getenv("ADMIN_API_TOKEN", ""))
     cors_origins: tuple[str, ...] = tuple(
         origin.strip()
         for origin in os.getenv(
@@ -48,6 +48,11 @@ class Settings:
     }
     wencai_cookie: str = os.getenv("WENCAI_COOKIE", "")
     iwencai_base_url: str = os.getenv("IWENCAI_BASE_URL", "https://openapi.iwencai.com")
+    iwencai_allowed_hosts: tuple[str, ...] = tuple(
+        host.strip().lower()
+        for host in os.getenv("IWENCAI_ALLOWED_HOSTS", "openapi.iwencai.com").split(",")
+        if host.strip()
+    )
     iwencai_api_key: str = os.getenv("IWENCAI_API_KEY", "")
     wencai_user_agent: str = os.getenv("WENCAI_USER_AGENT", "")
     wencai_pro: bool = os.getenv("WENCAI_PRO", "false").lower() in {
@@ -58,7 +63,35 @@ class Settings:
     }
     wencai_timeout_seconds: float = float(os.getenv("WENCAI_TIMEOUT_SECONDS", "20"))
 
+    def __post_init__(self) -> None:
+        if self.app_env.strip().lower() == "production":
+            _validate_production_token("API_TOKEN", self.api_token)
+            if self.admin_api_token:
+                _validate_production_token("ADMIN_API_TOKEN", self.admin_api_token)
+
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+_PUBLIC_API_TOKENS = {
+    "dev-local-token",
+    "change-me",
+    "change-me-before-long-running",
+    "change-me-long-random-token",
+    "replace-me",
+    "your-api-token",
+}
+
+
+def _validate_production_token(name: str, token: str) -> None:
+    normalized = token.strip().lower()
+    if (
+        not normalized
+        or normalized in _PUBLIC_API_TOKENS
+        or any(value in normalized for value in ("dev-local-token", "change-me", "replace-me"))
+    ):
+        raise RuntimeError(f"{name} must be a non-placeholder secret when APP_ENV=production")
+    if len(token) < 32 or len(set(token)) < 12:
+        raise RuntimeError(f"{name} must be a high-entropy secret when APP_ENV=production")

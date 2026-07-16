@@ -1,5 +1,5 @@
-import { chartDataManager } from "../api/chartDataManager";
-import { getBars as getBarsHttp, searchSymbols } from "../api/client";
+import { chartDataManager, type ChartDataManager } from "../api/chartDataManager";
+import { searchSymbols } from "../api/client";
 import { patchTvDebug, recordTvDebug } from "./debug";
 import { TIMEFRAME_BY_INTERVAL, toTradingViewTime } from "./time";
 
@@ -15,38 +15,32 @@ type TvBar = {
 
 const RESOLUTIONS = ["5", "15", "30", "60", "D", "W", "M"];
 const REALTIME_POLL_INTERVAL_MS = 3_000;
-const MAX_BARS_PER_REQUEST = 5_000;
-const FIRST_LOAD_PREFETCH_BARS: Record<string, number> = {
-  "5f": 3000,
-  "15f": 2400,
-  "30f": 2000,
-  "1h": 1600,
-  "1d": 1200,
-  "1w": 800,
-  "1m": 600,
-};
-const PAN_PREFETCH_BARS: Record<string, number> = {
-  "5f": 1800,
-  "15f": 1200,
-  "30f": 1000,
-  "1h": 800,
-  "1d": 600,
-  "1w": 400,
-  "1m": 300,
-};
+const MAX_DIRECTIONAL_GUARD_BARS = 200;
 
 const realtimeSubscriptions = new Map<
   string,
   {
     timer: number;
-    latestSignature: string;
+    unsubscribe?: () => void;
+    closed: boolean;
     symbol: string;
     timeframe: string;
     resolution: string;
   }
 >();
 
-export function createDatafeed() {
+export function createDatafeed(manager: ChartDataManager = chartDataManager) {
+  let activeHistoryContext = "";
+  let activeHistoryEpoch = 0;
+  let historyAbortController: AbortController | null = null;
+
+  const resetHistoryContext = () => {
+    historyAbortController?.abort();
+    historyAbortController = null;
+    activeHistoryContext = "";
+    activeHistoryEpoch += 1;
+  };
+
   return {
     onReady(callback: Callback) {
       setTimeout(() => {
@@ -107,8 +101,8 @@ export function createDatafeed() {
           full_name: symbol,
           description: symbol,
           type: "stock",
-          session: "24x7",
-          session_display: "24x7",
+          session: "0930-1130,1300-1500",
+          session_display: "0930-1130,1300-1500",
           timezone: "Asia/Shanghai",
           exchange,
           listed_exchange: exchange,
@@ -144,55 +138,48 @@ export function createDatafeed() {
     ) {
       const symbol = symbolInfo.ticker ?? symbolInfo.name ?? "";
       const timeframe = TIMEFRAME_BY_INTERVAL[resolution] ?? "5f";
-      const sessionRange = chartDataManager.getSessionBarRange(symbol, timeframe);
-      const panDirection = inferPanDirection(periodParams, sessionRange);
-      const prefetchLimit = periodParams.firstDataRequest
-        ? firstLoadPrefetchBars(timeframe)
-        : panPrefetchBars(timeframe, panDirection);
-      const requestedLimit = Math.min(
-        MAX_BARS_PER_REQUEST,
-        Math.max(
-          periodParams.countBack ?? 300,
-          prefetchLimit,
-        ),
-      );
-      // TradingView's from/to window can fall on non-trading gaps while panning.
-      // Query by countBack + to so the backend can return the nearest prior bars.
-      const requestFrom = undefined;
+      const request = planHistoryRequest(periodParams);
+      const context = `${symbol.toUpperCase()}|${timeframe}`;
+      if (context !== activeHistoryContext) {
+        historyAbortController?.abort();
+        historyAbortController = new AbortController();
+        activeHistoryContext = context;
+        activeHistoryEpoch += 1;
+      }
+      historyAbortController ??= new AbortController();
+      const requestEpoch = activeHistoryEpoch;
+      const signal = historyAbortController.signal;
       recordTvDebug("datafeed.getBars.request", {
         symbol,
         resolution,
         timeframe,
-        from: requestFrom,
-        to: periodParams.to,
+        from: request.from,
+        to: request.to,
         countBack: periodParams.countBack,
-        requestedLimit,
-        panDirection,
-        sessionRange,
+        requestedLimit: request.limit,
+        guard: request.guard,
         firstDataRequest: periodParams.firstDataRequest,
       });
-      getBarsHttp(
-        symbol,
-        timeframe,
-        requestedLimit,
-        requestFrom,
-        periodParams.to,
-      )
+      manager.getBars({ symbol, timeframe, ...request, signal })
         .then((response) => {
+          if (context !== activeHistoryContext || requestEpoch !== activeHistoryEpoch) {
+            recordTvDebug("datafeed.getBars.stale", { symbol, timeframe });
+            return;
+          }
           const bars = response.bars.map((bar) => toTvBar(bar, resolution));
           const firstBar = response.bars[0];
           const lastBar = response.bars[response.bars.length - 1];
           if (response.bars.length > 0) {
-            chartDataManager.publishHistoryWindow({
+            manager.publishHistoryWindow({
               source: "tradingview-datafeed",
               symbol,
               timeframe,
               resolution,
-              requestedFrom: requestFrom,
-              requestedTo: periodParams.to,
+              requestedFrom: request.from,
+              requestedTo: request.to,
               from: firstBar?.time ?? periodParams.from,
               to: lastBar?.time ?? periodParams.to,
-              limit: Math.max(response.bars.length, requestedLimit),
+              limit: Math.max(response.bars.length, request.limit),
               bars: response.bars,
               first: firstBar?.time,
               last: lastBar?.time,
@@ -202,10 +189,9 @@ export function createDatafeed() {
               symbol,
               resolution,
               timeframe,
-              from: requestFrom,
-              to: periodParams.to,
-              requestedLimit,
-              panDirection,
+              from: request.from,
+              to: request.to,
+              requestedLimit: request.limit,
             });
           }
           patchTvDebug("datafeed", {
@@ -213,10 +199,9 @@ export function createDatafeed() {
               symbol,
               resolution,
               timeframe,
-              from: requestFrom,
-              to: periodParams.to,
-              requestedLimit,
-              panDirection,
+              from: request.from,
+              to: request.to,
+              requestedLimit: request.limit,
               count: bars.length,
               first: bars[0]?.time,
               last: bars[bars.length - 1]?.time,
@@ -229,18 +214,19 @@ export function createDatafeed() {
             count: bars.length,
             transport: "http-bars",
           });
-          onHistory(bars, { noData: bars.length === 0 });
+          onHistory(bars, { noData: response.noData === true });
         })
         .catch((error) => {
-          const message = String(error);
-          recordTvDebug("datafeed.getBars.error", message);
           if (
-            timeframe === "5f" &&
-            message.includes("Chan service requires 5f base bars for recursive analysis")
+            signal.aborted ||
+            context !== activeHistoryContext ||
+            requestEpoch !== activeHistoryEpoch
           ) {
-            onHistory([], { noData: true });
+            recordTvDebug("datafeed.getBars.aborted", { symbol, timeframe });
             return;
           }
+          const message = String(error);
+          recordTvDebug("datafeed.getBars.error", message);
           onError(message);
         });
     },
@@ -255,53 +241,110 @@ export function createDatafeed() {
       const timeframe = TIMEFRAME_BY_INTERVAL[resolution] ?? "5f";
       const subscription = {
         timer: 0,
-        latestSignature: "",
+        unsubscribe: undefined as (() => void) | undefined,
+        closed: false,
         symbol,
         timeframe,
         resolution,
       };
 
+      const acceptBar = (
+        bar: {
+          time: number;
+          open: number;
+          high: number;
+          low: number;
+          close: number;
+          volume: number;
+          revision?: number;
+          complete?: boolean;
+        },
+        responseSymbol: string,
+        responseTimeframe: string,
+        snapshotVersion?: string,
+        seq?: number,
+        sessionGeneration?: number,
+      ) => {
+        const accepted = manager.handleRealtimeBarUpdate({
+          symbol: responseSymbol.toUpperCase(),
+          timeframe: responseTimeframe,
+          snapshotVersion,
+          seq,
+          sessionGeneration,
+          bar,
+        });
+        if (!accepted) {
+          return;
+        }
+        recordTvDebug("datafeed.subscribeBars.tick", {
+          symbol,
+          timeframe,
+          subscriberUid,
+          transport: manager.transportMode,
+        });
+        onRealtime(toTvBar(bar, resolution));
+      };
+
       const poll = async () => {
         try {
-          const response = await getBarsHttp(symbol, timeframe, 2);
+          const response = await manager.getBars({
+            symbol,
+            timeframe,
+            limit: 2,
+          });
           const bar = response.bars[response.bars.length - 1];
           if (!bar) {
             return;
           }
-          const signature = [
-            bar.time,
-            bar.revision,
-            bar.close,
-            bar.volume,
-            bar.complete ? 1 : 0,
-          ].join(":");
-          if (signature === subscription.latestSignature) {
-            return;
-          }
-          subscription.latestSignature = signature;
-          chartDataManager.handleRealtimeBarUpdate({
-            symbol: response.symbol.toUpperCase(),
-            timeframe: response.timeframe,
-            bar,
-          });
-          recordTvDebug("datafeed.subscribeBars.tick", {
-            symbol,
-            timeframe,
-            subscriberUid,
-            transport: "http-bars",
-          });
-          onRealtime(toTvBar(bar, resolution));
+          acceptBar(bar, response.symbol, response.timeframe);
         } catch (error) {
           recordTvDebug("datafeed.subscribeBars.error", String(error));
         }
       };
 
-      recordTvDebug("datafeed.subscribeBars.open", { symbol, timeframe, subscriberUid });
-      void poll();
-      subscription.timer = window.setInterval(() => {
+      const startPollingFallback = () => {
+        if (subscription.closed || subscription.timer) {
+          return;
+        }
         void poll();
-      }, REALTIME_POLL_INTERVAL_MS);
+        subscription.timer = window.setInterval(() => {
+          void poll();
+        }, REALTIME_POLL_INTERVAL_MS);
+      };
+
+      recordTvDebug("datafeed.subscribeBars.open", { symbol, timeframe, subscriberUid });
       realtimeSubscriptions.set(subscriberUid, subscription);
+      void poll();
+      void manager.subscribeRealtimeBars(
+        {
+          symbol,
+          timeframe,
+        },
+        (event) => {
+          acceptBar(
+            event.bar,
+            event.symbol,
+            event.timeframe,
+            event.snapshotVersion,
+            event.seq,
+            event.sessionGeneration,
+          );
+        },
+        (generation) => {
+          manager.beginRealtimeSession(symbol, timeframe, generation);
+        },
+      )
+        .then((unsubscribe) => {
+          if (subscription.closed) {
+            unsubscribe();
+            return;
+          }
+          subscription.unsubscribe = unsubscribe;
+        })
+        .catch((error) => {
+          recordTvDebug("datafeed.subscribeBars.realtimeFallback", String(error));
+          startPollingFallback();
+        });
     },
 
     unsubscribeBars(subscriberUid: string) {
@@ -309,8 +352,19 @@ export function createDatafeed() {
       if (!subscription) {
         return;
       }
-      window.clearInterval(subscription.timer);
+      subscription.closed = true;
+      subscription.unsubscribe?.();
+      if (subscription.timer) {
+        window.clearInterval(subscription.timer);
+      }
       realtimeSubscriptions.delete(subscriberUid);
+      if (`${subscription.symbol.toUpperCase()}|${subscription.timeframe}` === activeHistoryContext) {
+        resetHistoryContext();
+      }
+    },
+
+    resetCache() {
+      resetHistoryContext();
     },
   };
 }
@@ -336,42 +390,20 @@ function toTvBar(
   };
 }
 
-type SessionRange = { from?: number; to?: number; count: number } | null;
-type PanDirection = "initial" | "older" | "newer" | "overlap";
-
-function inferPanDirection(
-  periodParams: { from: number; to: number; firstDataRequest?: boolean },
-  sessionRange: SessionRange,
-): PanDirection {
-  if (periodParams.firstDataRequest || !sessionRange || sessionRange.count === 0) {
-    return "initial";
-  }
-  if (sessionRange.from !== undefined && periodParams.to < sessionRange.from) {
-    return "older";
-  }
-  if (sessionRange.to !== undefined && periodParams.from > sessionRange.to) {
-    return "newer";
-  }
-  if (sessionRange.to !== undefined && periodParams.to < sessionRange.to) {
-    return "older";
-  }
-  if (sessionRange.from !== undefined && periodParams.from > sessionRange.from) {
-    return "newer";
-  }
-  return "overlap";
-}
-
-function firstLoadPrefetchBars(timeframe: string): number {
-  return FIRST_LOAD_PREFETCH_BARS[timeframe] ?? 1200;
-}
-
-function panPrefetchBars(timeframe: string, direction: PanDirection): number {
-  const base = PAN_PREFETCH_BARS[timeframe] ?? 600;
-  if (direction === "older") {
-    return Math.min(MAX_BARS_PER_REQUEST, Math.round(base * 1.5));
-  }
-  if (direction === "newer") {
-    return Math.max(300, Math.round(base * 0.75));
-  }
-  return base;
+export function planHistoryRequest(periodParams: {
+  from: number;
+  to: number;
+  countBack?: number;
+  firstDataRequest?: boolean;
+}): { from?: number; to: number; limit: number; guard: number } {
+  const countBack = Math.max(1, periodParams.countBack ?? 1);
+  const guard = Math.min(MAX_DIRECTIONAL_GUARD_BARS, Math.ceil(countBack * 0.25));
+  return {
+    // On a symbol/timeframe switch, one end-anchored countBack query avoids
+    // waiting for a ranged response followed by a second deficit request.
+    from: periodParams.firstDataRequest ? undefined : periodParams.from,
+    to: periodParams.to,
+    limit: countBack + guard,
+    guard,
+  };
 }

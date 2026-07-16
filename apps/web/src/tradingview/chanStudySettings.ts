@@ -24,7 +24,7 @@ type StudyInputDefinition = {
 
 type PineInputGetter = (index: number) => StudyInputValue;
 
-const LEVELS: ChanLevel[] = ["5f", "30f", "1d"];
+const LEVELS: ChanLevel[] = ["5f", "30f", "1d", "1w", "1m"];
 const SIGNAL_VARIANTS = ["1", "2", "2s", "3", "other"] as const;
 
 export type ChanStudySignalVariant = (typeof SIGNAL_VARIANTS)[number];
@@ -37,6 +37,8 @@ export type ChanStudyDisplaySettings = {
 const LEVEL_LABELS: Record<ChanLevel, string> = {
   "5f": "5f",
   "30f": "30f",
+  "1w": "周线",
+  "1m": "月线",
   "1d": "日线",
 };
 
@@ -44,6 +46,8 @@ export const CHAN_STUDY_INPUTS: StudyInputDefinition[] = [
   boolInput("show_5f", "显示 5f 级别", true),
   boolInput("show_30f", "显示 30f 级别", true),
   boolInput("show_1d", "显示日线级别", true),
+  boolInput("show_1w", "显示周线级别", true),
+  boolInput("show_1m", "显示月线级别", true),
   boolInput("show_strokes", "显示笔", true),
   boolInput("show_segments", "显示线段", true),
   boolInput("show_centers", "显示中枢", true),
@@ -91,6 +95,8 @@ export function chanOverlaySettingsToStudyInputs(
     show_5f: settings.levels["5f"],
     show_30f: settings.levels["30f"],
     show_1d: settings.levels["1d"],
+    show_1w: settings.levels["1w"],
+    show_1m: settings.levels["1m"],
     show_strokes: settings.parts.strokes,
     show_segments: settings.parts.segments,
     show_centers: settings.parts.centers,
@@ -188,6 +194,8 @@ function studyInputRecordToOverlaySettings(
       "5f": readBoolean(values.show_5f, fallback.levels["5f"]),
       "30f": readBoolean(values.show_30f, fallback.levels["30f"]),
       "1d": readBoolean(values.show_1d, fallback.levels["1d"]),
+      "1w": readBoolean(values.show_1w, fallback.levels["1w"]),
+      "1m": readBoolean(values.show_1m, fallback.levels["1m"]),
     },
     modes: {
       confirmed: readBoolean(values.show_confirmed, fallback.modes.confirmed),
@@ -214,6 +222,8 @@ function studyInputRecordToOverlaySettings(
       "5f": readLevelStyle(values, "5f", fallback),
       "30f": readLevelStyle(values, "30f", fallback),
       "1d": readLevelStyle(values, "1d", fallback),
+      "1w": readLevelStyle(values, "1w", fallback),
+      "1m": readLevelStyle(values, "1m", fallback),
     },
   };
 }

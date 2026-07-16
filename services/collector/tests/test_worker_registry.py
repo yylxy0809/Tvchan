@@ -21,6 +21,7 @@ def test_list_workers_is_sorted() -> None:
     assert "chan-tail-publisher" not in names
     assert "realtime-pipeline" not in names
     assert "tdx-csv-import" in names
+    assert "iwencai-sidebar-events" in names
 
 
 def test_run_worker_restores_argv(monkeypatch) -> None:

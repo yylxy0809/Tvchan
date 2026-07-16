@@ -5,6 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.db import lifespan
+from app.market_sidebar import router as market_sidebar_router
+from app.market_sidebar.repository import RedisSidebarSnapshotRepository
+from app.market_sidebar.service import SidebarAggregator
 from app.routes.registry import register_routes
 
 
@@ -25,6 +28,10 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     register_routes(app)
+    repository = RedisSidebarSnapshotRepository(settings.redis_url)
+    app.state.market_sidebar_repository = repository
+    app.state.market_sidebar_aggregator = SidebarAggregator(repository)
+    app.include_router(market_sidebar_router, prefix="/api/v3")
     return app
 
 

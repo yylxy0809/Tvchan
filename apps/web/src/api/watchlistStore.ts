@@ -115,11 +115,14 @@ function reviveGroup(value: unknown): WatchlistGroup | null {
               typeof (item as WatchlistItem).symbol === "string"
             );
           })
-          .map((item) => ({
-            symbol: item.symbol.toUpperCase(),
-            name: normalizeSymbolName(item.name || item.symbol),
-            exchange: item.exchange || inferExchangeFromSymbol(item.symbol),
-          }))
+          .map((item) => {
+            const symbol = normalizeWatchlistSymbol(item.symbol);
+            return {
+              symbol,
+              name: normalizeSymbolName(item.name || symbol),
+              exchange: inferExchangeFromSymbol(symbol),
+            };
+          })
       : [],
   };
 }
@@ -150,11 +153,11 @@ function mergeItems(
 ): WatchlistItem[] {
   const merged = new Map<string, WatchlistItem>();
   [...existing, ...incoming].forEach((item) => {
-    const symbol = item.symbol.toUpperCase();
+    const symbol = normalizeWatchlistSymbol(item.symbol);
     merged.set(symbol, {
       symbol,
       name: normalizeSymbolName(item.name || symbol),
-      exchange: item.exchange || inferExchangeFromSymbol(symbol),
+      exchange: inferExchangeFromSymbol(symbol),
     });
   });
   return Array.from(merged.values());
@@ -171,12 +174,28 @@ function normalizeSymbolName(name: string): string {
   return name === "Ping An Bank" ? "平安银行" : name;
 }
 
+function normalizeWatchlistSymbol(symbol: string): string {
+  const upper = symbol.trim().toUpperCase();
+  const code = upper.split(".")[0];
+  if (/^\d{6}$/.test(code)) {
+    return `${code}.${inferExchangeFromCode(code)}`;
+  }
+  return upper;
+}
+
 function inferExchangeFromSymbol(symbol: string): string {
+  const code = symbol.split(".")[0];
+  if (/^\d{6}$/.test(code)) {
+    return inferExchangeFromCode(code);
+  }
   const suffix = symbol.split(".")[1];
   if (suffix) {
     return suffix.toUpperCase();
   }
-  const code = symbol.split(".")[0];
+  return "SZ";
+}
+
+function inferExchangeFromCode(code: string): string {
   if (/^(4|8|920)/.test(code)) {
     return "BJ";
   }

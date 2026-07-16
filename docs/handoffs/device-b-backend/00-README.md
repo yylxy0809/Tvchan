@@ -1,5 +1,11 @@
 # 设备 B 后端无缝交接总索引
 
+> **2026-07-16 当前执行入口：** [13-设备 B 接管执行方案](13-device-b-takeover-execution-plan-2026-07-16.md)。
+> 设备 B 先等待设备 A 完成并合入 PR #5；随后按 foundation -> execution -> replay/gate 三层 `rebase --onto` 重建。不得直接合并旧 PR #3/#4/#6，也不得在 Gate FE 前启动新的全市场重算。
+> 本入口优先于旧的 `12` 中关于旧 sidebar 分支、一次性集成分支和 replay 前置状态的说明。
+
+> **2026-07-14 更新：** 当前接管入口已经更新为 [12-设备 B 全项目接管交接说明](12-device-b-full-project-takeover-2026-07-14.md)。该文档包含 iWencai/AnythingAPI 右侧栏 V2、窗口化图表、最新 Module C/策略状态、验证证据和后续分阶段验收标准。若旧文档与 12 冲突，以 12、当前仓库代码和最新用户指令为准。
+
 > 审计基线：2026-07-11，分支 `master`。后端改造实现提交为 `d2c4065`（`feat(backend): consolidate Module C and strategy pipeline`）；SMB 交接说明随后的仓库 `HEAD` 一并提交。
 >
 > 重要：原先的大量后端未提交成果已保存到 `d2c4065`。设备 A 的前端改动仍保持未提交且未包含在该后端提交中。设备 B 应克隆共享仓库的最新 `master`，不能停留在旧基准 `28d87f6`。
@@ -22,6 +28,8 @@
 8. [08-设备 B 启动清单](08-device-b-bootstrap-and-next-work.md)：按顺序执行的落地步骤和验收门。
 9. [09-策略生命周期推荐表结构](09-strategy-lifecycle-recommended-schema.md)：在 B 新库落地事件可见性和历史回放。
 10. [10-A/B Codex Agent 交接协议](10-agent-to-agent-handoff-protocol.md)：两台设备通过 Codex 线程或 SMB 邮箱完成双向确认。
+11. [11-设备 B GitHub 拉取与推送说明](11-github-pull-push-instructions.md)：通过 GitHub 保留设备 B 现有工作并安全协作。
+12. [12-设备 B 全项目接管交接说明](12-device-b-full-project-takeover-2026-07-14.md)：当前完整目标、架构、实现、验证、缺口和后续计划。
 
 ## 不得混淆的事实
 
