@@ -8,9 +8,8 @@ WORKDIR /app
 
 COPY services/collector/requirements.txt /tmp/collector-requirements.txt
 COPY services/api/requirements.txt /tmp/api-requirements.txt
-RUN apt-get update \
-    && pip install --no-cache-dir -r /tmp/collector-requirements.txt -r /tmp/api-requirements.txt \
-    && rm -rf /var/lib/apt/lists/*
+ARG PIP_INDEX_URL
+RUN pip install --no-cache-dir -r /tmp/collector-requirements.txt -r /tmp/api-requirements.txt
 
 COPY libs/protocol/python /app/libs/protocol/python
 COPY services/api /app/services/api
