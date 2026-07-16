@@ -1,0 +1,71 @@
+{
+  "active_symbols": 5534,
+  "active_universe_hash": "3ba3241435c8eb55dd64bee21654be83d43b78a52a38caf96234bea476b5308c",
+  "build_id": "06f311a8-2dbf-4a81-be67-f16fe11639e8",
+  "by_timeframe": {
+    "1d": {
+      "eligible": 5531,
+      "excluded": 3,
+      "reasons": {
+        "unresolved_ambiguous_volume_unit": 3
+      },
+      "total": 5534
+    },
+    "1m": {
+      "eligible": 5529,
+      "excluded": 5,
+      "reasons": {
+        "canonical_gate_unresolved": 2,
+        "daily_unresolved_propagated": 3,
+        "missing_ingest_watermark": 2
+      },
+      "total": 5534
+    },
+    "1w": {
+      "eligible": 5531,
+      "excluded": 3,
+      "reasons": {
+        "daily_unresolved_propagated": 3
+      },
+      "total": 5534
+    },
+    "30f": {
+      "eligible": 888,
+      "excluded": 4646,
+      "reasons": {
+        "bj_30f_excluded": 324,
+        "canonical_gate_unresolved": 324,
+        "missing_ingest_watermark": 324,
+        "unresolved_ambiguous_volume_unit": 4322
+      },
+      "total": 5534
+    },
+    "5f": {
+      "eligible": 61,
+      "excluded": 5473,
+      "reasons": {
+        "canonical_gate_unresolved": 796,
+        "missing_ingest_watermark": 796,
+        "missing_source_file": 796,
+        "unresolved_ambiguous_volume_unit": 4677
+      },
+      "total": 5534
+    }
+  },
+  "canonical_audit_run_id": "a033568b-1c80-4d8b-bec0-700caf63869b",
+  "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+  "excluded_summary": {
+    "excluded_scopes": 10130,
+    "reasons": {
+      "bj_30f_excluded": 324,
+      "canonical_gate_unresolved": 1122,
+      "daily_unresolved_propagated": 6,
+      "missing_ingest_watermark": 1122,
+      "missing_source_file": 796,
+      "unresolved_ambiguous_volume_unit": 9002
+    }
+  },
+  "manifest_hash": "5a54a7c0142f502e040ef4f24449a28054926dd826d97feac155c737c6a1cdf9",
+  "manifest_version": "strict-v2-canonical-a033568b",
+  "rows": 27670
+}

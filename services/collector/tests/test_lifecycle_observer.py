@@ -1,11 +1,13 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from collector.lifecycle_observer import (
     ACK_OUTBOX_SQL,
     CLAIM_OUTBOX_SQL,
+    FAIL_OUTBOX_SQL,
     REBUILD_CURRENT_PROJECTION_SQL,
     RENEW_OUTBOX_SQL,
     LifecycleObserver,
@@ -72,12 +74,16 @@ def test_identity_normalizes_offsets_and_rejects_naive_time() -> None:
 
 def test_sql_contract_has_skip_locked_fencing_and_event_rebuild() -> None:
     assert "for update skip locked" in CLAIM_OUTBOX_SQL.lower()
-    assert "where status <> 'completed'" in CLAIM_OUTBOX_SQL
+    assert "where status in ('pending', 'processing', 'failed')" in CLAIM_OUTBOX_SQL
     assert "join due on due.id = outbox.id" in CLAIM_OUTBOX_SQL
     assert "lease_version = outbox.lease_version + 1" in CLAIM_OUTBOX_SQL
     assert "lease_token = $2" in ACK_OUTBOX_SQL
     assert "lease_version = $3" in ACK_OUTBOX_SQL
     assert "lease_token = $2" in RENEW_OUTBOX_SQL
+    assert "status in ('pending', 'failed')" in CLAIM_OUTBOX_SQL
+    assert "attempts >= $4" in FAIL_OUTBOX_SQL
+    assert "lease_token = $2" in FAIL_OUTBOX_SQL
+    assert "lease_version = $3" in FAIL_OUTBOX_SQL
     assert "truncate chan_structure_lifecycle_current" in REBUILD_CURRENT_PROJECTION_SQL.lower()
     assert "chan_structure_lifecycle_events" in REBUILD_CURRENT_PROJECTION_SQL
     assert "event_type = 'first_seen'" in REBUILD_CURRENT_PROJECTION_SQL
@@ -109,6 +115,61 @@ def test_ack_is_guarded_and_watermark_only_moves_after_success() -> None:
         assert accepted.executed[0][1] == ("chan-lifecycle-v1",)
 
     asyncio.run(exercise())
+
+
+def test_failed_claim_is_fenced_and_can_be_dead_lettered() -> None:
+    class Conn:
+        async def fetchrow(self, sql, *args):
+            self.sql = sql
+            self.args = args
+            return {"id": args[0], "status": "dead_letter"}
+
+    async def exercise() -> None:
+        conn = Conn()
+        claimed = {"id": 11, "lease_token": "lease", "lease_version": 4}
+        assert await LifecycleObserver().fail(
+            conn, claimed, error="poison", max_attempts=4, retry_delay_seconds=7
+        )
+        assert conn.args == (11, "lease", 4, 4, 7, "poison")
+
+    asyncio.run(exercise())
+
+
+def test_process_next_records_retry_instead_of_losing_poison_message() -> None:
+    class Observer(LifecycleObserver):
+        async def claim(self, *_args, **_kwargs):
+            return [{"id": 5, "lease_token": "token", "lease_version": 2}]
+
+        async def process_claimed(self, *_args, **_kwargs):
+            raise RuntimeError("poison")
+
+        async def fail(self, *_args, **kwargs):
+            self.failure = kwargs
+            return True
+
+    class Conn:
+        async def fetchval(self, sql):
+            return "try_advisory_lock" in sql or "advisory_unlock" in sql
+
+    async def exercise() -> None:
+        observer = Observer()
+        assert await observer.process_next(
+            Conn(), max_attempts=3, retry_delay_seconds=9
+        ) == 1
+        assert observer.failure == {
+            "error": "poison", "max_attempts": 3, "retry_delay_seconds": 9
+        }
+
+    asyncio.run(exercise())
+
+
+def test_migration_036_adds_retry_and_dead_letter_contract() -> None:
+    migration = (
+        Path(__file__).resolve().parents[3] / "db" / "sql" / "036_lifecycle_outbox_retry.sql"
+    ).read_text(encoding="utf-8").lower()
+    for column in ("next_attempt_at", "last_error", "failed_at", "dead_lettered_at"):
+        assert f"add column if not exists {column}" in migration
+    assert "dead_letter" in migration
 
 
 def test_lost_lease_aborts_atomic_persist() -> None:

@@ -1,0 +1,63 @@
+# Module C Recompute Summary
+
+```json
+{
+  "batch_id": 6,
+  "batch_status": "completed",
+  "heads": {
+    "expected": 35080,
+    "missing": 0,
+    "missing_history": 0,
+    "missing_outbox": 0,
+    "outbox_incomplete": 0,
+    "published": 35080
+  },
+  "lifecycle": {
+    "blockers": [],
+    "decision": "PASS"
+  },
+  "official": {
+    "baseline_claimed_historical_events": 0,
+    "future_leak_events": 0,
+    "historical_replay_heads": 0,
+    "official_expected_heads": 35080,
+    "official_missing_heads": 35080
+  },
+  "outbox": {
+    "blocking": 0,
+    "statuses": {
+      "completed": 34760
+    }
+  },
+  "tasks": {
+    "by_level": {
+      "1d": {
+        "completed": 5531,
+        "excluded": 3
+      },
+      "1m": {
+        "completed": 5529,
+        "excluded": 5
+      },
+      "1w": {
+        "completed": 5531,
+        "excluded": 3
+      },
+      "30f": {
+        "completed": 888,
+        "excluded": 4646
+      },
+      "5f": {
+        "completed": 61,
+        "excluded": 5473
+      }
+    },
+    "expected": 27670,
+    "observed": 27670,
+    "statuses": {
+      "completed": 17540,
+      "excluded": 10130
+    }
+  }
+}
+```

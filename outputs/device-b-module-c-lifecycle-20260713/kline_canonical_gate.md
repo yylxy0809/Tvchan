@@ -1,0 +1,20 @@
+# K-line Canonical Gate
+
+```json
+{
+  "audit": {
+    "apply_mode": false,
+    "audit_run_id": "a033568b-1c80-4d8b-bec0-700caf63869b",
+    "completed_at": "2026-07-12T17:19:26.821203+00:00",
+    "failure": null,
+    "parameters": "{\"engine\": \"sql_gate\", \"timeframes\": [10080, 43200]}",
+    "started_at": "2026-07-12T13:25:49.683728+00:00",
+    "status": "completed",
+    "summary": "{\"eligible\": 26548, \"gate_pass\": false, \"unresolved\": 1122, \"checkpoints\": 27670, \"invalid_ohlc\": 0, \"missing_rows\": 1122, \"rows_scanned\": 789605632, \"anomaly_total\": 1122, \"incomplete_rows\": 0, \"negative_amount\": 0, \"negative_volume\": 0, \"illegal_sessions\": 0, \"unexpected_source\": 0, \"missing_daily_basis\": 0, \"current_open_periods\": 0, \"timestamp_mismatches\": 0, \"logical_duplicate_rows\": 0, \"missing_higher_periods\": 0}"
+  },
+  "gate_available": true,
+  "gate_pass": false,
+  "generated_at": "2026-07-13T21:11:59.060708+00:00",
+  "readonly": true
+}
+```

@@ -1,0 +1,4422 @@
+{
+  "generated_at": "2026-07-13T09:59:42.985523+00:00",
+  "selector": {
+    "batch_id": 3,
+    "run_group_id": null
+  },
+  "expected_config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+  "published_runs": 100,
+  "symbols": 20,
+  "levels": [
+    "1d",
+    "1m",
+    "1w",
+    "30f",
+    "5f"
+  ],
+  "difference_count": 0,
+  "failed_runs": 0,
+  "passed": true,
+  "runs": [
+    {
+      "run_id": 8,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001220.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 4802,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 163,
+          "persisted_count": 163,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 19,
+          "persisted_count": 19,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 22,
+          "persisted_count": 22,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 23,
+          "persisted_count": 23,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 9,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001220.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 882,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 40,
+          "persisted_count": 40,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 10,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001220.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 98,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 11,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001220.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 21,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 12,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001220.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 5,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 13,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001257.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 3136,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 96,
+          "persisted_count": 96,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 13,
+          "persisted_count": 13,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 10,
+          "persisted_count": 10,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 8,
+          "persisted_count": 8,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 14,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001257.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 576,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 23,
+          "persisted_count": 23,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 4,
+          "persisted_count": 4,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 15,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001257.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 64,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 16,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001257.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 14,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 17,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001257.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 4,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 18,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001280.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 6860,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 261,
+          "persisted_count": 261,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 41,
+          "persisted_count": 41,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 30,
+          "persisted_count": 30,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 43,
+          "persisted_count": 43,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 19,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001280.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 1260,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 55,
+          "persisted_count": 55,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 11,
+          "persisted_count": 11,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 9,
+          "persisted_count": 9,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 20,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001280.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 140,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 9,
+          "persisted_count": 9,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 21,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001280.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 30,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 22,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001280.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 7,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 23,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001312.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 2450,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 71,
+          "persisted_count": 71,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 9,
+          "persisted_count": 9,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 24,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001312.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 450,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 13,
+          "persisted_count": 13,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 25,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001312.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 50,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 26,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001312.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 11,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 27,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001312.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 3,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 28,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001314.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 40229,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1415,
+          "persisted_count": 1415,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 205,
+          "persisted_count": 205,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 162,
+          "persisted_count": 162,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 176,
+          "persisted_count": 176,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 29,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001314.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 7389,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 303,
+          "persisted_count": 303,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 47,
+          "persisted_count": 47,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 40,
+          "persisted_count": 40,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 59,
+          "persisted_count": 59,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 30,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001314.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 812,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 42,
+          "persisted_count": 42,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 9,
+          "persisted_count": 9,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 4,
+          "persisted_count": 4,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 9,
+          "persisted_count": 9,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 31,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001314.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 171,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 13,
+          "persisted_count": 13,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 32,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001314.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 41,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 33,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001365.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 1666,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 51,
+          "persisted_count": 51,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 8,
+          "persisted_count": 8,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 34,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001365.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 306,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 35,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001365.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 34,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 36,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001365.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 7,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 37,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001365.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 2,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 38,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001369.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 5929,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 169,
+          "persisted_count": 169,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 23,
+          "persisted_count": 23,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 21,
+          "persisted_count": 21,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 27,
+          "persisted_count": 27,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 39,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001369.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 1089,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 35,
+          "persisted_count": 35,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 40,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001369.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 121,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 9,
+          "persisted_count": 9,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 41,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001369.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 26,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 42,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001369.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 7,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 43,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001382.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 15288,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 390,
+          "persisted_count": 390,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 67,
+          "persisted_count": 67,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 48,
+          "persisted_count": 48,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 72,
+          "persisted_count": 72,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 44,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001382.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 2808,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 104,
+          "persisted_count": 104,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 12,
+          "persisted_count": 12,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 12,
+          "persisted_count": 12,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 11,
+          "persisted_count": 11,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 45,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001382.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 312,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 17,
+          "persisted_count": 17,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 46,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001382.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 67,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 47,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001382.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 16,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 48,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001386.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 8330,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 271,
+          "persisted_count": 271,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 43,
+          "persisted_count": 43,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 34,
+          "persisted_count": 34,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 39,
+          "persisted_count": 39,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 49,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001386.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 1530,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 66,
+          "persisted_count": 66,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 12,
+          "persisted_count": 12,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 8,
+          "persisted_count": 8,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 10,
+          "persisted_count": 10,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 50,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001386.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 170,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 51,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001386.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 36,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 52,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001386.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 9,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 53,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001390.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 13083,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 412,
+          "persisted_count": 412,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 60,
+          "persisted_count": 60,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 53,
+          "persisted_count": 53,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 71,
+          "persisted_count": 71,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 54,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001390.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 2403,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 89,
+          "persisted_count": 89,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 15,
+          "persisted_count": 15,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 14,
+          "persisted_count": 14,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 19,
+          "persisted_count": 19,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 55,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001390.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 267,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 18,
+          "persisted_count": 18,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 4,
+          "persisted_count": 4,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 56,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001390.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 57,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 57,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001390.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 14,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 58,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001391.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 17836,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 210,
+          "persisted_count": 210,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 38,
+          "persisted_count": 38,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 23,
+          "persisted_count": 23,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 27,
+          "persisted_count": 27,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 59,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001391.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 3276,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 84,
+          "persisted_count": 84,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 14,
+          "persisted_count": 14,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 60,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001391.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 364,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 13,
+          "persisted_count": 13,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 61,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001391.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 78,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 62,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001391.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 19,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 63,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001393.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 1715,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 51,
+          "persisted_count": 51,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 8,
+          "persisted_count": 8,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 9,
+          "persisted_count": 9,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 64,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001393.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 315,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 11,
+          "persisted_count": 11,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 65,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001393.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 35,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 66,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001393.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 8,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 67,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001393.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 2,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 68,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001399.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 294,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 69,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001399.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 54,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 70,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001399.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 6,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 71,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001399.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 2,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 72,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "001399.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 1,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 73,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "300784.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 24598,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 963,
+          "persisted_count": 963,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 153,
+          "persisted_count": 153,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 106,
+          "persisted_count": 106,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 134,
+          "persisted_count": 134,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 74,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "300784.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 4518,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 216,
+          "persisted_count": 216,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 30,
+          "persisted_count": 30,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 26,
+          "persisted_count": 26,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 36,
+          "persisted_count": 36,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 75,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "300784.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 502,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 17,
+          "persisted_count": 17,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 76,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "300784.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 108,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 77,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "300784.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 25,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 78,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301141.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 38563,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1394,
+          "persisted_count": 1394,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 217,
+          "persisted_count": 217,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 173,
+          "persisted_count": 173,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 235,
+          "persisted_count": 235,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 79,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301141.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 7083,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 288,
+          "persisted_count": 288,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 42,
+          "persisted_count": 42,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 39,
+          "persisted_count": 39,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 54,
+          "persisted_count": 54,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 80,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301141.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 787,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 44,
+          "persisted_count": 44,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 10,
+          "persisted_count": 10,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 81,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301141.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 167,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 12,
+          "persisted_count": 12,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 82,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301141.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 39,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 83,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301269.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 46599,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1969,
+          "persisted_count": 1969,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 313,
+          "persisted_count": 313,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 234,
+          "persisted_count": 234,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 292,
+          "persisted_count": 292,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 84,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301269.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 8559,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 372,
+          "persisted_count": 372,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 60,
+          "persisted_count": 60,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 46,
+          "persisted_count": 46,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 70,
+          "persisted_count": 70,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 85,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301269.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 941,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 58,
+          "persisted_count": 58,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 10,
+          "persisted_count": 10,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 11,
+          "persisted_count": 11,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 86,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301269.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 199,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 10,
+          "persisted_count": 10,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 87,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301269.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 48,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 88,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301275.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 15680,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 560,
+          "persisted_count": 560,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 77,
+          "persisted_count": 77,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 63,
+          "persisted_count": 63,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 82,
+          "persisted_count": 82,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 89,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301275.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 2880,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 112,
+          "persisted_count": 112,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 17,
+          "persisted_count": 17,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 15,
+          "persisted_count": 15,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 19,
+          "persisted_count": 19,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 90,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301275.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 320,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 17,
+          "persisted_count": 17,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 4,
+          "persisted_count": 4,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 91,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301275.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 68,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 92,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301275.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 16,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 93,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301293.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 37583,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1424,
+          "persisted_count": 1424,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 225,
+          "persisted_count": 225,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 169,
+          "persisted_count": 169,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 231,
+          "persisted_count": 231,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 94,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301293.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 6903,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 296,
+          "persisted_count": 296,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 53,
+          "persisted_count": 53,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 34,
+          "persisted_count": 34,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 47,
+          "persisted_count": 47,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 95,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301293.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 767,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 46,
+          "persisted_count": 46,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 96,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301293.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 163,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 97,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301293.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 38,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 98,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301297.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 41503,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1638,
+          "persisted_count": 1638,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 255,
+          "persisted_count": 255,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 181,
+          "persisted_count": 181,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 209,
+          "persisted_count": 209,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 99,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301297.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 7623,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 318,
+          "persisted_count": 318,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 58,
+          "persisted_count": 58,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 36,
+          "persisted_count": 36,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 49,
+          "persisted_count": 49,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 100,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301297.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 837,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 41,
+          "persisted_count": 41,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 7,
+          "persisted_count": 7,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 101,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301297.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 178,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 9,
+          "persisted_count": 9,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 102,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301297.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 43,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 103,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301308.SZ",
+      "level": "5f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 46354,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 1934,
+          "persisted_count": 1934,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 306,
+          "persisted_count": 306,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 228,
+          "persisted_count": 228,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 307,
+          "persisted_count": 307,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 104,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301308.SZ",
+      "level": "30f",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 8514,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 388,
+          "persisted_count": 388,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 65,
+          "persisted_count": 65,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 42,
+          "persisted_count": 42,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 59,
+          "persisted_count": 59,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 105,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301308.SZ",
+      "level": "1d",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 946,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 46,
+          "persisted_count": 46,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 6,
+          "persisted_count": 6,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 5,
+          "persisted_count": 5,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 2,
+          "persisted_count": 2,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 106,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301308.SZ",
+      "level": "1w",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 200,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 13,
+          "persisted_count": 13,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    },
+    {
+      "run_id": 107,
+      "batch_id": 3,
+      "run_group_id": "canary-20-20260712-a033568b-v4",
+      "symbol": "301308.SZ",
+      "level": "1m",
+      "modes": [
+        "confirmed",
+        "predictive"
+      ],
+      "config_hash": "module-c:native-5lvl-v4-bi-strict-false-bi-allow-sub-peak-false",
+      "config_match": true,
+      "bar_count": 47,
+      "bar_count_match": true,
+      "difference_count": 0,
+      "objects": {
+        "strokes": {
+          "direct_count": 3,
+          "persisted_count": 3,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "segments": {
+          "direct_count": 1,
+          "persisted_count": 1,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "centers": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        },
+        "signals": {
+          "direct_count": 0,
+          "persisted_count": 0,
+          "mismatch_count": 0,
+          "samples": []
+        }
+      },
+      "error": null,
+      "passed": true
+    }
+  ]
+}

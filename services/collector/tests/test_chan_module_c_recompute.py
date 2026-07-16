@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import UTC, datetime
+from pathlib import Path
 import sys
 from types import SimpleNamespace
 
 from collector.chan_module_c_recompute import (
     MODULE_C_CONFIG_HASH,
     aggregate_from_5f,
+    claim_recompute_task,
     filter_completed_symbols,
     is_module_c_complete,
     parse_args,
+    process_claimed_task,
 )
+import collector.chan_module_c_recompute as recompute
 from collector.module_c_adapter import DEFAULT_CHAN_CONFIG
 from trading_protocol import Bar
 
@@ -118,6 +123,15 @@ class _FakeConn:
             return self.rows(query, args)
         return self.rows
 
+    async def fetchrow(self, query, *args):
+        self.calls.append((query, args))
+        rows = self.rows(query, args) if callable(self.rows) else self.rows
+        return rows[0] if rows else None
+
+    async def execute(self, query, *args):
+        self.calls.append((query, args))
+        return "UPDATE 1"
+
 
 def test_module_c_filter_completed_symbols_keeps_only_incomplete_symbols() -> None:
     pool = _FakePool(_complete_rows())
@@ -200,3 +214,113 @@ def test_module_c_filter_completed_symbols_skips_current_config_heads() -> None:
     )
 
     assert result == []
+
+
+def test_full_recompute_claim_is_sharded_leased_and_attempt_bounded() -> None:
+    row = {
+        "batch_id": 11,
+        "symbol_id": 22,
+        "chan_level": 30,
+        "claim_token": "token",
+        "lease_version": 3,
+    }
+    pool = _FakePool([row])
+    kline_writer = SimpleNamespace(_pool=pool)
+
+    result = asyncio.run(
+        claim_recompute_task(
+            kline_writer=kline_writer,
+            batch_id=11,
+            worker_id="worker-2",
+            shard_index=2,
+            shard_count=4,
+            lease_seconds=900,
+            max_attempts=3,
+        )
+    )
+
+    assert result == row
+    query, args = pool.conn.calls[0]
+    assert "for update skip locked" in query.lower()
+    assert "lease_version = task.lease_version + 1" in query
+    assert args == (11, "worker-2", 900, 2, 4, 3)
+
+
+def test_batch_init_casts_config_hash_for_asyncpg() -> None:
+    sql = inspect.getsource(recompute.ensure_recompute_batch)
+    assert "$4::varchar" in sql
+    assert "build.config_hash = $4::text" in sql
+
+
+def test_claimed_task_uses_one_level_and_frozen_cutoff(monkeypatch) -> None:
+    cutoff = datetime(2026, 7, 10, 7, tzinfo=UTC)
+    bars = [
+        Bar(
+            symbol="000001.SZ", timeframe="1d",
+            ts=datetime(2026, 7, day, 7, tzinfo=UTC),
+            open=10, high=11, low=9, close=10.5, volume=100,
+            amount=1000, complete=True, revision=1, source="parquet",
+        )
+        for day in (8, 9, 10, 11)
+    ]
+
+    class KlineWriter:
+        async def get_bars(self, symbol, level):
+            assert (symbol, level) == ("000001.SZ", "1d")
+            return bars
+
+    class ChanWriter:
+        def __init__(self):
+            self.kwargs = None
+
+        async def replace_analysis(self, **kwargs):
+            self.kwargs = kwargs
+            return {"strokes": 0, "segments": 0, "centers": 0, "signals": 0}
+
+    async def fake_compute(**kwargs):
+        assert kwargs["levels"] == ["1d"]
+        assert [bar.ts for bar in kwargs["bars_by_level"]["1d"]] == [bar.ts for bar in bars[:3]]
+        return {
+            "engine": "module-c:chan.py-native-levels",
+            "snapshot_version": "frozen",
+            "strokes": [], "segments": [], "centers": [], "signals": [], "channels": [],
+        }
+
+    async def fake_heartbeat(**_kwargs):
+        return True
+
+    monkeypatch.setattr(recompute, "compute_module_c_overlay", fake_compute)
+    monkeypatch.setattr(recompute, "heartbeat_recompute_task", fake_heartbeat)
+    writer = ChanWriter()
+    task = {
+        "batch_id": 11, "symbol_id": 22, "symbol": "000001.SZ",
+        "chan_level": 1440, "target_bar_until": cutoff,
+        "claim_token": "token", "lease_version": 1,
+    }
+
+    asyncio.run(
+        process_claimed_task(
+            kline_writer=KlineWriter(), chan_writer=writer, task=task,
+            modes=["confirmed", "predictive"], lease_seconds=30,
+            chan_py_path="unused",
+        )
+    )
+
+    assert writer.kwargs["level"] == "1d"
+    assert writer.kwargs["bar_until"] == cutoff
+    assert writer.kwargs["bar_count"] == 3
+    assert writer.kwargs["full_recompute_task"] is task
+
+
+def test_migration_035_contains_provenance_and_fenced_batch_tasks() -> None:
+    migration = (
+        Path(__file__).resolve().parents[3]
+        / "db" / "sql" / "035_chan_c_full_recompute_tasks.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "add column if not exists batch_id bigint" in migration
+    assert "create table if not exists chan_c_full_recompute_batches" in migration
+    assert "create table if not exists chan_c_full_recompute_tasks" in migration
+    assert "claim_token varchar(64)" in migration
+    assert "lease_version bigint" in migration
+    assert "target_bar_until timestamptz" in migration

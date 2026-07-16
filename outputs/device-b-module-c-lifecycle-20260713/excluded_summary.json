@@ -1,0 +1,11 @@
+{
+  "excluded_scopes": 10130,
+  "reasons": {
+    "bj_30f_excluded": 324,
+    "canonical_gate_unresolved": 1122,
+    "daily_unresolved_propagated": 6,
+    "missing_ingest_watermark": 1122,
+    "missing_source_file": 796,
+    "unresolved_ambiguous_volume_unit": 9002
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-07-13T21:11:57.811167+00:00",
+  "readonly": true,
+  "outbox": {
+    "statuses": {
+      "completed": {
+        "count": 35080,
+        "oldest_age_seconds": 97828
+      }
+    },
+    "blocking_count": 0
+  },
+  "watermarks": [
+    {
+      "observer_name": "chan-lifecycle-v1",
+      "last_outbox_id": 35080,
+      "updated_at": "2026-07-13 20:46:22.928379+00:00"
+    }
+  ],
+  "projection_replay": {
+    "mismatch_count": 0,
+    "samples": []
+  },
+  "published_head_history": {
+    "missing_count": 0,
+    "samples": "[]"
+  },
+  "decision": "PASS",
+  "blockers": []
+}

@@ -50,6 +50,18 @@ def test_missing_source_and_watermark_have_stable_reasons() -> None:
     assert not five.eligible
 
 
+def test_canonical_gate_unresolved_fails_closed() -> None:
+    symbol = Symbol(5, "600002", "SH")
+    canonical = {
+        (5, timeframe): "eligible" for timeframe in ("5f", "30f", "1d", "1w", "1m")
+    }
+    canonical[(5, "30f")] = "unresolved"
+    rows = evaluate_dispositions([symbol], _coverage(5), {}, {}, canonical)
+    by_timeframe = {row.timeframe: row for row in rows}
+    assert by_timeframe["5f"].eligible
+    assert by_timeframe["30f"].reasons == ("canonical_gate_unresolved",)
+
+
 def test_summary_counts_each_level_instead_of_market_total() -> None:
     symbols = [Symbol(1, "600000", "SH"), Symbol(2, "920000", "BJ")]
     rows = evaluate_dispositions(symbols, {**_coverage(1), **_coverage(2)}, {}, {})
