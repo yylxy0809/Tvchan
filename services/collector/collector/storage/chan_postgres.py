@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -169,6 +170,15 @@ class PostgresChanWriter:
         run_config_hash: str = "module-c:default",
         tail_config_hash: str = "module-c:stream-v1",
         native_base_timeframe: bool = False,
+        publication_profile: str = "online",
+        run_group_id: str | None = None,
+        publication_source: str = "collector",
+        run_kind: str = "online",
+        batch_id: int | None = None,
+        publication_namespace: str | None = None,
+        profile_id: str | None = None,
+        worker_id: str | None = None,
+        claim_token: str | None = None,
     ) -> None:
         self.database_url = database_url
         self.pool_min_size = pool_min_size
@@ -177,6 +187,17 @@ class PostgresChanWriter:
         self.run_config_hash = run_config_hash
         self.tail_config_hash = tail_config_hash
         self.native_base_timeframe = native_base_timeframe
+        if publication_profile not in {"baseline", "online", "historical_replay"}:
+            raise ValueError(f"Unsupported publication profile: {publication_profile}")
+        self.publication_profile = publication_profile
+        self.run_group_id = run_group_id
+        self.publication_source = publication_source
+        self.run_kind = run_kind
+        self.batch_id = batch_id
+        self.publication_namespace = publication_namespace
+        self.profile_id = profile_id
+        self.worker_id = worker_id
+        self.claim_token = claim_token
         self._pool = None
 
     async def __aenter__(self) -> "PostgresChanWriter":
@@ -242,9 +263,19 @@ class PostgresChanWriter:
                     bar_count,
                     status,
                     snapshot_version,
-                    computed_at
+                    computed_at,
+                    run_kind,
+                    run_group_id,
+                    cutoff_bar_end,
+                    base_timeframe,
+                    batch_id,
+                    publication_namespace,
+                    profile_id,
+                    run_identity,
+                    provenance
                 )
-                values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now())
+                values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6,
+                        $11, $12, $13, $14, $15, jsonb_build_object('source',$16::text,'profile',$14::varchar))
                 returning id
                 """,
                 symbol_id,
@@ -255,6 +286,16 @@ class PostgresChanWriter:
                 bar_until,
                 bar_count,
                 snapshot_version,
+                self.run_kind,
+                self.run_group_id,
+                base_timeframe_code,
+                self.batch_id,
+                self.publication_namespace,
+                self.profile_id,
+                hashlib.sha256(
+                    f"{self.run_group_id}|{symbol}|{level}|{snapshot_version}".encode("utf-8")
+                ).hexdigest(),
+                self.publication_source,
             )
 
             try:
@@ -291,39 +332,38 @@ class PostgresChanWriter:
                         run_id,
                         response.get("signals", []),
                     )
-                await conn.execute(
-                    f"""
-                    update {runs_table}
-                    set status = 'success',
-                        finished_at = now()
-                    where id = $1
-                    """,
-                    run_id,
-                )
-                await self._upsert_published_heads(
-                    conn,
-                    symbol_id=symbol_id,
-                    level_code=level_code,
-                    modes=modes,
-                    base_timeframe_code=base_timeframe_code,
-                    bar_from=bar_from,
-                    bar_until=bar_until,
-                    bar_count=bar_count,
-                    snapshot_version=snapshot_version,
-                    run_id=run_id,
-                    status="published",
-                    last_error=None,
-                )
-                await self._upsert_recompute_watermarks(
-                    conn,
-                    symbol_id=symbol_id,
-                    level_code=level_code,
-                    modes=modes,
-                    base_timeframe_code=base_timeframe_code,
-                    last_computed_bar_end=bar_until,
-                    dirty_from_bar_end=None,
-                    last_error=None,
-                )
+                    await conn.execute(
+                        f"""
+                        update {runs_table}
+                        set status = 'success', finished_at = now()
+                        where id = $1
+                        """,
+                        run_id,
+                    )
+                    await self._upsert_published_heads(
+                        conn,
+                        symbol_id=symbol_id,
+                        level_code=level_code,
+                        modes=modes,
+                        base_timeframe_code=base_timeframe_code,
+                        bar_from=bar_from,
+                        bar_until=bar_until,
+                        bar_count=bar_count,
+                        snapshot_version=snapshot_version,
+                        run_id=run_id,
+                        status="published",
+                        last_error=None,
+                    )
+                    await self._upsert_recompute_watermarks(
+                        conn,
+                        symbol_id=symbol_id,
+                        level_code=level_code,
+                        modes=modes,
+                        base_timeframe_code=base_timeframe_code,
+                        last_computed_bar_end=bar_until,
+                        dirty_from_bar_end=None,
+                        last_error=None,
+                    )
             except Exception as exc:
                 await conn.execute(
                     f"""
@@ -366,6 +406,7 @@ class PostgresChanWriter:
         response: dict[str, Any],
         expected_head_run_id: int | None = None,
         expected_head_base_to_bar_end: datetime | None = None,
+        publication_claim_token: str | None = None,
     ) -> dict[str, Any]:
         assert self._pool is not None
         async with self._pool.acquire() as conn:
@@ -477,9 +518,12 @@ class PostgresChanWriter:
                     bar_count,
                     status,
                     snapshot_version,
-                    computed_at
+                    computed_at,
+                    run_kind,
+                    run_group_id,
+                    cutoff_bar_end
                 )
-                values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now())
+                values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6)
                 returning id
                 """,
                 symbol_id,
@@ -490,6 +534,8 @@ class PostgresChanWriter:
                 bar_until,
                 int(bar_count or 0),
                 snapshot_version,
+                self.run_kind,
+                self.run_group_id,
             )
 
             try:
@@ -547,6 +593,8 @@ class PostgresChanWriter:
                         snapshot_version=snapshot_version,
                         run_id=run_id,
                         expected_run_id=expected_head_run_id or int(head["run_id"]),
+                        old_base_to_bar_end=head["base_to_bar_end"],
+                        publication_claim_token=publication_claim_token,
                     )
                     await self._upsert_recompute_watermarks(
                         conn,
@@ -616,17 +664,33 @@ class PostgresChanWriter:
                 bar_until,
                 bar_count,
                 snapshot_version,
+                self.run_config_hash,
                 status,
                 run_id,
                 last_error,
+                self.batch_id,
+                self.publication_namespace,
+                self.profile_id,
+                self.run_group_id,
             )
             for mode in modes
         ]
         if not rows:
             return
         table = self.tables["published_heads"]
-        await conn.executemany(
-            f"""
+        previous = {}
+        for mode in modes:
+            previous[mode] = await conn.fetchrow(
+                f"""
+                select run_id, base_to_bar_end
+                from {table}
+                where symbol_id = $1 and chan_level = $2
+                  and mode = $3::varchar and base_timeframe = $4
+                for update
+                """,
+                symbol_id, level_code, mode, base_timeframe_code,
+            )
+        upsert_sql = f"""
             insert into {table} (
                 symbol_id,
                 chan_level,
@@ -636,17 +700,22 @@ class PostgresChanWriter:
                 base_to_bar_end,
                 bar_count,
                 snapshot_version,
+                config_hash,
                 status,
                 run_id,
                 published_at,
                 updated_at,
                 last_error
+                ,batch_id
+                ,publication_namespace
+                ,profile_id
+                ,run_group_id
             )
             values (
-                $1, $2, $3::varchar, $4, $5, $6, $7, $8::varchar, $9::varchar, $10,
-                case when $9::text = 'published' then now() else null end,
+                $1, $2, $3::varchar, $4, $5, $6, $7, $8::varchar, $9::varchar, $10::varchar, $11,
+                case when $10::text = 'published' then now() else null end,
                 now(),
-                $11
+                $12, $13, $14, $15, $16
             )
             on conflict (symbol_id, chan_level, mode, base_timeframe)
             do update
@@ -654,6 +723,7 @@ class PostgresChanWriter:
                 base_to_bar_end = excluded.base_to_bar_end,
                 bar_count = excluded.bar_count,
                 snapshot_version = excluded.snapshot_version,
+                config_hash = excluded.config_hash,
                 status = excluded.status,
                 run_id = excluded.run_id,
                 published_at = case
@@ -662,12 +732,35 @@ class PostgresChanWriter:
                 end,
                 updated_at = now(),
                 last_error = excluded.last_error
+                ,batch_id = excluded.batch_id
+                ,publication_namespace = excluded.publication_namespace
+                ,profile_id = excluded.profile_id
+                ,run_group_id = excluded.run_group_id
             where {table}.status <> 'published'
                or {table}.base_to_bar_end is null
-               or {table}.base_to_bar_end <= excluded.base_to_bar_end
-            """,
-            rows,
-        )
+               or {table}.base_to_bar_end < excluded.base_to_bar_end
+               or (
+                    {table}.base_to_bar_end = excluded.base_to_bar_end
+                    and {table}.config_hash is distinct from excluded.config_hash
+               )
+            """
+        for mode, row in zip(modes, rows, strict=True):
+            result = await conn.execute(upsert_sql, *row)
+            if result.endswith(" 0"):
+                continue
+            old = previous[mode]
+            await self._append_head_history_outbox(
+                conn,
+                symbol_id=symbol_id,
+                level_code=level_code,
+                mode=mode,
+                base_timeframe_code=base_timeframe_code,
+                old_run_id=int(old["run_id"]) if old and old["run_id"] is not None else None,
+                new_run_id=run_id,
+                old_base_to_bar_end=old["base_to_bar_end"] if old else None,
+                new_base_to_bar_end=bar_until,
+                snapshot_version=snapshot_version,
+            )
 
     async def _publish_heads_cas(
         self,
@@ -683,6 +776,8 @@ class PostgresChanWriter:
         snapshot_version: str,
         run_id: int,
         expected_run_id: int,
+        old_base_to_bar_end: datetime | None = None,
+        publication_claim_token: str | None = None,
     ) -> None:
         table = self.tables["published_heads"]
         for mode in modes:
@@ -693,6 +788,7 @@ class PostgresChanWriter:
                     base_to_bar_end = $6,
                     bar_count = $7,
                     snapshot_version = $8::varchar,
+                    config_hash = $11::varchar,
                     status = 'published',
                     run_id = $9,
                     published_at = now(),
@@ -719,15 +815,76 @@ class PostgresChanWriter:
                 snapshot_version,
                 run_id,
                 expected_run_id,
+                self.tail_config_hash,
             )
             if not result.endswith(" 1"):
                 raise StaleChanHeadError(
                     f"Chan head CAS failed for symbol_id={symbol_id} level={level_code} mode={mode}"
                 )
+            await self._append_head_history_outbox(
+                conn,
+                symbol_id=symbol_id,
+                level_code=level_code,
+                mode=mode,
+                base_timeframe_code=base_timeframe_code,
+                old_run_id=expected_run_id,
+                new_run_id=run_id,
+                old_base_to_bar_end=old_base_to_bar_end,
+                new_base_to_bar_end=bar_until,
+                snapshot_version=snapshot_version,
+                claim_token=publication_claim_token,
+                config_hash=self.tail_config_hash,
+            )
         return {
             "run_id": int(run_id),
             "snapshot_version": snapshot_version,
         }
+
+    async def _append_head_history_outbox(
+        self,
+        conn,
+        *,
+        symbol_id: int,
+        level_code: int,
+        mode: str,
+        base_timeframe_code: int,
+        old_run_id: int | None,
+        new_run_id: int,
+        old_base_to_bar_end: datetime | None,
+        new_base_to_bar_end: datetime,
+        snapshot_version: str,
+        claim_token: str | None = None,
+        config_hash: str | None = None,
+    ) -> None:
+        await conn.execute(
+            """
+            with inserted_history as (
+                insert into chan_c_head_history (
+                    symbol_id, chan_level, mode, base_timeframe, config_hash,
+                    publication_profile, run_group_id, old_run_id, new_run_id,
+                    old_base_to_bar_end, new_base_to_bar_end, snapshot_version,
+                    worker_id, claim_token, source, provenance
+                ) values (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                    $10, $11, $12, $13, $14, $15,
+                    jsonb_build_object('publication_profile', $6::varchar, 'run_group_id', $7::varchar)
+                )
+                on conflict (symbol_id, chan_level, mode, base_timeframe, new_run_id)
+                do nothing
+                returning id, symbol_id, chan_level, mode, base_timeframe,
+                          publication_profile, run_group_id, old_run_id, new_run_id,
+                          old_base_to_bar_end, new_base_to_bar_end, snapshot_version,
+                          config_hash, published_at
+            )
+            insert into chan_c_head_outbox (head_history_id, payload)
+            select id, to_jsonb(inserted_history) from inserted_history
+            on conflict (head_history_id) do nothing
+            """,
+            symbol_id, level_code, mode, base_timeframe_code,
+            config_hash or self.run_config_hash, self.publication_profile, self.run_group_id,
+            old_run_id, new_run_id, old_base_to_bar_end, new_base_to_bar_end,
+            snapshot_version, self.worker_id, claim_token or self.claim_token, self.publication_source,
+        )
 
     async def _upsert_recompute_watermarks(
         self,

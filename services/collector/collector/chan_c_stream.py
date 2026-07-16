@@ -179,6 +179,11 @@ async def run_once(args: argparse.Namespace) -> None:
             run_config_hash=MODULE_C_CONFIG_HASH,
             tail_config_hash=MODULE_C_CONFIG_HASH,
             native_base_timeframe=True,
+            publication_profile="online",
+            publication_source="stream",
+            run_kind="online",
+            run_group_id="online",
+            worker_id=worker_id,
         ) as chan_writer:
             async with PostgresChanCStreamStore(
                 args.database_url,
@@ -386,6 +391,7 @@ async def process_symbol_tail(
                 expected_head_base_to_bar_end=first_present(
                     mode_jobs, "expected_head_base_to_bar_end"
                 ),
+                publication_claim_token=first_present(mode_jobs, "claim_token"),
             )
             emit(
                 "chan_c_stream_published",

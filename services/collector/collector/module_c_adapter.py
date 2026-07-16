@@ -202,12 +202,16 @@ def _rows_to_klu_list(bars: list[dict[str, Any]], kl_type: Any, cls: Any, fields
         if min(values) <= 0:
             continue
         dt = datetime.fromtimestamp(int(bar["time"]), UTC).astimezone(ZoneInfo("Asia/Shanghai"))
-        payload = {fields.FIELD_TIME: ctime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, auto=False), fields.FIELD_OPEN: values[0], fields.FIELD_HIGH: values[1], fields.FIELD_LOW: values[2], fields.FIELD_CLOSE: values[3], fields.FIELD_VOLUME: _safe_float(bar.get("volume", 0))}
+        base_ts = int(bar["time"])
+        item_time = ctime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, auto=False)
+        item_time._module_c_base_ts = base_ts
+        payload = {fields.FIELD_TIME: item_time, fields.FIELD_OPEN: values[0], fields.FIELD_HIGH: values[1], fields.FIELD_LOW: values[2], fields.FIELD_CLOSE: values[3], fields.FIELD_VOLUME: _safe_float(bar.get("volume", 0))}
         for attr, key in (("FIELD_TURNOVER", "amount"), ("FIELD_TURNRATE", "turnrate")):
             field = getattr(fields, attr, None)
             if field is not None:
                 payload[field] = _safe_float(bar.get(key, 0))
         item = cls(payload, autofix=True)
+        item._module_c_base_ts = base_ts
         if hasattr(item, "set_idx"):
             item.set_idx(len(result))
         item.kl_type = kl_type
@@ -263,7 +267,18 @@ def _iter_items(items: Any) -> list[Any]: return list(items) if items is not Non
 def _iter_klu_items(items: Any) -> list[Any]:
     iterator = getattr(items, "klu_iter", None); return list(iterator()) if callable(iterator) else _iter_items(getattr(items, "lst", []))
 def _time(item: Any) -> int:
+    base_ts = getattr(item, "_module_c_base_ts", None)
+    if base_ts is not None:
+        return int(base_ts)
     value = item if hasattr(item, "ts") else getattr(item, "time", None)
+    base_ts = getattr(value, "_module_c_base_ts", None)
+    if base_ts is not None:
+        return int(base_ts)
+    if value is not None and all(hasattr(value, name) for name in ("year", "month", "day", "hour", "minute")):
+        return int(datetime(
+            int(value.year), int(value.month), int(value.day), int(value.hour), int(value.minute),
+            int(getattr(value, "second", 0)), tzinfo=ZoneInfo("Asia/Shanghai"),
+        ).timestamp())
     if value is None or not hasattr(value, "ts"): raise AttributeError(f"Unsupported time payload: {type(item)!r}")
     return int(value.ts)
 def _seq(item: Any) -> int | None:
