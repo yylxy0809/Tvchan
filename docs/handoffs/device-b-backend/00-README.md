@@ -1,5 +1,9 @@
 # 设备 B 后端无缝交接总索引
 
+> **2026-07-16 当前执行入口：** [13-设备 B 接管执行方案](13-device-b-takeover-execution-plan-2026-07-16.md)。
+> 设备 B 先等待设备 A 完成并合入 PR #5；随后按 foundation -> execution -> replay/gate 三层 `rebase --onto` 重建。不得直接合并旧 PR #3/#4/#6，也不得在 Gate FE 前启动新的全市场重算。
+> 本入口优先于旧的 `12` 中关于旧 sidebar 分支、一次性集成分支和 replay 前置状态的说明。
+
 > **2026-07-14 更新：** 当前接管入口已经更新为 [12-设备 B 全项目接管交接说明](12-device-b-full-project-takeover-2026-07-14.md)。该文档包含 iWencai/AnythingAPI 右侧栏 V2、窗口化图表、最新 Module C/策略状态、验证证据和后续分阶段验收标准。若旧文档与 12 冲突，以 12、当前仓库代码和最新用户指令为准。
 
 > 审计基线：2026-07-11，分支 `master`。后端改造实现提交为 `d2c4065`（`feat(backend): consolidate Module C and strategy pipeline`）；SMB 交接说明随后的仓库 `HEAD` 一并提交。
