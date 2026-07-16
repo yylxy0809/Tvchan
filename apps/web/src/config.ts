@@ -96,6 +96,10 @@ export function getApiToken(): string {
     return DEFAULT_API_TOKEN;
   }
   try {
+    const sessionToken = window.localStorage.getItem(LOGIN_TOKEN_STORAGE_KEY)?.trim() ?? "";
+    if (sessionToken) {
+      return sessionToken;
+    }
     const saved = window.localStorage.getItem(API_TOKEN_STORAGE_KEY);
     const normalized = saved?.trim() ?? "";
     if (!normalized || isFrontendLoginToken(normalized)) {
