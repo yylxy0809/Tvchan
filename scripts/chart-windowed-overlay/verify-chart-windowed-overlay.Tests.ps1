@@ -445,4 +445,24 @@ Describe "Task 6 full-script failures" {
             finally { Stop-RawMockServer $server }
         }
     }
+
+    It "reads UTF-8 TypeScript sources correctly in Windows PowerShell 5" {
+        $sourceRoot = Join-Path $TestDrive "scanner-utf8-source"
+        $outputRoot = Join-Path $TestDrive "scanner-utf8-output"
+        New-ScannerFixture $sourceRoot $false
+        $workspacePath = Join-Path $sourceRoot "apps/web/src/components/ChartWorkspace.tsx"
+        $title = -join @([char]0x5207, [char]0x6362, [char]0x5230, [char]0x767D, [char]0x8272, [char]0x4E3B, [char]0x9898)
+        $workspaceSource = 'export function ChartWorkspace() { const title = "' + $title + '"; const requestOverlay = () => overlayManager.request({ title }); requestOverlay(); realtimeBridge.apply({}); }'
+        [IO.File]::WriteAllText($workspacePath, $workspaceSource, [Text.UTF8Encoding]::new($false))
+        $server = Start-RawMockServer body '{"symbol":"TEST.SZ","timeframe":"5f","bars":[{"time":"bad"}]}'
+        try {
+            $run = Invoke-HarnessChild -ExtraArguments @("-ApiBaseUrl", "http://127.0.0.1:$($server.port)", "-SourceRoot", $sourceRoot, "-OutputRoot", $outputRoot, "-RunId", "scanner-utf8", "-RequestTimeoutSeconds", "2") -EnableSourceCheck
+            $run.exitCode | Should Be 2
+            $report = Get-Content -Raw (Join-Path $outputRoot "scanner-utf8\report.json") | ConvertFrom-Json
+            $gate = @($report.results | Where-Object name -eq "normal-path-no-bundle")[0]
+            $gate.status | Should Be "PASS"
+            $gate.evidence.uncertainties.Count | Should Be 0
+        }
+        finally { Stop-RawMockServer $server }
+    }
 }
