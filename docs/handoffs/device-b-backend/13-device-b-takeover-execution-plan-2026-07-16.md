@@ -10,8 +10,8 @@ GitHub 与当前仓库代码是唯一源码事实。不同设备和不同 Codex 
 
 | 对象 | 状态 |
 | --- | --- |
-| `origin/master` | `27aa0a6`，尚未包含侧栏、lifecycle 或 replay 工作 |
-| PR #5 | `codex/iwencai-sidebar-v2-rebased`，前端窗口化图表与侧栏 V2；设备 A 正在完成 Gate FE |
+| `origin/master` | `a5d18d9`，已通过 merge commit 合入 PR #5；尚未包含 lifecycle 或 replay 工作 |
+| PR #5 | 已于 2026-07-16 合入；Gate FE 证据见 PR #5 comment `issuecomment-4989496334` |
 | PR #3 | `codex/device-b-lifecycle-foundation` @ `5c5da96`，旧 foundation |
 | PR #4 | `codex/device-b-module-c-lifecycle-execution` @ `5f12465`，旧 execution；base 错误，不能直接合并 |
 | PR #6 | `codex/device-b-historical-replay-execution-20260714` @ `2560c61`，整条 lifecycle/replay/gate 堆叠代码与执行证据 |
@@ -28,21 +28,20 @@ GitHub 与当前仓库代码是唯一源码事实。不同设备和不同 Codex 
 - canonical K 线只读，除非另有明确、可审计的 K 线修复授权。
 - 侧栏的外部行情字段走当前 iWencai/AnythingAPI 聚合链；缠论状态与策略信号继续只读本地数据库。不得恢复 WeStock 运行时 fallback。
 
-## 2. 当前硬门禁：设备 B 等待 Gate FE
+## 2. Gate FE 已解除：设备 B 开始 foundation 重建
 
-设备 A 现在只在 `codex/iwencai-sidebar-v2-rebased` 上完成 PR #5 的测试、页面烟测与性能证据。
+设备 A 已在 `codex/iwencai-sidebar-v2-rebased` 完成 PR #5 的测试、页面烟测与性能证据，并将其合入 `master`。合入后的唯一基线是 `origin/master@a5d18d9`。
 
-在设备 A 宣布 PR #5 已合并到 `master` 前，设备 B：
+设备 B 现在执行 foundation 重建；在 foundation 新 PR 合入前：
 
-- 可以整理 PR #6 的可复现测试与精简审计文档；
-- 可以检查本机 K 线审计、磁盘、TimescaleDB 与运行环境；
-- 可以准备不进 Git 的运行资产清单；
-- 不得合并 PR #3、PR #4 或 PR #6；
+- 以 `origin/master@a5d18d9` 为新基线，只搬运旧 foundation 的 7 个提交；
+- 建立新的 `codex/device-b-lifecycle-foundation-rebased` 和独立 PR；
+- 冻结 PR #3、PR #4、PR #6，不直接合并其中任何一个；
 - 不得启动新的无审计全市场 Module C 重算；
 - 不得改写旧共享分支历史；
 - 不得把 `NO_GO` 改写为正式策略通过。
 
-等待的原因是主干尚未包含前端/API 合同。即使侧栏和 B 栈当前没有同名文件冲突，迁移、published head、空 head、窗口化图表 bundle 的运行时合同仍必须以合入后的 `master` 为基线复验。
+侧栏和 B 栈当前没有同名文件冲突，但迁移、published head、空 head、窗口化图表 bundle 的运行时合同仍必须以合入后的 `master` 为基线复验。foundation 验收并合入后，才能开始 execution 重建。
 
 ## 3. 正确的主干顺序
 
@@ -71,20 +70,24 @@ $FOUNDATION = "5c5da96"
 $EXECUTION  = "5f12465"
 $REPLAY     = "2560c61" # 执行前再次确认 PR #6 head
 
-# 1. foundation：仅搬运旧 master 到 foundation tip 的 7 个提交
-git switch -c codex/device-b-lifecycle-foundation-rebased origin/master
-git rebase --onto origin/master $OLD_MASTER $FOUNDATION
+# 1. foundation：先让新分支指向旧 foundation tip，再仅搬运旧 master 之后的 7 个提交
+git switch -c codex/device-b-lifecycle-foundation-rebased $FOUNDATION
+git rebase --onto origin/master $OLD_MASTER
 
 # foundation 合并后更新 origin/master。
 # 2. execution：仅搬运旧 foundation 之后的 6 个提交
-git switch -c codex/device-b-module-c-lifecycle-execution-rebased origin/master
-git rebase --onto origin/master $FOUNDATION $EXECUTION
+git fetch origin --prune
+git switch -c codex/device-b-module-c-lifecycle-execution-rebased $EXECUTION
+git rebase --onto origin/master $FOUNDATION
 
 # execution 合并后更新 origin/master。
 # 3. replay/gate：仅搬运 execution 之后到 PR #6 tip 的增量
-git switch -c codex/device-b-historical-replay-gate-rebased origin/master
-git rebase --onto origin/master $EXECUTION $REPLAY
+git fetch origin --prune
+git switch -c codex/device-b-historical-replay-gate-rebased $REPLAY
+git rebase --onto origin/master $EXECUTION
 ```
+
+注意：新分支必须先指向对应的旧层 tip，再在当前分支上执行不带第三个 `branch` 参数的 `rebase --onto`。如果先从 `origin/master` 建分支、再把旧 tip 作为第三个参数传给 `rebase`，Git 会在旧 tip 上执行并可能留下 detached HEAD，不能保证新的 `*-rebased` 分支获得重建结果。
 
 每层都必须：
 
