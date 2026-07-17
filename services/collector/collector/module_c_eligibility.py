@@ -415,10 +415,17 @@ async def _load_strict_inputs(
     connection: asyncpg.Connection,
     audit_run_id: str,
     freshness: FreshnessContract,
+    *,
+    for_share: bool = True,
 ) -> StrictInputs:
-    audit = await connection.fetchrow(
+    audit_sql = (
         "SELECT status,apply_mode,parameters,summary FROM kline_audit_runs "
-        "WHERE audit_run_id=$1::uuid FOR SHARE",
+        "WHERE audit_run_id=$1::uuid"
+    )
+    if for_share:
+        audit_sql += " FOR SHARE"
+    audit = await connection.fetchrow(
+        audit_sql,
         audit_run_id,
     )
     if audit is None or audit["status"] != "completed" or bool(audit["apply_mode"]):

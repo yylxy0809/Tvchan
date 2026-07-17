@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   AdminRequestError,
   fetchAdminOpsStatus,
+  fetchModuleCExecution,
   isAdminAuthFailure,
 } from "../api/adminRuntimeConfig";
 
@@ -87,4 +88,63 @@ test("non-auth ops failures remain locally degraded", () => {
   assert.match(source, /reason: "request_failed"/);
   assert.match(source, /status: "degraded"/);
   assert.match(source, /status: "unavailable"/);
+});
+
+test("module C execution fetch uses the authenticated read-only endpoint", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let authorization = "";
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    authorization = String((init?.headers as Record<string, string>)?.Authorization ?? "");
+    return new Response(JSON.stringify({
+      observed_at: "2026-07-18T00:00:00Z",
+      readonly: true,
+      running_parent_batches: 0,
+      running_child_batches: 0,
+      running_tasks: 0,
+      batch: null,
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const result = await fetchModuleCExecution("admin-token", 42);
+    assert.equal(result.readonly, true);
+    assert.match(requestedUrl, /\/api\/v1\/admin\/ops\/module-c\/execution\?batch_id=42$/);
+    assert.equal(authorization, "Bearer admin-token");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("admin console renders read-only Module C execution evidence without control actions", () => {
+  const source = readFileSync(new URL("./AdminConsole.tsx", import.meta.url), "utf8");
+  const apiSource = readFileSync(new URL("../api/adminRuntimeConfig.ts", import.meta.url), "utf8");
+
+  for (const label of [
+    "Batch and tasks",
+    "Retry and leases",
+    "Strict provenance",
+    "Freshness and catalog drift",
+  ]) assert.match(source, new RegExp(label));
+  for (const field of [
+    "retryable_failed", "exhausted_failed", "expired_leases", "max_attempts",
+    "canonical_audit_run_id", "audit_evidence_sha256", "audit_checkpoint_sha256",
+    "audit_gate_pass",
+    "freshness_contract_sha256", "expected_closed_watermarks", "actual_checkpoint_watermarks",
+    "catalog_generation_id", "catalog_control_revision", "catalog_revision_matches", "drift_reasons",
+    "frozen_config_matches", "execution_identity_matches", "live_universe_matches",
+    "catalog_manifest_matches", "future_scopes",
+  ]) {
+    assert.match(source, new RegExp(field));
+    assert.match(apiSource, new RegExp(field));
+  }
+  assert.match(source, /title=\{value\}/);
+  assert.doesNotMatch(source, /handle(?:Start|Retry|Activate)ModuleC/);
+});
+
+test("Module C request failure preserves the last snapshot and auth failure returns first", () => {
+  const source = readFileSync(new URL("./AdminConsole.tsx", import.meta.url), "utf8");
+  assert.match(source, /if \(handleAuthenticationFailure\(nextError\)\) return;/);
+  assert.match(source, /setModuleCExecutionState\(\(current\) => \(\{[\s\S]*\.\.\.current,[\s\S]*stale: true,[\s\S]*reason: "request_failed"/);
+  assert.match(source, /showing the last successful snapshot/);
 });

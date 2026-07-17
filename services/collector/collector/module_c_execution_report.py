@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import subprocess
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -13,25 +14,55 @@ from typing import Any, Mapping, Sequence
 import asyncpg
 
 from collector.lifecycle_reconciliation import build_reconciliation
+from collector.module_c_eligibility import (
+    FRESHNESS_CONTRACT_VERSION,
+    _SHA256_RE,
+    _load_strict_inputs,
+    parse_freshness_contract,
+)
 
 
 LEVEL_NAMES = {5: "5f", 30: "30f", 1440: "1d", 10080: "1w", 43200: "1m"}
 MODES = ("confirmed", "predictive")
+EXECUTION_CONTRACT = "module-c-native-five-level-v1"
 
 BATCH_SQL = """
 /* report:batch */
 select batch.batch_id, batch.eligibility_build_id::text, batch.run_group_id,
        batch.config_hash, batch.publication_namespace, batch.profile_id,
        batch.shard_count, batch.status, batch.active_symbols,
+       batch.eligibility_build_id::text as child_eligibility_build_id,
+       batch.run_group_id as child_run_group_id,
+       batch.config_hash as child_config_hash,
+       batch.publication_namespace as child_publication_namespace,
+       batch.profile_id as child_profile_id,
+       batch.shard_count as child_shard_count,
        batch.disposition_rows, batch.created_at, batch.started_at,
        batch.finished_at, batch.updated_at,
        evidence.batch_key, evidence.batch_kind, evidence.code_commit,
+       evidence.effective_config as parent_effective_config,
+       evidence.run_group_id as parent_run_group_id,
+       evidence.config_hash as parent_config_hash,
+       evidence.publication_namespace as parent_publication_namespace,
+       evidence.profile_id as parent_profile_id,
        evidence.image_digest, evidence.vendor_manifest_sha256,
        evidence.eligible_manifest_uri, evidence.eligible_manifest_sha256,
        evidence.input_watermark, evidence.audit_references,
-       eligibility.manifest_version, eligibility.active_universe_hash,
+       eligibility.manifest_version,
+       eligibility.build_id::text as build_id,
+       eligibility.config_hash as build_config_hash,
+       eligibility.active_universe_hash,
        eligibility.manifest_hash, eligibility.parameters as eligibility_parameters,
-       eligibility.summary as eligibility_summary
+       eligibility.summary as eligibility_summary,
+       eligibility.canonical_audit_run_id::text,
+       eligibility.audit_evidence_sha256,
+       eligibility.audit_checkpoint_sha256,
+       eligibility.freshness_contract_version,
+       eligibility.freshness_contract_sha256,
+       eligibility.catalog_generation_id::text,
+       eligibility.catalog_control_revision,
+       eligibility.catalog_manifest_sha256,
+       eligibility.audit_active_universe_sha256
 from chan_c_full_recompute_batches batch
 join chan_c_batches evidence on evidence.id = batch.batch_id
 join module_c_eligibility_builds eligibility
@@ -166,9 +197,7 @@ CANONICAL_SQL = """
 select audit_run_id::text, started_at, completed_at, status, apply_mode,
        parameters, summary, failure
 from kline_audit_runs
-where status in ('completed', 'failed')
-order by completed_at desc nulls last, started_at desc
-limit 1
+where audit_run_id = $1::uuid
 """
 
 OFFICIAL_SQL = """
@@ -259,6 +288,319 @@ def _jsonl(rows: Sequence[Mapping[str, Any]]) -> str:
     return "".join(json.dumps(dict(row), ensure_ascii=False, sort_keys=True, default=_json_value) + "\n" for row in rows)
 
 
+def _failed_provenance(
+    failure_code: str,
+    validation_error: str,
+    *,
+    policy: str = "strict-v2",
+    frozen: Mapping[str, Any] | None = None,
+    observed: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "readonly": True,
+        "kline_rows_scanned": False,
+        "policy": policy,
+        "decision": "FAIL",
+        "failure_code": failure_code,
+        "validation_error": validation_error,
+        "frozen": dict(frozen or {}),
+        "observed": dict(observed or {}),
+    }
+
+
+async def build_strict_v2_provenance(
+    conn: Any,
+    batch: Mapping[str, Any],
+) -> dict[str, Any]:
+    parameters = _json_object(batch.get("eligibility_parameters"))
+    if parameters.get("policy") != "strict-v2":
+        return _failed_provenance(
+            "unavailable",
+            "Eligibility build does not declare the strict-v2 policy",
+            policy=str(parameters.get("policy") or ""),
+        )
+    effective_config = _json_object(batch.get("parent_effective_config"))
+    required_effective_fields = {
+        "contract",
+        "levels",
+        "modes",
+        "concurrency_per_worker",
+        "shard_count",
+        "eligibility_build_id",
+        "max_attempts",
+    }
+    execution_identity = {
+        "batch_kind": batch.get("batch_kind"),
+        "parent_run_group_id": batch.get("parent_run_group_id"),
+        "child_run_group_id": batch.get("child_run_group_id"),
+        "parent_publication_namespace": batch.get("parent_publication_namespace"),
+        "child_publication_namespace": batch.get("child_publication_namespace"),
+        "parent_profile_id": batch.get("parent_profile_id"),
+        "child_profile_id": batch.get("child_profile_id"),
+        "parent_config_hash": batch.get("parent_config_hash"),
+        "child_config_hash": batch.get("child_config_hash"),
+        "build_config_hash": batch.get("build_config_hash"),
+        "child_shard_count": batch.get("child_shard_count"),
+        "child_eligibility_build_id": batch.get("child_eligibility_build_id"),
+        "build_id": batch.get("build_id"),
+        "parent_effective_config": effective_config,
+    }
+    identity_text_fields = (
+        "batch_kind",
+        "parent_run_group_id",
+        "child_run_group_id",
+        "parent_publication_namespace",
+        "child_publication_namespace",
+        "parent_profile_id",
+        "child_profile_id",
+        "parent_config_hash",
+        "child_config_hash",
+        "build_config_hash",
+    )
+    max_attempts = effective_config.get("max_attempts")
+    concurrency = effective_config.get("concurrency_per_worker")
+    configured_shards = effective_config.get("shard_count")
+    child_shards = batch.get("child_shard_count")
+    levels = effective_config.get("levels")
+    modes = effective_config.get("modes")
+    try:
+        child_build_id = str(uuid.UUID(str(batch["child_eligibility_build_id"])))
+        build_id = str(uuid.UUID(str(batch["build_id"])))
+        configured_build_id = str(
+            uuid.UUID(str(effective_config["eligibility_build_id"]))
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        return _failed_provenance(
+            "unavailable",
+            f"Strict-v2 execution identity is incomplete: {error}",
+            observed={"execution_identity": execution_identity},
+        )
+    if (
+        not required_effective_fields.issubset(effective_config)
+        or any(
+            not isinstance(execution_identity[field], str)
+            or not str(execution_identity[field]).strip()
+            for field in identity_text_fields
+        )
+        or not isinstance(effective_config.get("contract"), str)
+        or not isinstance(levels, list)
+        or not all(isinstance(value, str) for value in levels)
+        or not isinstance(modes, list)
+        or not all(isinstance(value, str) for value in modes)
+        or not isinstance(concurrency, int)
+        or isinstance(concurrency, bool)
+        or concurrency < 1
+        or not isinstance(configured_shards, int)
+        or isinstance(configured_shards, bool)
+        or configured_shards < 1
+        or not isinstance(child_shards, int)
+        or isinstance(child_shards, bool)
+        or child_shards < 1
+        or not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or max_attempts < 1
+    ):
+        return _failed_provenance(
+            "unavailable",
+            "Strict-v2 execution identity has missing or invalid field values",
+            observed={"execution_identity": execution_identity},
+        )
+    expected_effective_config = {
+        "contract": EXECUTION_CONTRACT,
+        "levels": list(LEVEL_NAMES.values()),
+        "modes": list(MODES),
+        "concurrency_per_worker": 1,
+        "shard_count": child_shards,
+        "eligibility_build_id": child_build_id,
+        "max_attempts": max_attempts,
+    }
+    if (
+        batch["batch_kind"] not in {"canary", "baseline"}
+        or effective_config != expected_effective_config
+        or child_build_id != build_id
+        or configured_build_id != child_build_id
+        or batch["parent_run_group_id"] != batch["child_run_group_id"]
+        or batch["parent_publication_namespace"]
+        != batch["child_publication_namespace"]
+        or batch["parent_profile_id"] != batch["child_profile_id"]
+        or len(
+            {
+                batch["parent_config_hash"],
+                batch["child_config_hash"],
+                batch["build_config_hash"],
+            }
+        )
+        != 1
+    ):
+        return _failed_provenance(
+            "drift",
+            "Strict-v2 execution identity drifted",
+            observed={"execution_identity": execution_identity},
+        )
+    identity = {
+        "eligible_manifest_sha256": batch.get("eligible_manifest_sha256"),
+        "eligibility_manifest_sha256": batch.get("manifest_hash"),
+        "parent_config_hash": batch.get("parent_config_hash"),
+        "child_config_hash": batch.get("config_hash"),
+        "build_config_hash": batch.get("build_config_hash"),
+    }
+    manifest_values = (
+        identity["eligible_manifest_sha256"],
+        identity["eligibility_manifest_sha256"],
+    )
+    config_values = (
+        identity["parent_config_hash"],
+        identity["child_config_hash"],
+        identity["build_config_hash"],
+    )
+    if (
+        any(
+            not isinstance(value, str) or not _SHA256_RE.fullmatch(value)
+            for value in manifest_values
+        )
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in config_values
+        )
+    ):
+        return _failed_provenance(
+            "unavailable",
+            "Strict-v2 batch manifest or config identity is incomplete",
+            observed={"batch_identity": identity},
+        )
+    if len(set(manifest_values)) != 1 or len(set(config_values)) != 1:
+        return _failed_provenance(
+            "drift",
+            "Strict-v2 batch manifest or config identity drifted",
+            observed={"batch_identity": identity},
+        )
+    try:
+        frozen = {
+            "canonical_audit_run_id": str(
+                uuid.UUID(str(batch["canonical_audit_run_id"]))
+            ),
+            "audit_evidence_sha256": str(batch["audit_evidence_sha256"]),
+            "audit_checkpoint_sha256": str(batch["audit_checkpoint_sha256"]),
+            "freshness_contract_version": str(batch["freshness_contract_version"]),
+            "freshness_contract_sha256": str(batch["freshness_contract_sha256"]),
+            "catalog_generation_id": str(
+                uuid.UUID(str(batch["catalog_generation_id"]))
+            ),
+            "catalog_control_revision": int(batch["catalog_control_revision"]),
+            "catalog_manifest_sha256": str(batch["catalog_manifest_sha256"]),
+            "audit_active_universe_sha256": str(
+                batch["audit_active_universe_sha256"]
+            ),
+        }
+        parameter_provenance = {
+            "canonical_audit_run_id": str(
+                uuid.UUID(str(parameters["canonical_audit_run_id"]))
+            ),
+            "audit_evidence_sha256": str(parameters["audit_evidence_sha256"]),
+            "audit_checkpoint_sha256": str(parameters["audit_checkpoint_sha256"]),
+            "freshness_contract_version": str(
+                parameters["freshness_contract_version"]
+            ),
+            "freshness_contract_sha256": str(
+                parameters["freshness_contract_sha256"]
+            ),
+            "catalog_generation_id": str(
+                uuid.UUID(str(parameters["catalog_generation_id"]))
+            ),
+            "catalog_control_revision": int(parameters["catalog_control_revision"]),
+            "catalog_manifest_sha256": str(parameters["catalog_manifest_sha256"]),
+            "audit_active_universe_sha256": str(
+                parameters["audit_active_universe_sha256"]
+            ),
+        }
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        return _failed_provenance(
+            "unavailable",
+            f"Strict-v2 frozen provenance is incomplete: {error}",
+        )
+    sha_fields = (
+        "audit_evidence_sha256",
+        "audit_checkpoint_sha256",
+        "freshness_contract_sha256",
+        "catalog_manifest_sha256",
+        "audit_active_universe_sha256",
+    )
+    if (
+        any(not _SHA256_RE.fullmatch(frozen[field]) for field in sha_fields)
+        or frozen["freshness_contract_version"] != FRESHNESS_CONTRACT_VERSION
+        or isinstance(batch["catalog_control_revision"], bool)
+        or isinstance(parameters["catalog_control_revision"], bool)
+        or frozen["catalog_control_revision"] < 0
+    ):
+        return _failed_provenance(
+            "unavailable",
+            "Strict-v2 frozen provenance has invalid field values",
+            frozen=frozen,
+        )
+    try:
+        freshness = parse_freshness_contract(parameters["freshness_contract"])
+    except (KeyError, TypeError, ValueError) as error:
+        return _failed_provenance(
+            "unavailable",
+            f"Strict-v2 freshness contract is unavailable: {error}",
+            frozen=frozen,
+        )
+    if (
+        parameter_provenance != frozen
+        or freshness.contract_version != frozen["freshness_contract_version"]
+        or freshness.sha256 != frozen["freshness_contract_sha256"]
+        or str(batch.get("active_universe_hash"))
+        != frozen["audit_active_universe_sha256"]
+    ):
+        return _failed_provenance(
+            "drift",
+            "Strict-v2 eligibility columns, parameters, or freshness contract drifted",
+            frozen=frozen,
+            observed=parameter_provenance,
+        )
+    try:
+        strict = await _load_strict_inputs(
+            conn,
+            frozen["canonical_audit_run_id"],
+            freshness,
+            for_share=False,
+        )
+    except RuntimeError as error:
+        return _failed_provenance(
+            "drift",
+            str(error),
+            frozen=frozen,
+        )
+    observed = {
+        "canonical_audit_run_id": frozen["canonical_audit_run_id"],
+        "audit_evidence_sha256": strict.audit_evidence_sha256,
+        "audit_checkpoint_sha256": strict.audit_checkpoint_sha256,
+        "freshness_contract_version": freshness.contract_version,
+        "freshness_contract_sha256": freshness.sha256,
+        "catalog_generation_id": str(strict.catalog_generation_id),
+        "catalog_control_revision": strict.catalog_control_revision,
+        "catalog_manifest_sha256": strict.catalog_manifest_sha256,
+        "audit_active_universe_sha256": strict.audit_active_universe_sha256,
+    }
+    if observed != frozen:
+        return _failed_provenance(
+            "drift",
+            "Live strict-v2 inputs no longer match the frozen eligibility provenance",
+            frozen=frozen,
+            observed=observed,
+        )
+    return {
+        "readonly": True,
+        "kline_rows_scanned": False,
+        "policy": "strict-v2",
+        "decision": "PASS",
+        "failure_code": None,
+        "validation_error": None,
+        "frozen": frozen,
+        "observed": observed,
+    }
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -285,12 +627,16 @@ async def build_report(
     batch = _dict(await conn.fetchrow(BATCH_SQL, batch_id))
     if not batch:
         raise ValueError(f"Module C recompute batch does not exist: {batch_id}")
+    strict_v2_provenance = await build_strict_v2_provenance(conn, batch)
 
     task_rows = [_dict(row) for row in await conn.fetch(TASK_PROGRESS_SQL, batch_id)]
     head_rows = [_dict(row) for row in await conn.fetch(HEAD_COVERAGE_SQL, batch_id)]
     outbox_rows = [_dict(row) for row in await conn.fetch(OUTBOX_SQL, batch_id)]
     failure_rows = [_dict(row) for row in await conn.fetch(FAILURES_SQL, batch_id)]
-    canonical = _dict(await conn.fetchrow(CANONICAL_SQL))
+    pinned_audit_run_id = strict_v2_provenance["frozen"].get(
+        "canonical_audit_run_id"
+    )
+    canonical = _dict(await conn.fetchrow(CANONICAL_SQL, pinned_audit_run_id))
     official = _dict(await conn.fetchrow(OFFICIAL_SQL, batch_id))
     db_resource = _dict(await conn.fetchrow(DB_RESOURCE_SQL))
     lifecycle = await build_reconciliation(conn)
@@ -335,6 +681,10 @@ async def build_report(
             "blockers": lifecycle["blockers"],
         },
         "official": {key: int(value or 0) for key, value in official.items()},
+        "provenance": {
+            "decision": strict_v2_provenance["decision"],
+            "failure_code": strict_v2_provenance["failure_code"],
+        },
     }
 
     blockers: list[dict[str, Any]] = []
@@ -361,24 +711,47 @@ async def build_report(
         block("baseline_claims_historical_first_seen", official, "Keep baseline as baseline_observed and remove it from official historical eligibility.")
     if int(official.get("future_leak_events") or 0):
         block("official_future_leak", official, "Correct replay event ordering and regenerate only affected official evidence.")
+    if strict_v2_provenance["decision"] != "PASS":
+        failure_code = str(strict_v2_provenance["failure_code"])
+        block(
+            f"strict_v2_provenance_{failure_code}",
+            strict_v2_provenance,
+            (
+                "Restore complete frozen strict-v2 provenance before reporting this batch."
+                if failure_code == "unavailable"
+                else "Resolve the pinned audit, universe, catalog, or freshness drift before continuing."
+            ),
+        )
 
     canonical_summary = _json_object(canonical.get("summary"))
-    canonical_ready = canonical.get("status") == "completed"
+    canonical_ready = (
+        canonical.get("status") == "completed"
+        and canonical.get("apply_mode") is False
+        and canonical.get("audit_run_id") == pinned_audit_run_id
+    )
+    canonical_gate_pass = canonical_summary.get("gate_pass") is True
     if not canonical_ready:
         block("canonical_gate_unavailable", canonical, "Complete the read-only canonical gate and retain its audit evidence.")
+    elif not canonical_gate_pass:
+        block(
+            "canonical_gate_failed",
+            canonical,
+            "Resolve the pinned canonical audit blockers before continuing.",
+        )
 
     manifest = {
         "generated_at": generated_at,
         "readonly": True,
         "batch": batch,
         "report_code_commit": _local_commit(),
+        "strict_v2_provenance": strict_v2_provenance,
     }
     canonical_report = {
         "generated_at": generated_at,
         "readonly": True,
         "audit": canonical,
         "gate_available": canonical_ready,
-        "gate_pass": bool(canonical_summary.get("gate_pass", False)),
+        "gate_pass": canonical_gate_pass,
     }
     coverage = {
         "generated_at": generated_at,
@@ -408,6 +781,7 @@ async def build_report(
         "published_head_coverage": coverage,
         "resource_metrics": [resource_row],
         "failure_samples": failure_rows,
+        "strict_v2_provenance": strict_v2_provenance,
         "next_phase_decision": decision,
     }
 
@@ -427,6 +801,7 @@ def write_artifacts(output_dir: Path, report: Mapping[str, Any]) -> None:
         "published_head_coverage.json": _json_text(report["published_head_coverage"]),
         "resource_metrics.jsonl": _jsonl(report["resource_metrics"]),
         "failure_samples.jsonl": _jsonl(report["failure_samples"]),
+        "strict_v2_provenance.json": _json_text(report["strict_v2_provenance"]),
         "next_phase_decision.json": _json_text(report["next_phase_decision"]),
     }
     for name, content in files.items():

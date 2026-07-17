@@ -22,9 +22,13 @@ import {
   type LlmProviderConfig,
   type LlmProvidersConfig,
   type LlmTestResult,
+  type ModuleCFreshnessActualWatermark,
+  type ModuleCFreshnessExpectedWatermark,
+  type ModuleCExecutionStatus,
   type WencaiAdminConfig,
   fetchAdminOpsStatus,
   fetchLlmProviders,
+  fetchModuleCExecution,
   fetchWencaiConfig,
   isAdminAuthFailure,
   saveLlmProviders,
@@ -54,6 +58,13 @@ type ActionFeedback = {
   message: string;
 };
 
+type ModuleCExecutionViewState = {
+  snapshot: ModuleCExecutionStatus | null;
+  stale: boolean;
+  reason: string | null;
+  error: string | null;
+};
+
 const DEFAULT_WENCAI_CONFIG: WencaiAdminConfig = {
   base_url: "https://openapi.iwencai.com",
   api_key: "",
@@ -79,6 +90,12 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
   });
   const [llmTestResults, setLlmTestResults] = useState<Record<string, LlmTestResult>>({});
   const [opsStatus, setOpsStatus] = useState<AdminOpsStatus | null>(null);
+  const [moduleCExecutionState, setModuleCExecutionState] = useState<ModuleCExecutionViewState>({
+    snapshot: null,
+    stale: false,
+    reason: null,
+    error: null,
+  });
   const [label, setLabel] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
@@ -92,6 +109,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
     void refreshWencaiConfig();
     void refreshLlmProviders();
     void refreshOpsStatus();
+    void refreshModuleCExecution();
   }, []);
 
   async function refreshTokens() {
@@ -156,6 +174,26 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
           error: readError(nextError),
         },
       });
+    }
+  }
+
+  async function refreshModuleCExecution() {
+    try {
+      const snapshot = await fetchModuleCExecution(adminToken);
+      setModuleCExecutionState({
+        snapshot,
+        stale: false,
+        reason: null,
+        error: null,
+      });
+    } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
+      setModuleCExecutionState((current) => ({
+        ...current,
+        stale: true,
+        reason: "request_failed",
+        error: readError(nextError),
+      }));
     }
   }
 
@@ -349,6 +387,9 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
     return true;
   }
 
+  const moduleCExecution = moduleCExecutionState.snapshot;
+  const moduleCBatch = moduleCExecution?.batch;
+
   return (
     <section className="admin-workspace" aria-label="管理后台">
       <div className="admin-head">
@@ -489,6 +530,106 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
             <p>heartbeat age: {formatAge(opsStatus?.lifecycle_observer.heartbeat_age_seconds)}</p>
             <p>stale after: {formatAge(opsStatus?.lifecycle_observer.heartbeat_stale_after_seconds)}</p>
             <p>updated: {formatDate(opsStatus?.lifecycle_observer.observer_watermark?.updated_at)}</p>
+          </div>
+        </div>
+      </section>
+
+      <section className="admin-feature-panel" aria-label="Module C execution status">
+        <div className="admin-feature-head">
+          <div>
+            <p className="eyebrow">Module C execution</p>
+            <h2>Read-only batch evidence</h2>
+          </div>
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={() => void refreshModuleCExecution()}
+          >
+            <RefreshCw size={16} />
+            <span>Refresh execution</span>
+          </button>
+        </div>
+        {moduleCExecutionState.stale ? (
+          <p className="form-error admin-error" role="status">
+            <AlertCircle size={15} />
+            <span>
+              {moduleCExecutionState.reason}: {moduleCExecutionState.error ?? "request failed"};{" "}
+              {moduleCExecutionState.snapshot
+                ? "showing the last successful snapshot"
+                : "no successful snapshot available"}
+            </span>
+          </p>
+        ) : null}
+        <div className="admin-feature-grid">
+          <div className="admin-feature-card">
+            <h3>Batch and tasks</h3>
+            <p>batch: {moduleCBatch?.batch_id ?? "--"}</p>
+            <p>kind: {moduleCBatch?.batch_kind ?? "--"}</p>
+            <p>parent: {moduleCBatch?.parent_status ?? "--"}</p>
+            <p>child: {moduleCBatch?.child_status ?? "--"}</p>
+            <p>running parents: {moduleCExecution?.running_parent_batches ?? "--"}</p>
+            <p>running children: {moduleCExecution?.running_child_batches ?? "--"}</p>
+            <p>active symbols: {moduleCBatch?.execution.active_symbols ?? "--"}</p>
+            <p>shards: {moduleCBatch?.execution.shard_count ?? "--"}</p>
+            {moduleCBatch?.execution.tasks.map((task) => (
+              <p key={`${task.chan_level}-${task.status}`}>
+                level {task.chan_level} / {task.status}: {task.count} tasks, {task.bars} bars,
+                {" "}{task.strokes} strokes, {task.segments} segments, {task.centers} centers,
+                {" "}{task.signals} signals
+              </p>
+            ))}
+            <p>latest update: {formatDate(moduleCBatch?.execution.latest_task_update)}</p>
+          </div>
+          <div className="admin-feature-card">
+            <h3>Retry and leases</h3>
+            <p>max_attempts: {moduleCBatch?.frozen_config.max_attempts ?? "--"}</p>
+            <p>running_tasks: {moduleCExecution?.running_tasks ?? "--"}</p>
+            <p>retryable_failed: {moduleCBatch?.execution.retryable_failed ?? "--"}</p>
+            <p>exhausted_failed: {moduleCBatch?.execution.exhausted_failed ?? "--"}</p>
+            <p>expired_leases: {moduleCBatch?.execution.expired_leases ?? "--"}</p>
+            <p>dispositions: {moduleCBatch?.execution.disposition_rows ?? "--"}</p>
+            <p>read-only: {formatBoolean(moduleCExecution?.readonly)}</p>
+            <p>observed: {formatDate(moduleCExecution?.observed_at)}</p>
+          </div>
+          <div className="admin-feature-card">
+            <h3>Strict provenance</h3>
+            <p>policy: {moduleCBatch?.provenance.policy ?? "--"}</p>
+            <p>eligibility build: {moduleCBatch?.provenance.eligibility_build_id ?? "--"}</p>
+            <p>audit run: {moduleCBatch?.provenance.canonical_audit_run_id ?? "--"}</p>
+            <p>audit status: {moduleCBatch?.provenance.audit_status ?? "--"}</p>
+            <p>audit apply mode: {formatBoolean(moduleCBatch?.provenance.audit_apply_mode ?? undefined)}</p>
+            <p>audit gate pass: {formatBoolean(moduleCBatch?.provenance.audit_gate_pass ?? undefined)}</p>
+            <p>audit evidence: <HashValue value={moduleCBatch?.provenance.audit_evidence_sha256} /></p>
+            <p>audit checkpoint: <HashValue value={moduleCBatch?.provenance.audit_checkpoint_sha256} /></p>
+            <p>eligibility manifest: <HashValue value={moduleCBatch?.provenance.eligibility_manifest_sha256} /></p>
+            <p>build manifest: <HashValue value={moduleCBatch?.provenance.build_manifest_sha256} /></p>
+            <p>freshness contract: <HashValue value={moduleCBatch?.provenance.freshness_contract_sha256} /></p>
+            <p>evidence complete: {formatBoolean(moduleCBatch?.provenance.evidence_complete)}</p>
+            <p>manifest matches: {formatBoolean(moduleCBatch?.provenance.eligibility_manifest_matches)}</p>
+            <p>config matches: {formatBoolean(moduleCBatch?.provenance.config_hash_matches)}</p>
+            <p>frozen config matches: {formatBoolean(moduleCBatch?.provenance.frozen_config_matches)}</p>
+            <p>execution identity matches: {formatBoolean(moduleCBatch?.provenance.execution_identity_matches)}</p>
+          </div>
+          <div className="admin-feature-card">
+            <h3>Freshness and catalog drift</h3>
+            <p>freshness: {moduleCBatch?.freshness.status ?? "--"}</p>
+            <p>as of: {formatDate(moduleCBatch?.freshness.as_of)}</p>
+            <p>reasons: {formatReasons(moduleCBatch?.freshness.reasons)}</p>
+            <p>catalog generation: {moduleCBatch?.provenance.catalog_generation_id ?? "--"}</p>
+            <p>catalog status: {moduleCBatch?.provenance.catalog_generation_status ?? "--"}</p>
+            <p>catalog revision: {moduleCBatch?.provenance.catalog_control_revision ?? "--"}</p>
+            <p>live revision: {moduleCBatch?.provenance.live_catalog_control_revision ?? "--"}</p>
+            <p>catalog active: {formatBoolean(moduleCBatch?.provenance.catalog_is_active)}</p>
+            <p>catalog revision matches: {formatBoolean(moduleCBatch?.provenance.catalog_revision_matches)}</p>
+            <p>live universe matches: {formatBoolean(moduleCBatch?.provenance.live_universe_matches)}</p>
+            <p>catalog manifest matches: {formatBoolean(moduleCBatch?.provenance.catalog_manifest_matches)}</p>
+            <p>drift_reasons: {formatReasons(moduleCBatch?.provenance.drift_reasons)}</p>
+            <p>catalog manifest: <HashValue value={moduleCBatch?.provenance.catalog_manifest_sha256} /></p>
+            <p>active universe: <HashValue value={moduleCBatch?.provenance.audit_active_universe_sha256} /></p>
+            <h4>expected_closed_watermarks</h4>
+            <WatermarkList values={moduleCBatch?.freshness.expected_closed_watermarks} />
+            <h4>actual_checkpoint_watermarks</h4>
+            <WatermarkList values={moduleCBatch?.freshness.actual_checkpoint_watermarks} />
           </div>
         </div>
       </section>
@@ -752,6 +893,39 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
   );
 }
 
+function HashValue({ value }: { value?: string | null }) {
+  if (!value) {
+    return <code>--</code>;
+  }
+  const displayValue = value.length > 12 ? `${value.slice(0, 12)}…` : value;
+  return <code title={value}>{displayValue}</code>;
+}
+
+function WatermarkList({
+  values,
+}: {
+  values?: (ModuleCFreshnessExpectedWatermark | ModuleCFreshnessActualWatermark)[];
+}) {
+  if (!values?.length) {
+    return <p>--</p>;
+  }
+  return (
+    <div>
+      {values.map((value) => (
+        <p key={value.timeframe}>
+          {value.timeframe}: expected {formatDate(value.expected)}
+          {"actual_min" in value ? (
+            <>
+              , actual {formatDate(value.actual_min)} to {formatDate(value.actual_max)}, empty{" "}
+              {value.empty_scopes}, stale {value.stale_scopes}, future {value.future_scopes}
+            </>
+          ) : null}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 function FeatureSwitchGroup({
   title,
   area,
@@ -888,4 +1062,15 @@ function formatAge(value?: number | null): string {
     return "--";
   }
   return `${value}s`;
+}
+
+function formatBoolean(value?: boolean): string {
+  if (value === undefined) {
+    return "--";
+  }
+  return value ? "yes" : "no";
+}
+
+function formatReasons(values?: string[]): string {
+  return values?.length ? values.join(", ") : "--";
 }
