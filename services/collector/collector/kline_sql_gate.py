@@ -105,8 +105,14 @@ def _normalize_timeframes(timeframes: Sequence[int]) -> tuple[int, ...]:
     return TIMEFRAMES
 
 
+def _advisory_lock_key(run_id: uuid.UUID) -> int:
+    """Map an audit UUID to PostgreSQL's signed 64-bit advisory-lock key."""
+    digest = hashlib.sha256(run_id.bytes).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
 async def _claim_audit_run(conn: Any, run_id: uuid.UUID) -> None:
-    """Claim a new or failed run without ever resetting durable completed evidence."""
+    """Claim or recover an incomplete run while its UUID advisory lock is held."""
     pending = json.dumps({
         "contract_version": EVIDENCE_CONTRACT_VERSION,
         "engine": "sql_gate",
@@ -128,11 +134,11 @@ async def _claim_audit_run(conn: Any, run_id: uuid.UUID) -> None:
             )
             return
         status = str(existing["status"])
-        if status in {"running", "completed"}:
+        if status == "completed":
             raise AuditRunAlreadyClaimed(
                 f"canonical audit {run_id} is already {status}; use a new UUID"
             )
-        if status != "failed":
+        if status not in {"running", "failed"}:
             raise AuditRunAlreadyClaimed(
                 f"canonical audit {run_id} has unsupported status {status}"
             )
@@ -143,7 +149,7 @@ async def _claim_audit_run(conn: Any, run_id: uuid.UUID) -> None:
         await conn.execute(
             "UPDATE kline_audit_runs SET started_at=now(),completed_at=NULL,status='running',"
             "apply_mode=false,parameters=$2::jsonb,summary='{}'::jsonb,failure=NULL "
-            "WHERE audit_run_id=$1 AND status='failed'",
+            "WHERE audit_run_id=$1 AND status IN ('running','failed')",
             run_id,
             pending,
         )
@@ -598,23 +604,12 @@ async def _worker(
         await connection.close()
 
 
-async def run_gate(
+async def _run_claimed_gate(
     database_url: str,
-    run_id: str | None = None,
-    timeframes: Sequence[int] = TIMEFRAMES,
+    run_id: str,
+    run_uuid: uuid.UUID,
+    timeframes: Sequence[int],
 ) -> tuple[str, dict[str, Any]]:
-    timeframes = _normalize_timeframes(timeframes)
-    run_id = run_id or str(uuid.uuid4())
-    run_uuid = uuid.UUID(run_id)
-    setup = await asyncpg.connect(database_url)
-    try:
-        primary_key = await setup.fetchrow(PRIMARY_KEY_SQL)
-        if not primary_key or not primary_key["convalidated"] or "(symbol_id, timeframe, ts)" not in primary_key["definition"]:
-            raise RuntimeError("klines canonical primary key is absent or unvalidated")
-        await _claim_audit_run(setup, run_uuid)
-    finally:
-        await setup.close()
-
     coordinator: Any | None = None
     coordinator_tx: Any | None = None
     coordinator_open = False
@@ -665,9 +660,6 @@ async def run_gate(
         if coordinator is not None:
             await coordinator.close()
 
-    # If this post-snapshot connection fails, the durable run can remain
-    # running.  Retry with a new UUID, or have an operator mark this UUID
-    # failed before deliberately reusing it; never reset running evidence.
     final = await asyncpg.connect(database_url)
     try:
         if evidence is None:
@@ -676,6 +668,38 @@ async def run_gate(
         return run_id, summary
     finally:
         await final.close()
+
+
+async def run_gate(
+    database_url: str,
+    run_id: str | None = None,
+    timeframes: Sequence[int] = TIMEFRAMES,
+) -> tuple[str, dict[str, Any]]:
+    timeframes = _normalize_timeframes(timeframes)
+    run_id = run_id or str(uuid.uuid4())
+    run_uuid = uuid.UUID(run_id)
+    lock_key = _advisory_lock_key(run_uuid)
+    setup = await asyncpg.connect(database_url)
+    lock_acquired = False
+    try:
+        lock_acquired = bool(
+            await setup.fetchval("SELECT pg_try_advisory_lock($1::bigint)", lock_key)
+        )
+        if not lock_acquired:
+            raise AuditRunAlreadyClaimed(
+                f"canonical audit {run_id} is already owned by another process"
+            )
+        primary_key = await setup.fetchrow(PRIMARY_KEY_SQL)
+        if not primary_key or not primary_key["convalidated"] or "(symbol_id, timeframe, ts)" not in primary_key["definition"]:
+            raise RuntimeError("klines canonical primary key is absent or unvalidated")
+        await _claim_audit_run(setup, run_uuid)
+        return await _run_claimed_gate(database_url, run_id, run_uuid, timeframes)
+    finally:
+        try:
+            if lock_acquired:
+                await setup.fetchval("SELECT pg_advisory_unlock($1::bigint)", lock_key)
+        finally:
+            await setup.close()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

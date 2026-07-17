@@ -335,22 +335,54 @@ class ClaimConnection:
         return "DELETE 4" if sql.lower().lstrip().startswith("delete") else "UPDATE 1"
 
 
-@pytest.mark.parametrize("status", ["running", "completed"])
-def test_claim_never_resets_running_or_completed_audit(status: str) -> None:
-    connection = ClaimConnection(status)
-    with pytest.raises(AuditRunAlreadyClaimed, match=status):
+def test_claim_never_resets_completed_audit() -> None:
+    connection = ClaimConnection("completed")
+    with pytest.raises(AuditRunAlreadyClaimed, match="completed"):
         asyncio.run(_claim_audit_run(connection, uuid4()))
     assert connection.executed == []
 
 
-def test_claim_may_reuse_failed_uuid_only_after_clearing_checkpoints() -> None:
-    connection = ClaimConnection("failed")
+@pytest.mark.parametrize("status", ["running", "failed"])
+def test_locked_claim_recovers_incomplete_run_after_clearing_checkpoints(
+    status: str,
+) -> None:
+    connection = ClaimConnection(status)
     asyncio.run(_claim_audit_run(connection, uuid4()))
 
     statements = [sql for sql, _args in connection.executed]
     assert statements[0].startswith("delete from kline_audit_checkpoints")
     assert statements[1].startswith("update kline_audit_runs")
     assert "apply_mode=false" in statements[1]
+    assert "status in ('running','failed')" in statements[1]
+
+
+def test_concurrent_same_uuid_is_rejected_by_advisory_lock(monkeypatch) -> None:
+    class LockedConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def fetchval(self, sql: str, *_args: object) -> bool:
+            assert "pg_try_advisory_lock" in sql.lower()
+            return False
+
+        async def fetchrow(self, _sql: str, *_args: object):
+            raise AssertionError("schema and claim must not run without the UUID lock")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    setup = LockedConnection()
+
+    async def connect(_database_url: str) -> LockedConnection:
+        return setup
+
+    monkeypatch.setattr(gate.asyncpg, "connect", connect)
+    run_id = str(uuid4())
+
+    with pytest.raises(AuditRunAlreadyClaimed, match=run_id):
+        asyncio.run(gate.run_gate("postgresql://audit", run_id))
+
+    assert setup.closed is True
 
 
 def _summary_record(*, checkpoints: int, eligible: int, unresolved: int) -> dict[str, int]:
@@ -436,6 +468,17 @@ def test_coordinator_connect_failure_marks_claimed_run_failed(monkeypatch) -> No
     class SetupConnection(ClaimConnection):
         def __init__(self) -> None:
             super().__init__(None)
+            self.lock_calls: list[str] = []
+            self.closed = False
+
+        async def fetchval(self, sql: str, *_args: object) -> bool:
+            normalized = " ".join(sql.lower().split())
+            self.lock_calls.append(normalized)
+            if "pg_try_advisory_lock" in normalized:
+                return True
+            if "pg_advisory_unlock" in normalized:
+                return True
+            raise AssertionError(sql)
 
         async def fetchrow(self, sql: str, *args: object):
             if "pg_constraint" in sql.lower():
@@ -446,7 +489,7 @@ def test_coordinator_connect_failure_marks_claimed_run_failed(monkeypatch) -> No
             return await super().fetchrow(sql, *args)
 
         async def close(self) -> None:
-            return None
+            self.closed = True
 
     class FailureConnection:
         def __init__(self) -> None:
@@ -485,3 +528,7 @@ def test_coordinator_connect_failure_marks_claimed_run_failed(monkeypatch) -> No
     assert "set status='failed'" in sql
     assert "status='running'" in sql
     assert args[1] == "coordinator unavailable"
+    assert len(setup.lock_calls) == 2
+    assert "pg_try_advisory_lock" in setup.lock_calls[0]
+    assert "pg_advisory_unlock" in setup.lock_calls[1]
+    assert setup.closed is True
