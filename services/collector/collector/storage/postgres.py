@@ -4,6 +4,10 @@ from collections.abc import Iterable
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from collector.kline_scope_catalog import (
+    record_present_scopes,
+    refresh_scopes_exact,
+)
 from trading_protocol import (
     Bar,
     SymbolInfo,
@@ -233,6 +237,32 @@ class PostgresKlineWriter:
             """,
             rows,
         )
+        scope_bounds: dict[tuple[str, int], tuple[datetime, datetime]] = {}
+        for symbol, timeframe, timestamp, *_values in rows:
+            key = (symbol, timeframe)
+            current = scope_bounds.get(key)
+            scope_bounds[key] = (
+                min(timestamp, current[0]) if current else timestamp,
+                max(timestamp, current[1]) if current else timestamp,
+            )
+        symbol_ids = {
+            row["symbol"]: int(row["symbol_id"])
+            for row in await conn.fetch(
+                """select id as symbol_id, code || '.' || exchange as symbol
+                     from symbols
+                    where code || '.' || exchange = any($1::text[])""",
+                sorted({symbol for symbol, _timeframe in scope_bounds}),
+            )
+        }
+        await record_present_scopes(
+            conn,
+            scopes=[
+                (symbol_ids[symbol], timeframe, bounds[0], bounds[1])
+                for (symbol, timeframe), bounds in sorted(scope_bounds.items())
+                if symbol in symbol_ids
+            ],
+        )
+
     async def _register_source_coverage(self, conn, rows: list[tuple]) -> None:
         coverage_rows = [
             (symbol, timeframe_code, source_code, ts)
@@ -256,22 +286,39 @@ class PostgresKlineWriter:
 
     async def delete_bars(self, symbols: Iterable[str], timeframes: Iterable[str]) -> int:
         assert self._pool is not None
-        symbol_list = list(symbols)
-        timeframe_codes = [timeframe_to_db_code(item) for item in timeframes]
+        symbol_list = list(dict.fromkeys(symbols))
+        timeframe_codes = list(dict.fromkeys(timeframe_to_db_code(item) for item in timeframes))
         if not symbol_list or not timeframe_codes:
             return 0
         async with self._pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                delete from klines k
-                using symbols s
-                where s.id = k.symbol_id
-                  and (s.code || '.' || s.exchange) = any($1::text[])
-                  and k.timeframe = any($2::int[])
-                """,
-                symbol_list,
-                timeframe_codes,
-            )
+            async with conn.transaction():
+                resolved = await conn.fetch(
+                    """select id as symbol_id, code || '.' || exchange as symbol
+                         from symbols
+                        where code || '.' || exchange = any($1::text[])
+                        order by id""",
+                    symbol_list,
+                )
+                scopes = [
+                    (int(row["symbol_id"]), timeframe)
+                    for row in resolved
+                    for timeframe in timeframe_codes
+                ]
+                result = await conn.execute(
+                    """
+                    delete from klines k
+                    using symbols s
+                    where s.id = k.symbol_id
+                      and (s.code || '.' || s.exchange) = any($1::text[])
+                      and k.timeframe = any($2::int[])
+                    """,
+                    symbol_list,
+                    timeframe_codes,
+                )
+                # Re-read exact bounds after the delete. The catalog CAS then
+                # preserves any concurrent writer that committed after the
+                # delete statement's snapshot.
+                await refresh_scopes_exact(conn, scopes=scopes)
         return int(result.split()[-1])
 
     async def get_bars(self, symbol: str, timeframe: str) -> list[Bar]:

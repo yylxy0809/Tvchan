@@ -99,3 +99,23 @@ def test_lifecycle_observer_is_a_single_standard_realtime_worker() -> None:
     assert "CHAN_LIFECYCLE_OBSERVER=chan-lifecycle-v1" in example
     assert "LIFECYCLE_LEASE_SECONDS=300" in example
     assert "LIFECYCLE_MAX_ATTEMPTS=5" in example
+
+
+def test_kline_scope_bootstrap_is_registered_but_never_auto_started_by_compose() -> None:
+    compose = (ROOT / "deploy" / "docker-compose.backend.yml").read_text(encoding="utf-8")
+    windows_compose = (ROOT / "deploy" / "docker-compose.backend.windows.yml").read_text(
+        encoding="utf-8"
+    )
+    dev_compose = (ROOT / "deploy" / "docker-compose.dev.yml").read_text(encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "collector.worker", "--list"],
+        cwd=ROOT / "services" / "collector",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "kline-scope-bootstrap\tcollector.kline_scope_catalog\t" in result.stdout
+    for deployment in (compose, windows_compose, dev_compose):
+        assert "kline-scope-bootstrap" not in deployment
+        assert "collector.kline_scope_catalog" not in deployment

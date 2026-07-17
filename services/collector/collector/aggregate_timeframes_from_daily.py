@@ -13,6 +13,7 @@ from typing import Iterable
 
 import asyncpg
 
+from collector.kline_scope_catalog import refresh_scopes_exact
 from collector.storage.postgres import source_priority_case
 
 
@@ -355,6 +356,11 @@ async def _aggregate_one(
                         timeout=statement_timeout,
                     )
                     rows = _parse_status_count(status) or 0
+
+                    await refresh_scopes_exact(
+                        conn,
+                        scopes=[(symbol_id, target_code) for symbol_id in batch_symbol_ids],
+                    )
 
                     wm_status = await conn.execute(
                         WATERMARK_SQL,

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from collector.kline_scope_catalog import record_present_scopes
 from collector.storage.postgres import amount_to_x100, price_to_x1000, source_priority_case
 from trading_protocol import Bar, SymbolInfo, canonical_kline_timestamp
 
@@ -275,6 +276,30 @@ class PostgresScheme2KlineWriter:
                 )
                 await _register_source_coverage_from_stage(conn)
                 await _upsert_klines_from_stage(conn)
+                scope_rows = await conn.fetch(
+                    """select symbols.id as symbol_id,
+                              stage.timeframe,
+                              min(stage.bar_end) as min_ts,
+                              max(stage.bar_end) as max_ts
+                         from _scheme2_kline_stage stage
+                         join symbols
+                           on symbols.code = stage.code
+                          and symbols.exchange = stage.exchange
+                        group by symbols.id, stage.timeframe
+                        order by symbols.id, stage.timeframe"""
+                )
+                await record_present_scopes(
+                    conn,
+                    scopes=[
+                        (
+                            int(row["symbol_id"]),
+                            int(row["timeframe"]),
+                            row["min_ts"],
+                            row["max_ts"],
+                        )
+                        for row in scope_rows
+                    ],
+                )
                 await _upsert_watermarks_from_stage(conn)
         return len(bar_rows)
 

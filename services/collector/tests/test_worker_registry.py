@@ -10,6 +10,10 @@ from collector import worker_registry
 def test_worker_name_normalization_and_alias() -> None:
     assert worker_registry.get_worker("market_fill").module == "collector.market_fill"
     assert worker_registry.get_worker("backfill").module == "collector.backfill"
+    assert (
+        worker_registry.get_worker("kline_scope_bootstrap").module
+        == "collector.kline_scope_catalog"
+    )
 
 
 def test_list_workers_is_sorted() -> None:
@@ -23,6 +27,7 @@ def test_list_workers_is_sorted() -> None:
     assert "realtime-pipeline" not in names
     assert "tdx-csv-import" in names
     assert "iwencai-sidebar-events" in names
+    assert "kline-scope-bootstrap" in names
 
 
 def test_run_worker_restores_argv(monkeypatch) -> None:

@@ -22,6 +22,7 @@ from typing import Any, Iterable, Sequence
 
 import asyncpg
 
+from collector.kline_scope_catalog import invalidate_scopes
 from trading_protocol.kline_contract import (
     SHANGHAI_TZ,
     canonical_kline_timestamp,
@@ -282,6 +283,10 @@ async def apply_actions(connection: Any, audit_run_id: str, quarantine: Sequence
         if normalize:
             value, target = normalize
             await _normalize_timestamp(connection, value, target)
+        mutated_scopes = [(value.symbol_id, TIMEFRAME_CODES[value.timeframe]) for value in delete]
+        if normalize:
+            mutated_scopes.append((normalize[0].symbol_id, TIMEFRAME_CODES[normalize[0].timeframe]))
+        await invalidate_scopes(connection, scopes=list(dict.fromkeys(mutated_scopes)))
 
 
 async def apply_action_batches(
@@ -296,6 +301,7 @@ async def apply_action_batches(
     for batch in _chunks(groups, group_cap):
         async with connection.transaction():
             await connection.execute("SELECT set_config('lock_timeout', $1, true)", f"{lock_timeout_seconds}s")
+            mutated_scopes: list[tuple[int, int]] = []
             for actions in batch:
                 reasons = {value: "ohlcv_disagreement" if actions.disagreement else "duplicate_loser" for value in actions.quarantine}
                 if getattr(actions, "quarantine_reason", None):
@@ -304,9 +310,12 @@ async def apply_action_batches(
                     await connection.execute(QUARANTINE_SQL, audit_run_id, reasons[value], json.dumps({"winner": True}), *_row_values(value))
                 for value in actions.delete:
                     await connection.execute(DELETE_SQL, *_identity_values(value))
+                    mutated_scopes.append((value.symbol_id, TIMEFRAME_CODES[value.timeframe]))
                 if actions.normalize:
                     value, target = actions.normalize
                     await _normalize_timestamp(connection, value, target)
+                    mutated_scopes.append((value.symbol_id, TIMEFRAME_CODES[value.timeframe]))
+            await invalidate_scopes(connection, scopes=list(dict.fromkeys(mutated_scopes)))
 
 
 def _chunks(values: Sequence[PlannedActions], size: int) -> Iterable[Sequence[PlannedActions]]:

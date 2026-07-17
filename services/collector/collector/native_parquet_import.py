@@ -27,6 +27,7 @@ from collector.kline_import_quarantine import (
     commit_import_batch,
     create_import_run,
 )
+from collector.kline_scope_catalog import record_present_scopes
 from trading_protocol import canonical_kline_timestamp
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -34,6 +35,20 @@ DEFAULT_ROOT = "D:\\\u5386\u53f2\u6570\u636e"
 DEFAULT_TIMEFRAMES = "30f,1d"
 SOURCE_NAME = "parquet_native"
 SOURCE_CODE = source_to_code(SOURCE_NAME)
+
+NATIVE_STAGE_SCOPE_BOUNDS_SQL = """
+SELECT
+    symbols.id AS symbol_id,
+    stage.timeframe,
+    MIN(stage.bar_end) AS min_ts,
+    MAX(stage.bar_end) AS max_ts
+FROM _native_parquet_kline_stage stage
+JOIN symbols
+  ON symbols.code = stage.code
+ AND symbols.exchange = stage.exchange
+GROUP BY symbols.id, stage.timeframe
+ORDER BY symbols.id, stage.timeframe
+"""
 
 TIMEFRAME_PATHS = {
     "30f": ("30m_price", "trade_time"),
@@ -620,6 +635,14 @@ class NativeParquetWriter:
         )
         await register_source_coverage(conn)
         await upsert_klines(conn)
+        scope_rows = await conn.fetch(NATIVE_STAGE_SCOPE_BOUNDS_SQL)
+        await record_present_scopes(
+            conn,
+            scopes=[
+                (row["symbol_id"], row["timeframe"], row["min_ts"], row["max_ts"])
+                for row in scope_rows
+            ],
+        )
         await upsert_watermarks(conn)
         return len(bars)
 

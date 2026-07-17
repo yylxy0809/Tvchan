@@ -60,6 +60,11 @@ _WORKERS: dict[str, WorkerSpec] = {
         module="collector.parquet_bootstrap_audit",
         description="Scheme2 parquet bootstrap audit command.",
     ),
+    "kline-scope-bootstrap": WorkerSpec(
+        name="kline-scope-bootstrap",
+        module="collector.kline_scope_catalog",
+        description="One-shot generation-fenced K-line scope catalog bootstrap.",
+    ),
     "pytdx-5f-spool": WorkerSpec(
         name="pytdx-5f-spool",
         module="collector.pytdx_5f_spool",
