@@ -171,6 +171,10 @@ async def _capture_snapshot_evidence(conn: Any) -> dict[str, Any]:
     universe_ids = [record["symbol_id"] for record in universe]
     generation_symbols = {int(value) for value in generation["symbol_ids"]}
     generation_timeframes = {int(value) for value in generation["timeframes"]}
+    # A complete generation may retain scopes for symbols deactivated after it
+    # was built.  Strict evidence binds only the current active audit universe
+    # and requires its five-level scope subset to be exact; inactive extras are
+    # deliberately outside the ordered manifest hash.
     if not set(universe_ids).issubset(generation_symbols):
         raise InvalidAuditEvidence("active catalog generation does not cover the active universe")
     if not set(TIMEFRAMES).issubset(generation_timeframes):
@@ -439,6 +443,64 @@ def summarize(record: Any) -> tuple[str, dict[str, Any]]:
     return "completed", summary
 
 
+async def _finalize_audit_run(
+    conn: Any,
+    run_id: uuid.UUID,
+    evidence: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    status, summary = summarize(await conn.fetchrow(SUMMARY_SQL, run_id))
+    summary.update({
+        "contract_version": evidence["contract_version"],
+        "observed_at": evidence["observed_at"],
+        "evidence_lsn": evidence["evidence_lsn"],
+        "evidence_sha256": evidence["evidence_sha256"],
+    })
+    expected = int(evidence["active_universe_count"]) * len(TIMEFRAMES)
+    checkpoints = int(summary["checkpoints"])
+    dispositions = int(summary["eligible"]) + int(summary["unresolved"])
+    error: str | None = None
+    if checkpoints != expected:
+        error = f"strict audit checkpoints={checkpoints} expected={expected}"
+    elif dispositions != checkpoints:
+        error = (
+            f"strict audit dispositions={dispositions} checkpoints={checkpoints}"
+        )
+    if error is not None:
+        summary["gate_pass"] = False
+        summary["evidence_complete"] = False
+        command_tag = await conn.execute(
+            "UPDATE kline_audit_runs SET status='failed',completed_at=now(),"
+            "summary=$2::jsonb,parameters=$3::jsonb,failure=$4 "
+            "WHERE audit_run_id=$1 AND status='running'",
+            run_id,
+            json.dumps(summary, sort_keys=True),
+            json.dumps(evidence, sort_keys=True),
+            error,
+        )
+        if command_tag != "UPDATE 1":
+            raise AuditRunAlreadyClaimed(
+                f"canonical audit {run_id} lost its running failure fence"
+            )
+        raise InvalidAuditEvidence(error)
+
+    summary["evidence_complete"] = True
+    command_tag = await conn.execute(
+        "UPDATE kline_audit_runs SET status=$2,completed_at=now(),summary=$3::jsonb,"
+        "failure=$4,parameters=$5::jsonb "
+        "WHERE audit_run_id=$1 AND status='running'",
+        run_id,
+        status,
+        json.dumps(summary, sort_keys=True),
+        None if status == "completed" else "canonical SQL gate found unresolved rows",
+        json.dumps(evidence, sort_keys=True),
+    )
+    if command_tag != "UPDATE 1":
+        raise AuditRunAlreadyClaimed(
+            f"canonical audit {run_id} lost its running completion fence"
+        )
+    return status, summary
+
+
 async def _worker(
     database_url: str,
     snapshot: str,
@@ -487,11 +549,13 @@ async def run_gate(
     finally:
         await setup.close()
 
-    coordinator = await asyncpg.connect(database_url)
-    coordinator_tx = coordinator.transaction(isolation="repeatable_read", readonly=True)
+    coordinator: Any | None = None
+    coordinator_tx: Any | None = None
     coordinator_open = False
     evidence: dict[str, Any] | None = None
     try:
+        coordinator = await asyncpg.connect(database_url)
+        coordinator_tx = coordinator.transaction(isolation="repeatable_read", readonly=True)
         await coordinator_tx.start()
         coordinator_open = True
         snapshot = await coordinator.fetchval("SELECT pg_export_snapshot()")
@@ -505,7 +569,7 @@ async def run_gate(
         await coordinator_tx.commit()
         coordinator_open = False
     except BaseException as error:
-        if coordinator_open:
+        if coordinator_open and coordinator_tx is not None:
             try:
                 await coordinator_tx.rollback()
             except Exception:
@@ -524,33 +588,14 @@ async def run_gate(
             await failure.close()
         raise
     finally:
-        await coordinator.close()
+        if coordinator is not None:
+            await coordinator.close()
 
     final = await asyncpg.connect(database_url)
     try:
         if evidence is None:
             raise InvalidAuditEvidence("audit snapshot evidence was not captured")
-        status, summary = summarize(await final.fetchrow(SUMMARY_SQL, run_uuid))
-        summary.update({
-            "contract_version": evidence["contract_version"],
-            "observed_at": evidence["observed_at"],
-            "evidence_lsn": evidence["evidence_lsn"],
-            "evidence_sha256": evidence["evidence_sha256"],
-        })
-        command_tag = await final.execute(
-            "UPDATE kline_audit_runs SET status=$2,completed_at=now(),summary=$3::jsonb,"
-            "failure=$4,parameters=$5::jsonb "
-            "WHERE audit_run_id=$1 AND status='running'",
-            run_uuid,
-            status,
-            json.dumps(summary, sort_keys=True),
-            None if status == "completed" else "canonical SQL gate found unresolved rows",
-            json.dumps(evidence, sort_keys=True),
-        )
-        if command_tag != "UPDATE 1":
-            raise AuditRunAlreadyClaimed(
-                f"canonical audit {run_id} lost its running completion fence"
-            )
+        _status, summary = await _finalize_audit_run(final, run_uuid, evidence)
         return run_id, summary
     finally:
         await final.close()
