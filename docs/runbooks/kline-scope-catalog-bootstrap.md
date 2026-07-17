@@ -95,13 +95,39 @@ python -m collector.worker kline-scope-bootstrap `
   --finalize --generation-id $generation
 ```
 
-Report the active generation without changing state:
+Report the management snapshot without changing state. The payload preserves
+the active generation report (or `active_generation_id: null`), includes the
+control revision, and exposes the single resumable `building_generation` with
+its base fence and progress counts when one exists:
 
 ```powershell
-python -m collector.worker kline-scope-bootstrap
+$snapshot = python -m collector.worker kline-scope-bootstrap | ConvertFrom-Json
+$snapshot | ConvertTo-Json -Depth 4
 ```
 
-If a building generation cannot be completed, mark only that generation failed:
+If the original UUID was lost after interruption, recover it from the
+read-only snapshot rather than creating another generation:
+
+```powershell
+$generation = $snapshot.building_generation.generation_id
+if (-not $generation) {
+  throw "No building scope-catalog generation is available to resume"
+}
+
+python -m collector.worker kline-scope-bootstrap `
+  --bootstrap --generation-id $generation --batch-size 25
+```
+
+After the resumed generation reaches zero remaining work, use that same
+discovered UUID for finalization:
+
+```powershell
+python -m collector.worker kline-scope-bootstrap `
+  --finalize --generation-id $generation
+```
+
+If the discovered building generation cannot be completed, mark only that
+same generation failed:
 
 ```powershell
 python -m collector.worker kline-scope-bootstrap `
