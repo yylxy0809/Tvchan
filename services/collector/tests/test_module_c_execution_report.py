@@ -1,14 +1,76 @@
 import asyncio
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
+
+import collector.module_c_execution_report as report_module
+from collector.module_c_eligibility import _canonical_sha256
 
 from collector.module_c_execution_report import (
+    BATCH_SQL,
+    CANONICAL_SQL,
     HEAD_COVERAGE_SQL,
     _json_object,
     build_report,
     parse_args,
     write_artifacts,
 )
+
+
+AUDIT_ID = "11111111-1111-1111-1111-111111111111"
+CATALOG_ID = "22222222-2222-2222-2222-222222222222"
+EVIDENCE_SHA = "a" * 64
+CHECKPOINT_SHA = "b" * 64
+CATALOG_SHA = "c" * 64
+UNIVERSE_SHA = "d" * 64
+FRESHNESS_CONTRACT = {
+    "contract_version": "module-c-authoritative-freshness-v1",
+    "as_of": "2026-07-18T00:00:00+00:00",
+    "trading_calendar": {"id": "test-calendar", "sha256": "e" * 64},
+    "expected_closed_watermarks": {
+        "5f": "2026-07-17T07:00:00+00:00",
+        "30f": "2026-07-17T07:00:00+00:00",
+        "1d": "2026-07-17T07:00:00+00:00",
+        "1w": "2026-07-17T07:00:00+00:00",
+        "1m": "2026-06-30T07:00:00+00:00",
+    },
+}
+FRESHNESS_SHA = _canonical_sha256(FRESHNESS_CONTRACT)
+
+
+def _strict_parameters(*, policy: str = "strict-v2") -> dict[str, object]:
+    return {
+        "policy": policy,
+        "canonical_audit_run_id": AUDIT_ID,
+        "audit_evidence_sha256": EVIDENCE_SHA,
+        "audit_checkpoint_sha256": CHECKPOINT_SHA,
+        "freshness_contract": FRESHNESS_CONTRACT,
+        "freshness_contract_version": "module-c-authoritative-freshness-v1",
+        "freshness_contract_sha256": FRESHNESS_SHA,
+        "catalog_generation_id": CATALOG_ID,
+        "catalog_control_revision": 7,
+        "catalog_manifest_sha256": CATALOG_SHA,
+        "audit_active_universe_sha256": UNIVERSE_SHA,
+    }
+
+
+@pytest.fixture(autouse=True)
+def _strict_loader(monkeypatch):
+    async def load(_conn, audit_run_id, freshness):
+        assert audit_run_id == AUDIT_ID
+        assert freshness.sha256 == FRESHNESS_SHA
+        return SimpleNamespace(
+            audit_evidence_sha256=EVIDENCE_SHA,
+            audit_checkpoint_sha256=CHECKPOINT_SHA,
+            catalog_generation_id=CATALOG_ID,
+            catalog_control_revision=7,
+            catalog_manifest_sha256=CATALOG_SHA,
+            audit_active_universe_sha256=UNIVERSE_SHA,
+        )
+
+    monkeypatch.setattr(report_module, "_load_strict_inputs", load)
 
 
 def test_json_object_decodes_asyncpg_jsonb_text() -> None:
@@ -27,6 +89,8 @@ class Conn:
         official_heads=1,
         baseline_historical=0,
         future_leaks=0,
+        strict_policy="strict-v2",
+        provenance_overrides=None,
     ):
         self.batch_status = batch_status
         self.task_status = task_status
@@ -36,10 +100,13 @@ class Conn:
         self.official_heads = official_heads
         self.baseline_historical = baseline_historical
         self.future_leaks = future_leaks
+        self.strict_policy = strict_policy
+        self.provenance_overrides = provenance_overrides or {}
+        self.canonical_args = None
 
     async def fetchrow(self, sql, *args):
         if "report:batch" in sql:
-            return {
+            batch = {
                 "batch_id": args[0],
                 "eligibility_build_id": "build",
                 "run_group_id": "group",
@@ -63,16 +130,29 @@ class Conn:
                 "eligible_manifest_sha256": "c" * 64,
                 "input_watermark": {},
                 "audit_references": [],
-                "manifest_version": "strict-v1",
+                "manifest_version": "strict-v2",
                 "active_universe_hash": "d" * 64,
                 "manifest_hash": "e" * 64,
-                "eligibility_parameters": {},
+                "eligibility_parameters": _strict_parameters(policy=self.strict_policy),
                 "eligibility_summary": {},
+                "canonical_audit_run_id": AUDIT_ID,
+                "audit_evidence_sha256": EVIDENCE_SHA,
+                "audit_checkpoint_sha256": CHECKPOINT_SHA,
+                "freshness_contract_version": "module-c-authoritative-freshness-v1",
+                "freshness_contract_sha256": FRESHNESS_SHA,
+                "catalog_generation_id": CATALOG_ID,
+                "catalog_control_revision": 7,
+                "catalog_manifest_sha256": CATALOG_SHA,
+                "audit_active_universe_sha256": UNIVERSE_SHA,
             }
+            batch.update(self.provenance_overrides)
+            return batch
         if "report:canonical" in sql:
+            self.canonical_args = args
             return {
-                "audit_run_id": "audit",
+                "audit_run_id": AUDIT_ID,
                 "status": "completed",
+                "apply_mode": False,
                 "summary": {"gate_pass": True},
                 "parameters": {},
             }
@@ -144,8 +224,14 @@ class Conn:
 
 
 def test_report_go_requires_all_contract_evidence() -> None:
-    report = asyncio.run(build_report(Conn(), 7, resource_metrics={"cpu_percent": 25.0}))
+    connection = Conn()
+    report = asyncio.run(build_report(connection, 7, resource_metrics={"cpu_percent": 25.0}))
     assert report["next_phase_decision"]["decision"] == "GO"
+    assert connection.canonical_args == (AUDIT_ID,)
+    assert report["strict_v2_provenance"]["decision"] == "PASS"
+    assert report["run_manifest"]["strict_v2_provenance"]["frozen"] == report[
+        "strict_v2_provenance"
+    ]["observed"]
     assert report["recompute_summary"]["tasks"]["statuses"] == {"completed": 1}
     assert report["published_head_coverage"]["summary"]["missing"] == 0
     assert report["resource_metrics"][0]["cpu_percent"] == 25.0
@@ -177,6 +263,69 @@ def test_report_no_go_lists_each_required_blocking_class() -> None:
         "baseline_claims_historical_first_seen",
         "official_future_leak",
     } <= codes
+
+
+def test_report_fails_visible_when_strict_v2_provenance_is_unavailable() -> None:
+    report = asyncio.run(build_report(Conn(strict_policy="legacy"), 8))
+
+    assert report["strict_v2_provenance"]["decision"] == "FAIL"
+    assert report["strict_v2_provenance"]["failure_code"] == "unavailable"
+    assert report["next_phase_decision"]["decision"] == "NO_GO"
+    assert "strict_v2_provenance_unavailable" in {
+        blocker["code"] for blocker in report["next_phase_decision"]["blockers"]
+    }
+
+
+def test_report_fails_visible_when_live_strict_v2_inputs_drift(monkeypatch) -> None:
+    async def drifted(*_args):
+        raise RuntimeError("active K-line scope catalog no longer matches audit evidence")
+
+    monkeypatch.setattr(report_module, "_load_strict_inputs", drifted)
+    report = asyncio.run(build_report(Conn(), 8))
+
+    assert report["strict_v2_provenance"]["decision"] == "FAIL"
+    assert report["strict_v2_provenance"]["failure_code"] == "drift"
+    assert report["next_phase_decision"]["decision"] == "NO_GO"
+    assert "strict_v2_provenance_drift" in {
+        blocker["code"] for blocker in report["next_phase_decision"]["blockers"]
+    }
+
+
+def test_report_fails_visible_when_frozen_column_and_parameters_drift() -> None:
+    report = asyncio.run(
+        build_report(
+            Conn(provenance_overrides={"catalog_control_revision": 8}),
+            8,
+        )
+    )
+
+    assert report["strict_v2_provenance"]["decision"] == "FAIL"
+    assert report["strict_v2_provenance"]["failure_code"] == "drift"
+    assert report["next_phase_decision"]["decision"] == "NO_GO"
+
+
+def test_canonical_gate_is_pinned_and_report_queries_never_scan_klines() -> None:
+    canonical = " ".join(CANONICAL_SQL.lower().split())
+    assert "where audit_run_id = $1::uuid" in canonical
+    assert "order by completed_at" not in canonical
+    assert "limit 1" not in canonical
+    batch = " ".join(BATCH_SQL.lower().split())
+    for field in (
+        "canonical_audit_run_id",
+        "audit_evidence_sha256",
+        "audit_checkpoint_sha256",
+        "freshness_contract_version",
+        "freshness_contract_sha256",
+        "catalog_generation_id",
+        "catalog_control_revision",
+        "catalog_manifest_sha256",
+        "audit_active_universe_sha256",
+    ):
+        assert f"eligibility.{field}" in batch
+    for sql in report_module.__dict__.values():
+        if isinstance(sql, str) and "report:" in sql:
+            assert " from klines" not in " ".join(sql.lower().split())
+            assert not sql.lstrip().lower().startswith(("insert ", "update ", "delete "))
 
 
 def test_head_coverage_accepts_direct_batch_or_strict_input_equivalent_noop() -> None:
@@ -212,6 +361,7 @@ def test_write_artifacts_replaces_all_required_report_files(tmp_path) -> None:
         "resource_metrics.jsonl",
         "failure_samples.jsonl",
         "next_phase_decision.json",
+        "strict_v2_provenance.json",
     }
     assert {path.name for path in tmp_path.iterdir()} == expected
     assert json.loads((tmp_path / "next_phase_decision.json").read_text(encoding="utf-8"))["decision"] == "GO"
