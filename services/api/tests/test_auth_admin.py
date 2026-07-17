@@ -104,6 +104,18 @@ def test_login_keeps_api_token_as_user_when_admin_token_is_not_configured() -> N
     }
 
 
+def test_empty_admin_token_keeps_management_surface_disabled() -> None:
+    client = _client(Settings(api_token="api-token", admin_api_token=""))
+
+    response = client.get(
+        "/api/v1/admin/tokens",
+        headers={"Authorization": "Bearer api-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Admin token required"
+
+
 def test_login_distinguishes_admin_token_from_compatible_api_token() -> None:
     client = _client(Settings(api_token="api-token", admin_api_token="admin-token"))
 
