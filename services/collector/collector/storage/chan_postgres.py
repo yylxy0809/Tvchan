@@ -237,11 +237,26 @@ class PostgresChanWriter:
             raise ValueError("Only one fenced task type may publish a run")
         if self.run_kind == "full_recompute" and full_recompute_task is None:
             raise ValueError("A full-recompute writer requires a fenced task")
-        if full_recompute_task is not None and (
-            self.batch_id is None
-            or int(full_recompute_task.get("batch_id", -1)) != int(self.batch_id)
-        ):
-            raise ValueError("Full-recompute task batch does not match writer batch")
+        if full_recompute_task is not None:
+            identity = (
+                self.run_group_id,
+                self.run_config_hash,
+                self.publication_namespace,
+                self.profile_id,
+            )
+            if (
+                self.run_kind != "full_recompute"
+                or self.publication_profile != "baseline"
+                or self.publication_source != "full_recompute"
+                or not self.native_base_timeframe
+                or not isinstance(self.batch_id, int)
+                or isinstance(self.batch_id, bool)
+                or self.batch_id <= 0
+                or any(not isinstance(value, str) or not value.strip() for value in identity)
+            ):
+                raise ValueError("Full-recompute task requires an exact writer configuration")
+            if int(full_recompute_task.get("batch_id", -1)) != self.batch_id:
+                raise ValueError("Full-recompute task batch does not match writer batch")
         assert self._pool is not None
         async with self._pool.acquire() as conn:
             symbol_id = await conn.fetchval(

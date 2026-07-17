@@ -520,7 +520,16 @@ def test_full_recompute_writer_requires_matching_task_before_pool_acquire() -> N
             raise AssertionError("invalid full-recompute input must fail before acquiring a connection")
 
     writer = PostgresChanWriter(
-        "postgresql://unused", batch_id=7, run_kind="full_recompute",
+        "postgresql://unused",
+        batch_id=7,
+        run_group_id="batch-7",
+        run_config_hash="module-c-v4",
+        native_base_timeframe=True,
+        publication_profile="baseline",
+        publication_source="full_recompute",
+        run_kind="full_recompute",
+        publication_namespace="canonical",
+        profile_id="module-c-v4",
     )
     writer._pool = NoAcquirePool()
     kwargs = {
@@ -536,6 +545,53 @@ def test_full_recompute_writer_requires_matching_task_before_pool_acquire() -> N
         asyncio.run(writer.replace_analysis(
             **kwargs,
             full_recompute_task={"batch_id": 8},
+        ))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"run_kind": "online"},
+        {"publication_profile": "online"},
+        {"publication_source": "collector"},
+        {"native_base_timeframe": False},
+        {"batch_id": None},
+        {"run_group_id": None},
+        {"run_config_hash": ""},
+        {"publication_namespace": None},
+        {"profile_id": None},
+    ],
+)
+def test_full_recompute_task_rejects_incomplete_writer_before_pool_acquire(override) -> None:
+    class NoAcquirePool:
+        def acquire(self):
+            raise AssertionError("invalid full-recompute writer must fail before pool acquire")
+
+    writer_args = {
+        "batch_id": 7,
+        "run_group_id": "batch-7",
+        "run_config_hash": "module-c-v4",
+        "native_base_timeframe": True,
+        "publication_profile": "baseline",
+        "publication_source": "full_recompute",
+        "run_kind": "full_recompute",
+        "publication_namespace": "canonical",
+        "profile_id": "module-c-v4",
+        **override,
+    }
+    writer = PostgresChanWriter("postgresql://unused", **writer_args)
+    writer._pool = NoAcquirePool()
+
+    with pytest.raises(ValueError, match="exact writer configuration"):
+        asyncio.run(writer.replace_analysis(
+            symbol="000001.SZ",
+            level="5f",
+            modes=["confirmed"],
+            bar_from=datetime.fromtimestamp(100, UTC),
+            bar_until=datetime.fromtimestamp(200, UTC),
+            bar_count=20,
+            response={"snapshot_version": "v1"},
+            full_recompute_task={"batch_id": 7},
         ))
 
 
