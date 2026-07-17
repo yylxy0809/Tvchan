@@ -598,6 +598,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
             <p>audit run: {moduleCBatch?.provenance.canonical_audit_run_id ?? "--"}</p>
             <p>audit status: {moduleCBatch?.provenance.audit_status ?? "--"}</p>
             <p>audit apply mode: {formatBoolean(moduleCBatch?.provenance.audit_apply_mode ?? undefined)}</p>
+            <p>audit gate pass: {formatBoolean(moduleCBatch?.provenance.audit_gate_pass ?? undefined)}</p>
             <p>audit evidence: <HashValue value={moduleCBatch?.provenance.audit_evidence_sha256} /></p>
             <p>audit checkpoint: <HashValue value={moduleCBatch?.provenance.audit_checkpoint_sha256} /></p>
             <p>eligibility manifest: <HashValue value={moduleCBatch?.provenance.eligibility_manifest_sha256} /></p>

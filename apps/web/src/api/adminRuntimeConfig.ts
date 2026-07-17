@@ -124,6 +124,7 @@ export type ModuleCExecutionProvenance = {
   audit_checkpoint_sha256: string | null;
   audit_status: string | null;
   audit_apply_mode: boolean | null;
+  audit_gate_pass: boolean | null;
   freshness_contract_version: string | null;
   freshness_contract_sha256: string | null;
   catalog_generation_id: string | null;
