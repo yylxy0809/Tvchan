@@ -19,7 +19,9 @@ from collector.historical_replay import (
     claim_replay_task,
     ensure_replay_batch,
     fail_replay_task,
+    finalize_replay_batch,
     heartbeat_replay_task,
+    lock_executable_replay_batch,
     stable_replay_identity,
 )
 from collector.market_fill import filter_chan_response_level
@@ -34,7 +36,10 @@ DEFAULT_OUTPUT_DIR = Path("outputs/device-b-historical-replay-20260714")
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Durable official Module C historical replay")
-    parser.add_argument("action", choices=("prepare-canary", "prepare-full", "prepare-intraday", "work", "report"))
+    parser.add_argument(
+        "action",
+        choices=("prepare-canary", "prepare-full", "prepare-intraday", "work", "report", "finalize"),
+    )
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
     parser.add_argument("--batch-id", type=int)
     parser.add_argument("--source-batch-id", type=int, default=6)
@@ -51,11 +56,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--shard-count", type=int)
     parser.add_argument("--task-limit", type=int, default=0)
     parser.add_argument("--chan-py-path", default=os.getenv("CHAN_PY_PATH"))
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--sealed-by")
+    parser.add_argument("--expected-contract-hash")
     args = parser.parse_args(argv)
     if not args.database_url:
         parser.error("--database-url or DATABASE_URL is required")
-    if args.action in {"prepare-intraday", "work", "report"} and not args.batch_id:
-        parser.error("--batch-id is required for prepare-intraday, work and report")
+    if args.action in {"prepare-intraday", "work", "report", "finalize"} and not args.batch_id:
+        parser.error("--batch-id is required for prepare-intraday, work, report and finalize")
+    if args.action == "finalize":
+        if not args.sealed_by:
+            parser.error("--sealed-by is required for finalize")
+        if (
+            not args.expected_contract_hash
+            or len(args.expected_contract_hash) != 64
+            or any(char not in "0123456789abcdef" for char in args.expected_contract_hash)
+        ):
+            parser.error("--expected-contract-hash must be a 64-character lowercase hex digest")
     if args.cutoffs_per_scope < 1:
         parser.error("--cutoffs-per-scope must be positive")
     if (args.shard_index is None) != (args.shard_count is None):
@@ -150,6 +167,32 @@ async def seed_canary_tasks(
     contract: ReplayContract,
     cutoffs_per_scope: int,
 ) -> int:
+    async with conn.transaction():
+        await lock_executable_replay_batch(
+            conn,
+            batch_id=batch_id,
+            contract=contract,
+            allowed_child_statuses=frozenset({"planned"}),
+        )
+        return await _seed_canary_tasks(
+            conn,
+            batch_id=batch_id,
+            source_batch_id=source_batch_id,
+            canary_source_batch_id=canary_source_batch_id,
+            contract=contract,
+            cutoffs_per_scope=cutoffs_per_scope,
+        )
+
+
+async def _seed_canary_tasks(
+    conn: asyncpg.Connection,
+    *,
+    batch_id: int,
+    source_batch_id: int,
+    canary_source_batch_id: int,
+    contract: ReplayContract,
+    cutoffs_per_scope: int,
+) -> int:
     rows = await conn.fetch(
         """
         with canary as (
@@ -227,6 +270,30 @@ async def seed_full_high_level_tasks(
     contract: ReplayContract,
     cutoffs_per_scope: int,
 ) -> int:
+    async with conn.transaction():
+        await lock_executable_replay_batch(
+            conn,
+            batch_id=batch_id,
+            contract=contract,
+            allowed_child_statuses=frozenset({"planned"}),
+        )
+        return await _seed_full_high_level_tasks(
+            conn,
+            batch_id=batch_id,
+            source_batch_id=source_batch_id,
+            contract=contract,
+            cutoffs_per_scope=cutoffs_per_scope,
+        )
+
+
+async def _seed_full_high_level_tasks(
+    conn: asyncpg.Connection,
+    *,
+    batch_id: int,
+    source_batch_id: int,
+    contract: ReplayContract,
+    cutoffs_per_scope: int,
+) -> int:
     rows = await conn.fetch(
         """
         with source as (
@@ -283,6 +350,28 @@ async def seed_full_high_level_tasks(
 
 
 async def seed_intraday_strategy_tasks(
+    conn: asyncpg.Connection,
+    *,
+    batch_id: int,
+    source_batch_id: int,
+    contract: ReplayContract,
+) -> dict[str, Any]:
+    async with conn.transaction():
+        await lock_executable_replay_batch(
+            conn,
+            batch_id=batch_id,
+            contract=contract,
+            allowed_child_statuses=frozenset({"running"}),
+        )
+        return await _seed_intraday_strategy_tasks(
+            conn,
+            batch_id=batch_id,
+            source_batch_id=source_batch_id,
+            contract=contract,
+        )
+
+
+async def _seed_intraday_strategy_tasks(
     conn: asyncpg.Connection,
     *,
     batch_id: int,
@@ -580,6 +669,20 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 async def main(args: argparse.Namespace) -> None:
+    if args.action == "finalize":
+        conn = await asyncpg.connect(args.database_url)
+        try:
+            result = await finalize_replay_batch(
+                conn,
+                batch_id=args.batch_id,
+                sealed_by=args.sealed_by,
+                expected_contract_hash=args.expected_contract_hash,
+                dry_run=args.dry_run,
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        finally:
+            await conn.close()
+        return
     if args.action == "prepare-intraday":
         conn = await asyncpg.connect(args.database_url)
         try:
@@ -602,23 +705,24 @@ async def main(args: argparse.Namespace) -> None:
             full = args.action == "prepare-full"
             batch_key = args.batch_key if not full or args.batch_key != "historical-replay-canary-20260714-v1" else "historical-replay-full-20260714-v1"
             run_group_id = args.run_group_id if not full or args.run_group_id != "historical-replay-canary-20260714-v1" else "historical-replay-full-20260714-v1"
-            batch_id = await create_parent_batch(
-                conn, source_batch_id=args.source_batch_id, batch_key=batch_key,
-                run_group_id=run_group_id, code_commit=args.code_commit,
-            )
-            writer = type("Writer", (), {"_pool": type("Pool", (), {"acquire": lambda _self: _ConnectionAcquire(conn)})()})()
-            await ensure_replay_batch(kline_writer=writer, batch_id=batch_id, contract=contract)
-            if full:
-                task_count = await seed_full_high_level_tasks(
-                    conn, batch_id=batch_id, source_batch_id=args.source_batch_id,
-                    contract=contract, cutoffs_per_scope=args.cutoffs_per_scope,
+            async with conn.transaction():
+                batch_id = await create_parent_batch(
+                    conn, source_batch_id=args.source_batch_id, batch_key=batch_key,
+                    run_group_id=run_group_id, code_commit=args.code_commit,
                 )
-            else:
-                task_count = await seed_canary_tasks(
-                    conn, batch_id=batch_id, source_batch_id=args.source_batch_id,
-                    canary_source_batch_id=args.canary_source_batch_id, contract=contract,
-                    cutoffs_per_scope=args.cutoffs_per_scope,
-                )
+                writer = type("Writer", (), {"_pool": type("Pool", (), {"acquire": lambda _self: _ConnectionAcquire(conn)})()})()
+                await ensure_replay_batch(kline_writer=writer, batch_id=batch_id, contract=contract)
+                if full:
+                    task_count = await seed_full_high_level_tasks(
+                        conn, batch_id=batch_id, source_batch_id=args.source_batch_id,
+                        contract=contract, cutoffs_per_scope=args.cutoffs_per_scope,
+                    )
+                else:
+                    task_count = await seed_canary_tasks(
+                        conn, batch_id=batch_id, source_batch_id=args.source_batch_id,
+                        canary_source_batch_id=args.canary_source_batch_id, contract=contract,
+                        cutoffs_per_scope=args.cutoffs_per_scope,
+                    )
             write_json(args.output_dir / "replay_contract.json", {**contract.payload(), "contract_hash": contract.digest(), "batch_id": batch_id})
             summary = await build_report(conn, batch_id=batch_id)
             summary.update({

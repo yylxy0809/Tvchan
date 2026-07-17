@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from collector.historical_replay import ReplayContract
 from collector.storage.chan_postgres import (
     MODULE_C_CHAN_TABLES,
     PostgresChanWriter,
@@ -44,6 +45,38 @@ class FakeConn:
 
     async def fetchrow(self, query: str, *args):
         self.fetchrow_calls.append((query, args))
+        lowered = query.lower()
+        contract = ReplayContract(
+            config_hash="module-c-v4",
+            source_batch_id=6,
+            eligible_universe_snapshot_id="eligibility:6",
+            canonical_gate_snapshot_id="canonical:6",
+            cutoff_time=datetime(2026, 7, 3, 7, tzinfo=UTC),
+        )
+        if "from chan_c_batches" in lowered:
+            return {
+                "id": 9,
+                "status": "running",
+                "batch_kind": "historical_replay",
+                "publication_namespace": "historical-replay",
+                "profile_id": "module-c-historical-replay-v1",
+                "run_group_id": "historical-replay",
+                "config_hash": contract.config_hash,
+                "effective_config": {},
+                "audit_references": [],
+            }
+        if "from chan_c_historical_replay_batches" in lowered:
+            return {
+                "batch_id": 9,
+                "status": "running",
+                "source_batch_id": 6,
+                "contract_version": contract.contract_version,
+                "contract_hash": contract.digest(),
+                "contract": contract.payload(),
+                "eligible_universe_snapshot_id": contract.eligible_universe_snapshot_id,
+                "canonical_gate_snapshot_id": contract.canonical_gate_snapshot_id,
+                "cutoff_policy": contract.cutoff_policy,
+            }
         return None
 
     async def executemany(self, query: str, rows: list[tuple[object, ...]]):
@@ -418,6 +451,65 @@ def test_full_recompute_publication_rechecks_batch_status_before_any_write() -> 
         assert "parent.status in ('planned', 'running')" in fence_query
         assert "for share of parent, batch" in fence_query
         assert "for update of task" in fence_query
+        assert conn.execute_calls == []
+        assert conn.copy_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_historical_replay_publication_rechecks_parent_and_child_status_before_any_write() -> None:
+    async def scenario() -> None:
+        conn = FakeConn()
+        conn._fetchval_results = iter([1, None])
+        writer = PostgresChanWriter(
+            "postgresql://unused",
+            batch_id=9,
+            run_group_id="historical-replay",
+            native_base_timeframe=True,
+            publication_profile="historical_replay",
+            publication_source="historical_replay",
+            run_kind="historical_replay",
+            publication_namespace="historical-replay",
+            profile_id="module-c-historical-replay-v1",
+        )
+        writer._pool = FakePool(conn)
+        task = {
+            "id": 10,
+            "batch_id": 9,
+            "symbol_id": 1,
+            "chan_level": 5,
+            "claim_token": "claim-1",
+            "lease_version": 2,
+            "replay_identity": "a" * 64,
+            "contract_version": "historical-replay-v1",
+        }
+
+        with pytest.raises(StaleChanHeadError, match="batch status fence failed"):
+            await writer.replace_analysis(
+                symbol="000001.SZ",
+                level="5f",
+                modes=["confirmed", "predictive"],
+                bar_from=datetime.fromtimestamp(100, UTC),
+                bar_until=datetime.fromtimestamp(200, UTC),
+                bar_count=20,
+                response={
+                    "snapshot_version": "historical-replay-snapshot",
+                    "strokes": [],
+                    "segments": [],
+                    "centers": [],
+                    "signals": [],
+                },
+                historical_replay_task=task,
+            )
+
+        fence_query, fence_args = conn.fetchval_calls[1]
+        lowered = fence_query.lower()
+        assert "for update of task" in lowered
+        assert fence_args == (10, 9, 1, 5, "claim-1", 2)
+        assert "from chan_c_batches" in conn.fetchrow_calls[0][0].lower()
+        assert "for share" in conn.fetchrow_calls[0][0].lower()
+        assert "from chan_c_historical_replay_batches" in conn.fetchrow_calls[1][0].lower()
+        assert "for share" in conn.fetchrow_calls[1][0].lower()
         assert conn.execute_calls == []
         assert conn.copy_calls == []
 

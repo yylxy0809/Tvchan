@@ -5,6 +5,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from collector.historical_replay import lock_executable_replay_batch
 from collector.storage.postgres import price_to_x1000, timeframe_to_db_code
 
 
@@ -341,14 +342,18 @@ class PostgresChanWriter:
                             )
                         run_id = await insert_run(resumable=True)
                     elif historical_replay_task is not None:
+                        await lock_executable_replay_batch(
+                            conn, batch_id=int(historical_replay_task["batch_id"])
+                        )
                         fenced = await conn.fetchval(
                             """
                             select 1
-                              from chan_c_historical_replay_tasks
-                             where id = $1 and batch_id = $2 and symbol_id = $3 and chan_level = $4
-                               and status = 'running' and claim_token = $5
-                               and lease_version = $6 and lease_until > now()
-                             for update
+                              from chan_c_historical_replay_tasks task
+                             where task.id = $1 and task.batch_id = $2
+                               and task.symbol_id = $3 and task.chan_level = $4
+                               and task.status = 'running' and task.claim_token = $5
+                               and task.lease_version = $6 and task.lease_until > now()
+                              for update of task
                             """,
                             historical_replay_task["id"],
                             historical_replay_task["batch_id"],
@@ -359,7 +364,8 @@ class PostgresChanWriter:
                         )
                         if fenced != 1:
                             raise StaleChanHeadError(
-                                f"Historical replay task fence failed for task_id={historical_replay_task['id']}"
+                                "Historical replay task or batch status fence failed "
+                                f"for task_id={historical_replay_task['id']}"
                             )
                         run_id = await insert_run(resumable=True)
                     stroke_count = await self._insert_stroke_like(
