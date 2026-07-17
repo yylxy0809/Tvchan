@@ -70,7 +70,10 @@ export default function App() {
               </button>
             </div>
           </header>
-          <AdminConsole adminToken={session.token} />
+          <AdminConsole
+            adminToken={session.token}
+            onAuthenticationFailure={handleLogout}
+          />
         </main>
       ) : null}
     </>
