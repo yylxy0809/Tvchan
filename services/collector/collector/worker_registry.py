@@ -40,6 +40,11 @@ _WORKERS: dict[str, WorkerSpec] = {
         module="collector.chan_c_stream",
         description="Module C native-timeframe streaming Chan tail worker.",
     ),
+    "lifecycle-observer": WorkerSpec(
+        name="lifecycle-observer",
+        module="collector.lifecycle_observer_worker",
+        description="Durable Module C lifecycle publication outbox observer.",
+    ),
     "tdx-csv-import": WorkerSpec(
         name="tdx-csv-import",
         module="collector.tdx_csv_import",
