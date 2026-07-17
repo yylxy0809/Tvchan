@@ -26,6 +26,7 @@ import {
   fetchAdminOpsStatus,
   fetchLlmProviders,
   fetchWencaiConfig,
+  isAdminAuthFailure,
   saveLlmProviders,
   saveWencaiConfig,
   testLlmProvider,
@@ -45,6 +46,7 @@ import { publishRuntimeFeatureConfig } from "../features/runtimeFeatureRegistry"
 
 type Props = {
   adminToken: string;
+  onAuthenticationFailure(): void;
 };
 
 type ActionFeedback = {
@@ -62,7 +64,7 @@ const DEFAULT_WENCAI_CONFIG: WencaiAdminConfig = {
   timeout_seconds: 5,
 };
 
-export function AdminConsole({ adminToken }: Props) {
+export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
   const [tokens, setTokens] = useState<AdminToken[]>([]);
   const [featureConfig, setFeatureConfig] = useState<RuntimeFeatureConfig>({
     rightSidebar: [],
@@ -121,6 +123,7 @@ export function AdminConsole({ adminToken }: Props) {
       setWencaiConfig({ ...config, timeout_seconds: Math.min(5, config.timeout_seconds) });
       if (showFeedback) setWencaiFeedback({ state: "success", message: "iWencai configuration reloaded." });
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       const message = readError(nextError);
       setError(message);
       if (showFeedback) setWencaiFeedback({ state: "error", message });
@@ -132,6 +135,7 @@ export function AdminConsole({ adminToken }: Props) {
       const config = await fetchLlmProviders(adminToken);
       setLlmConfig(config.providers.length ? config : withDefaultProvider(config));
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setError(readError(nextError));
       setLlmConfig(withDefaultProvider({ active_provider_id: null, providers: [] }));
     }
@@ -141,6 +145,7 @@ export function AdminConsole({ adminToken }: Props) {
     try {
       setOpsStatus(await fetchAdminOpsStatus(adminToken));
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setOpsStatus({
         status: "degraded",
         lifecycle_observer: {
@@ -245,6 +250,7 @@ export function AdminConsole({ adminToken }: Props) {
       setWencaiTestResult(null);
       setWencaiFeedback({ state: "success", message: "iWencai configuration saved." });
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       const message = readError(nextError);
       setError(message);
       setWencaiFeedback({ state: "error", message });
@@ -262,6 +268,7 @@ export function AdminConsole({ adminToken }: Props) {
       setWencaiTestResult(result);
       setWencaiFeedback({ state: result.ok ? "success" : "error", message: result.message });
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       const message = readError(nextError);
       setError(message);
       setWencaiFeedback({ state: "error", message });
@@ -285,6 +292,7 @@ export function AdminConsole({ adminToken }: Props) {
       setLlmConfig(saved);
       setLlmTestResults({});
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setError(readError(nextError));
     } finally {
       setMutating(false);
@@ -298,6 +306,7 @@ export function AdminConsole({ adminToken }: Props) {
       const result = await testLlmProvider(adminToken, provider);
       setLlmTestResults((current) => ({ ...current, [provider.id]: result }));
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setError(readError(nextError));
     } finally {
       setMutating(false);
@@ -330,6 +339,14 @@ export function AdminConsole({ adminToken }: Props) {
         providers,
       };
     });
+  }
+
+  function handleAuthenticationFailure(error: unknown): boolean {
+    if (!isAdminAuthFailure(error)) {
+      return false;
+    }
+    onAuthenticationFailure();
+    return true;
   }
 
   return (

@@ -79,6 +79,20 @@ export type AdminOpsStatus = {
   lifecycle_observer: LifecycleObserverStatus;
 };
 
+export class AdminRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "AdminRequestError";
+  }
+}
+
+export function isAdminAuthFailure(error: unknown): error is AdminRequestError {
+  return error instanceof AdminRequestError && (error.status === 401 || error.status === 403);
+}
+
 export async function fetchWencaiConfig(token: string): Promise<WencaiAdminConfig> {
   return requestAdmin<WencaiAdminConfig>(token, "/api/v1/admin/wencai/config");
 }
@@ -145,9 +159,15 @@ async function requestAdmin<T>(
     },
   });
   if (!response.ok) {
-    throw new Error(await readResponseError(response));
+    const message = redactToken(await readResponseError(response), token);
+    throw new AdminRequestError(response.status, message);
   }
   return response.json() as Promise<T>;
+}
+
+function redactToken(message: string, token: string): string {
+  const normalized = token.trim();
+  return normalized ? message.split(normalized).join("[redacted]") : message;
 }
 
 async function readResponseError(response: Response): Promise<string> {
