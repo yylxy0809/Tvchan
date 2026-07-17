@@ -1,4 +1,4 @@
-import { apiUrl, API_TOKEN_STORAGE_KEY, isFrontendAdminToken } from "../config";
+import { apiUrl, isFrontendAdminToken } from "../config";
 
 export type UserRole = "user" | "admin";
 
@@ -34,7 +34,6 @@ type AdminTokenListResponse = {
 };
 
 const LOCAL_TOKEN_STORAGE_KEY = "tv-a-share-local-issued-tokens";
-const ROLE_STORAGE_KEY = "tv-a-share-user-role";
 
 export async function loginWithToken(token: string): Promise<AuthSession> {
   const normalized = token.trim();
@@ -96,100 +95,41 @@ export async function loginWithToken(token: string): Promise<AuthSession> {
   }
 }
 
-export async function listAdminTokens(): Promise<AdminToken[]> {
-  if (useFrontendTokenStore()) {
-    return readLocalTokens().map(stripPlainToken);
-  }
-  try {
-    const data = await requestAdmin<AdminTokenListResponse | AdminToken[]>(
-      "/api/v1/admin/tokens",
-    );
-    return Array.isArray(data) ? data : data.items ?? [];
-  } catch (error) {
-    if (!shouldUseLocalStoreFallback(error)) {
-      throw error;
-    }
-    return readLocalTokens().map(stripPlainToken);
-  }
+export async function listAdminTokens(adminToken: string): Promise<AdminToken[]> {
+  const data = await requestAdmin<AdminTokenListResponse | AdminToken[]>(
+    adminToken,
+    "/api/v1/admin/tokens",
+  );
+  return Array.isArray(data) ? data : data.items ?? [];
 }
 
-export async function createAdminToken(input: {
+export async function createAdminToken(adminToken: string, input: {
   label: string;
   display_name?: string | null;
 }): Promise<AdminToken> {
-  if (!useFrontendTokenStore()) {
-    try {
-      return await requestAdmin<AdminToken>("/api/v1/admin/tokens", {
-        method: "POST",
-        body: JSON.stringify(input),
-      });
-    } catch (error) {
-      if (!shouldUseLocalStoreFallback(error)) {
-        throw error;
-      }
-    }
-  }
-
-  const now = new Date().toISOString();
-  const created: AdminToken = {
-    id: Date.now(),
-    label: input.label,
-    display_name: input.display_name,
-    role: "user",
-    is_active: true,
-    created_at: now,
-    updated_at: now,
-    token: createLocalToken(),
-  };
-  writeLocalTokens([created, ...readLocalTokens()]);
-  return created;
+  return requestAdmin<AdminToken>(adminToken, "/api/v1/admin/tokens", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
 
-export async function disableAdminToken(id: number): Promise<AdminToken> {
-  if (!useFrontendTokenStore()) {
-    try {
-      return await requestAdmin<AdminToken>(
-        `/api/v1/admin/tokens/${encodeURIComponent(String(id))}/disable`,
-        {
-          method: "POST",
-        },
-      );
-    } catch (error) {
-      if (!shouldUseLocalStoreFallback(error)) {
-        throw error;
-      }
-    }
-  }
-
-  const tokens = readLocalTokens();
-  const now = new Date().toISOString();
-  const next = tokens.map((item) =>
-    item.id === id
-      ? { ...item, is_active: false, disabled_at: now, updated_at: now }
-      : item,
+export async function disableAdminToken(
+  adminToken: string,
+  id: number,
+): Promise<AdminToken> {
+  return requestAdmin<AdminToken>(
+    adminToken,
+    `/api/v1/admin/tokens/${encodeURIComponent(String(id))}/disable`,
+    { method: "POST" },
   );
-  writeLocalTokens(next);
-  const updated = next.find((item) => item.id === id);
-  if (!updated) {
-    throw new Error("Token not found.");
-  }
-  return stripPlainToken(updated);
 }
 
-export async function deleteAdminToken(id: number): Promise<void> {
-  if (!useFrontendTokenStore()) {
-    try {
-      await requestAdmin(`/api/v1/admin/tokens/${encodeURIComponent(String(id))}`, {
-        method: "DELETE",
-      });
-      return;
-    } catch (error) {
-      if (!shouldUseLocalStoreFallback(error)) {
-        throw error;
-      }
-    }
-  }
-  writeLocalTokens(readLocalTokens().filter((item) => item.id !== id));
+export async function deleteAdminToken(adminToken: string, id: number): Promise<void> {
+  await requestAdmin(
+    adminToken,
+    `/api/v1/admin/tokens/${encodeURIComponent(String(id))}`,
+    { method: "DELETE" },
+  );
 }
 
 async function loginViaHealthFallback(token: string): Promise<AuthSession> {
@@ -210,6 +150,7 @@ async function loginViaHealthFallback(token: string): Promise<AuthSession> {
 }
 
 async function requestAdmin<T = unknown>(
+  adminToken: string,
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
@@ -217,7 +158,7 @@ async function requestAdmin<T = unknown>(
     ...init,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${getStoredToken()}`,
+      Authorization: `Bearer ${adminToken.trim()}`,
       ...init.headers,
     },
   });
@@ -228,14 +169,6 @@ async function requestAdmin<T = unknown>(
     return undefined as T;
   }
   return response.json() as Promise<T>;
-}
-
-function useFrontendTokenStore(): boolean {
-  try {
-    return window.localStorage.getItem(ROLE_STORAGE_KEY) === "admin";
-  } catch {
-    return false;
-  }
 }
 
 function readLocalTokens(): AdminToken[] {
@@ -257,22 +190,6 @@ function readLocalTokens(): AdminToken[] {
   }
 }
 
-function writeLocalTokens(tokens: AdminToken[]) {
-  if (typeof window === "undefined") {
-    return;
-  }
-  try {
-    window.localStorage.setItem(LOCAL_TOKEN_STORAGE_KEY, JSON.stringify(tokens));
-  } catch {
-    // Local token management is a temporary frontend-only store.
-  }
-}
-
-function stripPlainToken(token: AdminToken): AdminToken {
-  const { token: _token, ...rest } = token;
-  return rest;
-}
-
 function isAdminToken(value: unknown): value is AdminToken {
   if (!value || typeof value !== "object") {
     return false;
@@ -283,20 +200,6 @@ function isAdminToken(value: unknown): value is AdminToken {
     typeof record.label === "string" &&
     typeof record.is_active === "boolean"
   );
-}
-
-function createLocalToken(): string {
-  const bytes = new Uint8Array(18);
-  crypto.getRandomValues(bytes);
-  return `tv_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function getStoredToken(): string {
-  try {
-    return window.localStorage.getItem(API_TOKEN_STORAGE_KEY) ?? "";
-  } catch {
-    return "";
-  }
 }
 
 function normalizeRole(value: unknown): UserRole {
@@ -318,14 +221,4 @@ async function readResponseError(response: Response): Promise<string> {
 
 function isNetworkFailure(error: unknown): boolean {
   return error instanceof TypeError;
-}
-
-function shouldUseLocalStoreFallback(error: unknown): boolean {
-  if (error instanceof TypeError) {
-    return true;
-  }
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return /^404\b/.test(error.message) || /^405\b/.test(error.message);
 }
