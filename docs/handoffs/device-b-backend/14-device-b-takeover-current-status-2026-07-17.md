@@ -11,8 +11,8 @@
 当前已验收的主干基线：
 
 ```text
-origin/master = c7a9edcf19ffb05cad4c25795f96290329a50abf
-short SHA     = c7a9edc
+origin/master = 1c790e359e663d20fe72c3747be6d087c047f814
+short SHA     = 1c790e3
 ```
 
 | PR | 交付层 | 状态 |
@@ -31,6 +31,10 @@ short SHA     = c7a9edc
 | #20 | Lifecycle observer 管理状态、API 与 Admin Console | 已合入 |
 | #21 | generation-fenced `kline_scope_catalog` 正确性层 | 已合入 |
 | #22 | API active-complete exact-empty 消费层 | 已合入 |
+| #23 | 设备 B 接管状态刷新 | 已合入 |
+| #24 | 通用 Strategy backtest runner diagnostic-only 防火墙 | 已合入；official/default/未知策略在连接数据库前 fail-closed |
+| #25 | Admin Console durable token CRUD | 已合入；显式 admin token，无本地伪令牌或网络降级 |
+| #26 | scope catalog generation fencing 加固 | 已合入；migration 041、单 building、revision/ABA 防护 |
 
 三层 rebased 代码、合入后验收、v4/lifecycle 防火墙与 scope catalog 两阶段实现均已进入主干。旧 PR 和旧分支仅用于审计，不应再次合并、rebase 或强推。
 
@@ -90,8 +94,11 @@ short SHA     = c7a9edc
 1. **v4 语义防火墙**：PR #16 使生产读取只接受当前 v4 合同，旧 writer 默认禁用，v3-only 必须 empty/degraded。
 2. **Lifecycle observer 产品化与可观测性**：PR #18-#20 完成观察时点防泄漏、标准 worker、Compose 单实例运行、优雅退出、积压/DLQ/watermark 管理状态与前端展示。
 3. **可靠 scope catalog**：PR #21 新增 migration 040、可恢复 generation/bootstrap/finalizer、全部 canonical K-line 写删路径同事务维护和 activation fencing；PR #22 仅在 active complete generation 的 exact-empty 证据存在时跳过冷 `klines` probe，其余情况保留正确 fallback。
+4. **正式策略执行防火墙**：PR #24 将通用 Strategy backtest runner 永久限定为 diagnostic-only；official/default `weekly_daily_b2_resonance_v1` 与未知策略均在创建数据库连接前 fail-closed，不提供 bypass。
+5. **管理令牌认证边界**：PR #25 使 Admin Console 的 token GET/POST/disable/DELETE 显式携带当前 admin token 调用 durable 后端 API；网络失败和 404 不再降级到 `localStorage` 或生成本地伪令牌。
+6. **catalog generation 并发防护**：PR #26 的 migration 041 增加全局单一 building generation、base active pointer 与 control revision；writer/finalizer 对旧 revision、ABA 和 pointer-clear 变更均由数据库 fail-closed。
 
-组合验证基线：Collector `356 passed`，API `179 passed / 8 skipped`，Web `104/104` 且 production build 通过。Disposable TimescaleDB 已验证 migration 040 幂等、真实 writer `present -> empty`、并发 finalizer fencing、active generation 原子切换、exact-empty 零 K-line probe，且 canonical K-line 行、索引、触发器、chunk、存储和内容指纹不变。没有连接或写入生产数据库。
+组合验证基线：Web contract `107/107` 且 production build 通过；Strategy `200/200`；PR #26 focused Collector `24/24`，Collector 全套 `369 passed`，另有一个仅因本机缺少可选 `notte_core` 依赖的环境失败。Disposable TimescaleDB 已验证 migration 001..041 与 041 幂等、legacy building 显式恢复、并发 create、旧 writer/finalizer fail-closed、新 finalizer、revision/ABA/pointer-clear 规则、active generation 原子切换和 exact-empty 零 K-line probe；canonical K-line 指纹不变。没有连接或写入生产数据库。
 
 当前没有仓库任务单授权扩大为全市场重算、historical replay 或正式策略回测；official 仍为 `NO_GO`。
 
@@ -110,7 +117,7 @@ short SHA     = c7a9edc
 ## 8. 下一次接管冷启动
 
 ```text
-1. git fetch origin --prune，记录最新 origin/master；不要把 c7a9edc 当作永久固定 SHA。
+1. git fetch origin --prune，记录最新 origin/master；不要把 1c790e3 当作永久固定 SHA。
 2. 阅读 AGENTS.md、本文及新增任务单/审查意见。
 3. 确认工作树干净，确认禁止项和 official NO_GO 未变化。
 4. 从最新 master 建立单一范围分支；不得重跑 13 中已经完成的三层重建。
