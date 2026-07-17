@@ -21,6 +21,9 @@ import asyncpg
 
 TIMEFRAMES = (5, 30, 1440, 10080, 43200)
 EVIDENCE_CONTRACT_VERSION = "module-c-strict-audit-v2"
+AUDIT_LOCK_PROTOCOL_VERSION = "audit-uuid-advisory-v1"
+LOCK_WATCHDOG_INTERVAL_SECONDS = 30.0
+LOCK_WATCHDOG_TIMEOUT_SECONDS = 5.0
 _SNAPSHOT_RE = re.compile(r"^[0-9A-Fa-f]+-[0-9A-Fa-f]+-[0-9]+$")
 
 PRIMARY_KEY_SQL = """
@@ -74,6 +77,10 @@ class InvalidAuditEvidence(RuntimeError):
     pass
 
 
+class AuditLockOwnershipLost(RuntimeError):
+    pass
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -111,18 +118,26 @@ def _advisory_lock_key(run_id: uuid.UUID) -> int:
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 
-async def _claim_audit_run(conn: Any, run_id: uuid.UUID) -> None:
+async def _claim_audit_run(
+    conn: Any,
+    run_id: uuid.UUID,
+    lock_owner_id: str,
+) -> None:
     """Claim or recover an incomplete run while its UUID advisory lock is held."""
+    lock_owner_id = str(uuid.UUID(lock_owner_id))
     pending = json.dumps({
         "contract_version": EVIDENCE_CONTRACT_VERSION,
         "engine": "sql_gate",
         "apply_mode": False,
         "timeframes": list(TIMEFRAMES),
         "evidence_status": "pending",
+        "lock_protocol_version": AUDIT_LOCK_PROTOCOL_VERSION,
+        "lock_owner_id": lock_owner_id,
     }, sort_keys=True)
     async with conn.transaction():
         existing = await conn.fetchrow(
-            "SELECT status FROM kline_audit_runs WHERE audit_run_id=$1 FOR UPDATE",
+            "SELECT status,parameters FROM kline_audit_runs "
+            "WHERE audit_run_id=$1 FOR UPDATE",
             run_id,
         )
         if existing is None:
@@ -138,6 +153,28 @@ async def _claim_audit_run(conn: Any, run_id: uuid.UUID) -> None:
             raise AuditRunAlreadyClaimed(
                 f"canonical audit {run_id} is already {status}; use a new UUID"
             )
+        if status == "running":
+            raw_parameters = existing["parameters"]
+            if isinstance(raw_parameters, str):
+                try:
+                    decoded_parameters = json.loads(raw_parameters)
+                except json.JSONDecodeError:
+                    parameters = {}
+                else:
+                    parameters = (
+                        decoded_parameters
+                        if isinstance(decoded_parameters, dict)
+                        else {}
+                    )
+            elif isinstance(raw_parameters, dict):
+                parameters = raw_parameters
+            else:
+                parameters = {}
+            if parameters.get("lock_protocol_version") != AUDIT_LOCK_PROTOCOL_VERSION:
+                raise AuditRunAlreadyClaimed(
+                    f"canonical audit {run_id} is legacy running evidence; "
+                    "operator confirmation is required before recovery"
+                )
         if status not in {"running", "failed"}:
             raise AuditRunAlreadyClaimed(
                 f"canonical audit {run_id} has unsupported status {status}"
@@ -670,6 +707,72 @@ async def _run_claimed_gate(
         await final.close()
 
 
+async def _watch_lock_session(setup: Any, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            heartbeat = await asyncio.wait_for(
+                setup.fetchval("SELECT 1"),
+                timeout=LOCK_WATCHDOG_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise AuditLockOwnershipLost(
+                "audit advisory-lock watchdog heartbeat failed"
+            ) from error
+        if heartbeat != 1:
+            raise AuditLockOwnershipLost(
+                "audit advisory-lock watchdog returned an invalid heartbeat"
+            )
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=LOCK_WATCHDOG_INTERVAL_SECONDS,
+            )
+        except TimeoutError:
+            pass
+
+
+async def _run_with_lock_watchdog(
+    setup: Any,
+    database_url: str,
+    run_id: str,
+    run_uuid: uuid.UUID,
+    timeframes: Sequence[int],
+) -> tuple[str, dict[str, Any]]:
+    stop = asyncio.Event()
+    gate_task = asyncio.create_task(
+        _run_claimed_gate(database_url, run_id, run_uuid, timeframes)
+    )
+    watchdog_task = asyncio.create_task(_watch_lock_session(setup, stop))
+    try:
+        done, _pending = await asyncio.wait(
+            {gate_task, watchdog_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if watchdog_task in done:
+            watchdog_error = watchdog_task.exception()
+            if watchdog_error is not None:
+                gate_task.cancel()
+                await asyncio.gather(gate_task, return_exceptions=True)
+                raise watchdog_error
+            if not gate_task.done():
+                gate_task.cancel()
+                await asyncio.gather(gate_task, return_exceptions=True)
+                raise AuditLockOwnershipLost(
+                    "audit advisory-lock watchdog stopped unexpectedly"
+                )
+        stop.set()
+        await watchdog_task
+        return await gate_task
+    finally:
+        stop.set()
+        for task in (gate_task, watchdog_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(gate_task, watchdog_task, return_exceptions=True)
+
+
 async def run_gate(
     database_url: str,
     run_id: str | None = None,
@@ -679,6 +782,7 @@ async def run_gate(
     run_id = run_id or str(uuid.uuid4())
     run_uuid = uuid.UUID(run_id)
     lock_key = _advisory_lock_key(run_uuid)
+    lock_owner_id = str(uuid.uuid4())
     setup = await asyncpg.connect(database_url)
     lock_acquired = False
     try:
@@ -692,12 +796,30 @@ async def run_gate(
         primary_key = await setup.fetchrow(PRIMARY_KEY_SQL)
         if not primary_key or not primary_key["convalidated"] or "(symbol_id, timeframe, ts)" not in primary_key["definition"]:
             raise RuntimeError("klines canonical primary key is absent or unvalidated")
-        await _claim_audit_run(setup, run_uuid)
-        return await _run_claimed_gate(database_url, run_id, run_uuid, timeframes)
+        await _claim_audit_run(setup, run_uuid, lock_owner_id)
+        return await _run_with_lock_watchdog(
+            setup,
+            database_url,
+            run_id,
+            run_uuid,
+            timeframes,
+        )
     finally:
         try:
             if lock_acquired:
-                await setup.fetchval("SELECT pg_advisory_unlock($1::bigint)", lock_key)
+                try:
+                    unlocked = await setup.fetchval(
+                        "SELECT pg_advisory_unlock($1::bigint)",
+                        lock_key,
+                    )
+                except Exception as error:
+                    raise AuditLockOwnershipLost(
+                        "audit advisory unlock failed; ownership was lost"
+                    ) from error
+                if unlocked is not True:
+                    raise AuditLockOwnershipLost(
+                        "audit advisory unlock returned false; ownership was lost"
+                    )
         finally:
             await setup.close()
 
