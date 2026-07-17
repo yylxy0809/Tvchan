@@ -929,6 +929,18 @@ body[data-app-theme="light"] .chan-screener-placeholder strong {
   font-size: 18px;
 }
 
+.module-c-batch-controls,
+.module-c-batch-controls label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.module-c-batch-controls select {
+  min-height: 34px;
+  max-width: 260px;
+}
+
 .admin-feature-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

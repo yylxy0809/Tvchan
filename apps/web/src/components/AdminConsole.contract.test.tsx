@@ -9,7 +9,7 @@ import {
   handleAdminAuthenticationFailure,
   isAdminAuthFailure,
 } from "../api/adminRuntimeConfig";
-import { ModuleCSelectionEvidenceCard } from "./AdminConsole";
+import { ModuleCBatchSelector, ModuleCSelectionEvidenceCard } from "./AdminConsole";
 
 const PASS_SELECTION = {
   status: "pass" as const,
@@ -176,13 +176,18 @@ test("module C execution fetch uses the authenticated read-only endpoint", async
       running_parent_batches: 0,
       running_child_batches: 0,
       running_tasks: 0,
+      running_batch_ids: ["9007199254740993", "42"],
       batch: null,
     }), { status: 200, headers: { "Content-Type": "application/json" } });
   };
   try {
-    const result = await fetchModuleCExecution("admin-token", 42);
+    const result = await fetchModuleCExecution("admin-token", "9007199254740993");
     assert.equal(result.readonly, true);
-    assert.match(requestedUrl, /\/api\/v1\/admin\/ops\/module-c\/execution\?batch_id=42$/);
+    assert.deepEqual(result.running_batch_ids, ["9007199254740993", "42"]);
+    assert.match(
+      requestedUrl,
+      /\/api\/v1\/admin\/ops\/module-c\/execution\?batch_id=9007199254740993$/,
+    );
     assert.equal(authorization, "Bearer admin-token");
   } finally {
     globalThis.fetch = originalFetch;
@@ -213,6 +218,26 @@ test("admin console renders read-only Module C execution evidence without contro
   }
   assert.match(source, /title=\{value\}/);
   assert.doesNotMatch(source, /handle(?:Start|Retry|Activate)ModuleC/);
+  assert.match(source, /aria-label="Module C batch view"/);
+  assert.match(source, /moduleCRequestEpoch\.current/);
+  assert.match(source, /fetchModuleCExecution\(adminToken, batchId\)/);
+  assert.match(source, /running_batch_ids/);
+});
+
+test("Module C batch selector preserves bigint IDs and a completed selected batch", () => {
+  const html = renderToStaticMarkup(
+    <ModuleCBatchSelector
+      runningBatchIds={["9007199254740993", "42"]}
+      selectedBatchId="9007199254740995"
+      onSelect={() => undefined}
+    />,
+  );
+
+  assert.match(html, /Automatic \(newest running or latest\)/);
+  assert.match(html, /Selected terminal #9007199254740995/);
+  assert.match(html, /Running #9007199254740993/);
+  assert.match(html, /value="9007199254740993"/);
+  assert.doesNotMatch(html, /9007199254740992/);
 });
 
 test("canary selection card renders a passing v2 contract and exact quotas read-only", () => {

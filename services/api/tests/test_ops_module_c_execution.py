@@ -36,12 +36,15 @@ class FakeConnection:
         task_rows: list[dict] | None = None,
         checkpoint_scopes: int = 20,
         future_scopes: int = 0,
+        running_batch_ids: list[str] | None = None,
     ) -> None:
         self.batch = batch
         self.task_rows = list(task_rows or [])
         self.checkpoint_scopes = checkpoint_scopes
         self.future_scopes = future_scopes
+        self.running_batch_ids = list(running_batch_ids or [])
         self.queries: list[str] = []
+        self.batch_query_args: tuple[object, ...] | None = None
         self.transaction_args: dict[str, object] | None = None
 
     @asynccontextmanager
@@ -58,8 +61,10 @@ class FakeConnection:
                 "running_parent_batches": 1,
                 "running_child_batches": 1,
                 "running_tasks": 2,
+                "running_batch_ids": self.running_batch_ids,
             }
         if "module-c-execution:batch" in normalized:
+            self.batch_query_args = args
             return self.batch
         if "module-c-execution:task-health" in normalized:
             return {
@@ -438,6 +443,7 @@ def test_repository_returns_structured_bound_provenance_in_one_readonly_snapshot
     assert result["observed_at"] == NOW
     assert result["readonly"] is True
     assert result["running_tasks"] == 2
+    assert result["running_batch_ids"] == []
     assert result["batch"]["execution"]["tasks"][0]["bars"] == 100
     assert result["batch"]["execution"]["retryable_failed"] == 1
     assert result["batch"]["execution"]["exhausted_failed"] == 2
@@ -477,6 +483,26 @@ def test_repository_returns_structured_bound_provenance_in_one_readonly_snapshot
     assert provenance["drift_reasons"] == []
     assert "notes" not in result["batch"]
     assert "last_error" not in result["batch"]["execution"]["tasks"][0]
+
+
+def test_repository_selects_newest_running_indicator_batch_without_losing_bigint_id() -> None:
+    batch_id = "9007199254740993"
+    connection = FakeConnection(batch=_batch(batch_id=int(batch_id)), running_batch_ids=[batch_id, "41"])
+
+    result = asyncio.run(get_module_c_execution_status(connection, batch_id=None))
+
+    assert result["running_batch_ids"] == [batch_id, "41"]
+    assert result["batch"]["batch_id"] == batch_id
+    assert connection.batch_query_args == (int(batch_id),)
+
+
+def test_repository_explicit_batch_overrides_running_default() -> None:
+    connection = FakeConnection(batch=_batch(), running_batch_ids=["99", "42"])
+
+    result = asyncio.run(get_module_c_execution_status(connection, batch_id=42))
+
+    assert result["running_batch_ids"] == ["99", "42"]
+    assert connection.batch_query_args == (42,)
 
 
 @pytest.mark.parametrize(
@@ -627,6 +653,11 @@ def test_repository_sql_is_read_only_and_freshness_uses_only_pinned_checkpoints(
     assert "audit.parameters as audit_parameters" in BATCH_SQL.lower()
     assert "lease_until is null" in TASK_HEALTH_SQL.lower()
     assert "checkpoint.shard_end > levels.expected_closed_watermark" in FRESHNESS_SQL
+    running_sql = " ".join(RUNNING_COUNTS_SQL.lower().split())
+    assert "parent.status='running' or child.status='running'" in running_sql
+    assert "task.status='running'" in running_sql
+    assert "array_agg(" in running_sql
+    assert "running.batch_id::text order by running.created_at desc, running.batch_id desc" in running_sql
 
 
 def test_repository_reports_drift_as_facts_without_claiming_freshness() -> None:
@@ -896,7 +927,8 @@ def test_route_uses_one_repeatable_read_readonly_transaction() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["batch"]["batch_id"] == 42
+    assert response.json()["batch"]["batch_id"] == "42"
+    assert response.json()["running_batch_ids"] == []
     assert response.json()["batch"]["provenance"]["selection"][
         "active_universe_matches"
     ] is True

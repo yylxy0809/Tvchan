@@ -199,7 +199,7 @@ export type ModuleCExecutionFreshness = {
 };
 
 export type ModuleCExecutionBatch = {
-  batch_id: number;
+  batch_id: string;
   batch_key: string;
   batch_kind: string;
   parent_status: string;
@@ -227,6 +227,7 @@ export type ModuleCExecutionStatus = {
   running_parent_batches: number;
   running_child_batches: number;
   running_tasks: number;
+  running_batch_ids: string[];
   batch: ModuleCExecutionBatch | null;
 };
 
@@ -264,7 +265,7 @@ export async function fetchAdminOpsStatus(token: string): Promise<AdminOpsStatus
 
 export async function fetchModuleCExecution(
   token: string,
-  batchId?: number,
+  batchId?: string,
 ): Promise<ModuleCExecutionStatus> {
   const query = batchId === undefined ? "" : `?batch_id=${encodeURIComponent(String(batchId))}`;
   return requestAdmin<ModuleCExecutionStatus>(

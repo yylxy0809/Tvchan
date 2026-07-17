@@ -8,7 +8,7 @@ import {
   TestTube2,
   Trash2,
 } from "lucide-react";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import {
   type AdminToken,
   createAdminToken,
@@ -98,6 +98,8 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
     reason: null,
     error: null,
   });
+  const [selectedModuleCBatchId, setSelectedModuleCBatchId] = useState<string | undefined>();
+  const moduleCRequestEpoch = useRef(0);
   const [label, setLabel] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
@@ -180,17 +182,21 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
     }
   }
 
-  async function refreshModuleCExecution() {
+  async function refreshModuleCExecution(batchId = selectedModuleCBatchId) {
+    const requestEpoch = ++moduleCRequestEpoch.current;
     try {
-      const snapshot = await fetchModuleCExecution(adminToken);
+      const snapshot = await fetchModuleCExecution(adminToken, batchId);
+      if (requestEpoch !== moduleCRequestEpoch.current) return;
       setModuleCExecutionState({
         snapshot,
         stale: false,
         reason: null,
         error: null,
       });
+      setSelectedModuleCBatchId(batchId);
     } catch (nextError) {
       if (handleAuthenticationFailure(nextError)) return;
+      if (requestEpoch !== moduleCRequestEpoch.current) return;
       setModuleCExecutionState((current) => ({
         ...current,
         stale: true,
@@ -392,6 +398,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
 
   const moduleCExecution = moduleCExecutionState.snapshot;
   const moduleCBatch = moduleCExecution?.batch;
+  const runningModuleCBatchIds = moduleCExecution?.running_batch_ids ?? [];
 
   return (
     <section className="admin-workspace" aria-label="管理后台">
@@ -543,14 +550,21 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
             <p className="eyebrow">Module C execution</p>
             <h2>Read-only batch evidence</h2>
           </div>
-          <button
-            className="ghost-button"
-            type="button"
-            onClick={() => void refreshModuleCExecution()}
-          >
-            <RefreshCw size={16} />
-            <span>Refresh execution</span>
-          </button>
+          <div className="module-c-batch-controls">
+            <ModuleCBatchSelector
+              runningBatchIds={runningModuleCBatchIds}
+              selectedBatchId={selectedModuleCBatchId}
+              onSelect={(batchId) => void refreshModuleCExecution(batchId)}
+            />
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => void refreshModuleCExecution()}
+            >
+              <RefreshCw size={16} />
+              <span>Refresh execution</span>
+            </button>
+          </div>
         </div>
         {moduleCExecutionState.stale ? (
           <p className="form-error admin-error" role="status">
@@ -572,6 +586,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
             <p>child: {moduleCBatch?.child_status ?? "--"}</p>
             <p>running parents: {moduleCExecution?.running_parent_batches ?? "--"}</p>
             <p>running children: {moduleCExecution?.running_child_batches ?? "--"}</p>
+            <p>running batch IDs: {runningModuleCBatchIds.length ? runningModuleCBatchIds.join(", ") : "none"}</p>
             <p>active symbols: {moduleCBatch?.execution.active_symbols ?? "--"}</p>
             <p>shards: {moduleCBatch?.execution.shard_count ?? "--"}</p>
             {moduleCBatch?.execution.tasks.map((task) => (
@@ -894,6 +909,37 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
         </div>
       </section>
     </section>
+  );
+}
+
+export function ModuleCBatchSelector({
+  runningBatchIds,
+  selectedBatchId,
+  onSelect,
+}: {
+  runningBatchIds: string[];
+  selectedBatchId?: string;
+  onSelect(batchId?: string): void;
+}) {
+  const options = selectedBatchId && !runningBatchIds.includes(selectedBatchId)
+    ? [selectedBatchId, ...runningBatchIds]
+    : runningBatchIds;
+  return (
+    <label>
+      <span>Batch view</span>
+      <select
+        aria-label="Module C batch view"
+        value={selectedBatchId ?? ""}
+        onChange={(event) => onSelect(event.target.value || undefined)}
+      >
+        <option value="">Automatic (newest running or latest)</option>
+        {options.map((batchId) => (
+          <option value={batchId} key={batchId}>
+            {runningBatchIds.includes(batchId) ? "Running" : "Selected terminal"} #{batchId}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
