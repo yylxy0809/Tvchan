@@ -58,9 +58,10 @@ def _strict_parameters(*, policy: str = "strict-v2") -> dict[str, object]:
 
 @pytest.fixture(autouse=True)
 def _strict_loader(monkeypatch):
-    async def load(_conn, audit_run_id, freshness):
+    async def load(_conn, audit_run_id, freshness, *, for_share):
         assert audit_run_id == AUDIT_ID
         assert freshness.sha256 == FRESHNESS_SHA
+        assert for_share is False
         return SimpleNamespace(
             audit_evidence_sha256=EVIDENCE_SHA,
             audit_checkpoint_sha256=CHECKPOINT_SHA,
@@ -277,7 +278,7 @@ def test_report_fails_visible_when_strict_v2_provenance_is_unavailable() -> None
 
 
 def test_report_fails_visible_when_live_strict_v2_inputs_drift(monkeypatch) -> None:
-    async def drifted(*_args):
+    async def drifted(*_args, **_kwargs):
         raise RuntimeError("active K-line scope catalog no longer matches audit evidence")
 
     monkeypatch.setattr(report_module, "_load_strict_inputs", drifted)

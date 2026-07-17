@@ -393,6 +393,7 @@ async def build_strict_v2_provenance(
             conn,
             frozen["canonical_audit_run_id"],
             freshness,
+            for_share=False,
         )
     except RuntimeError as error:
         return _failed_provenance(

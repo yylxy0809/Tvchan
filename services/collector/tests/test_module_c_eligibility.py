@@ -170,6 +170,7 @@ class StrictInputConnection:
         self.checkpoint_metadata_overrides: dict[str, object] = {}
         self.checkpoint_metadata_by_timeframe: dict[int, dict[str, object]] = {}
         self.summary_overrides: dict[str, object] = {}
+        self.fetchrow_sql: list[str] = []
 
     def catalog_rows(self):
         return [
@@ -220,6 +221,7 @@ class StrictInputConnection:
 
     async def fetchrow(self, sql: str, *_args):
         normalized = " ".join(sql.lower().split())
+        self.fetchrow_sql.append(normalized)
         if "from kline_scope_catalog_control control" in normalized:
             return {
                 "generation_id": self.generation_id,
@@ -328,6 +330,32 @@ def _bind_producer_hash(row, producer_hash: str):
     parameters["evidence_sha256"] = _manifest_sha256([parameters])
     row["summary"]["evidence_sha256"] = parameters["evidence_sha256"]
     return row
+
+
+def test_strict_input_row_lock_is_explicitly_disabled_for_readonly_callers(
+    tmp_path,
+) -> None:
+    freshness = load_freshness_contract(_freshness_fixture(tmp_path))
+    readonly = StrictInputConnection()
+    asyncio.run(
+        _load_strict_inputs(
+            readonly,
+            str(UUID(int=1)),
+            freshness,
+            for_share=False,
+        )
+    )
+    audit_sql = next(
+        sql for sql in readonly.fetchrow_sql if "from kline_audit_runs" in sql
+    )
+    assert "for share" not in audit_sql
+
+    locked = StrictInputConnection()
+    asyncio.run(_load_strict_inputs(locked, str(UUID(int=1)), freshness))
+    audit_sql = next(
+        sql for sql in locked.fetchrow_sql if "from kline_audit_runs" in sql
+    )
+    assert "for share" in audit_sql
 
 
 def test_strict_input_requires_complete_exact_audit_and_producer_universe_hash(
