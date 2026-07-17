@@ -45,6 +45,14 @@ def test_production_allows_empty_or_high_entropy_admin_token() -> None:
     ).admin_api_token == admin_token
 
 
+@pytest.mark.parametrize("app_env", ["development", "test", "production"])
+def test_all_environments_reject_identical_api_and_admin_tokens(app_env: str) -> None:
+    token = "uy7RK4p9wQ2xM6zB1cD8fG3hJ5kL0nP!"
+
+    with pytest.raises(RuntimeError, match="ADMIN_API_TOKEN must differ from API_TOKEN"):
+        Settings(app_env=app_env, api_token=token, admin_api_token=token)
+
+
 def test_create_app_fails_fast_for_production_placeholder_token(monkeypatch) -> None:
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("API_TOKEN", "dev-local-token")
@@ -63,6 +71,19 @@ def test_create_app_fails_fast_for_production_placeholder_admin_token(monkeypatc
     get_settings.cache_clear()
     try:
         with pytest.raises(RuntimeError, match="ADMIN_API_TOKEN must be"):
+            create_app()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_create_app_fails_fast_for_identical_api_and_admin_tokens(monkeypatch) -> None:
+    token = "uy7RK4p9wQ2xM6zB1cD8fG3hJ5kL0nP!"
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("API_TOKEN", token)
+    monkeypatch.setenv("ADMIN_API_TOKEN", token)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="ADMIN_API_TOKEN must differ from API_TOKEN"):
             create_app()
     finally:
         get_settings.cache_clear()

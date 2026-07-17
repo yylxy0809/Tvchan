@@ -72,6 +72,8 @@ class Settings:
     def __post_init__(self) -> None:
         if self.chan_lifecycle_observer_stale_seconds <= 0:
             raise RuntimeError("CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS must be greater than zero")
+        if self.api_token and self.admin_api_token and self.api_token == self.admin_api_token:
+            raise RuntimeError("ADMIN_API_TOKEN must differ from API_TOKEN")
         if self.app_env.strip().lower() == "production":
             _validate_production_token("API_TOKEN", self.api_token)
             if self.admin_api_token:
