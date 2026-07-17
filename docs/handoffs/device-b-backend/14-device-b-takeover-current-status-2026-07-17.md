@@ -11,8 +11,8 @@
 当前已验收的主干基线：
 
 ```text
-origin/master = 379b26da159f3fc4356508ac079956d665a92924
-short SHA     = 379b26d
+origin/master = c7a9edcf19ffb05cad4c25795f96290329a50abf
+short SHA     = c7a9edc
 ```
 
 | PR | 交付层 | 状态 |
@@ -22,8 +22,17 @@ short SHA     = 379b26d
 | #11 | historical replay / official gate rebased | 已合入；official manifest 保持 fail-closed |
 | #12 | Windows UTF-8 / TSX 合入后验收工具 | 已合入 |
 | #13 | 空 timeframe bars fast-path | 已合入 |
+| #14 | 北交所 symbol / TradingView 元数据 | 已合入 |
+| #15 | 设备 B 接管状态入口 | 已合入；本文随后由独立 PR 刷新 |
+| #16 | Module C v4 运行时语义防火墙 | 已合入 |
+| #17 | 侧栏 parser 故障隔离 | 已合入 |
+| #18 | Strategy lifecycle `observed_time` as-of 防泄漏 | 已合入 |
+| #19 | Lifecycle observer 标准 worker / Compose / 单实例退出 | 已合入 |
+| #20 | Lifecycle observer 管理状态、API 与 Admin Console | 已合入 |
+| #21 | generation-fenced `kline_scope_catalog` 正确性层 | 已合入 |
+| #22 | API active-complete exact-empty 消费层 | 已合入 |
 
-三层 rebased 代码、验收工具与空周期查询修复均已进入主干。旧 PR 和旧分支仅用于审计，不应再次合并、rebase 或强推。
+三层 rebased 代码、合入后验收、v4/lifecycle 防火墙与 scope catalog 两阶段实现均已进入主干。旧 PR 和旧分支仅用于审计，不应再次合并、rebase 或强推。
 
 ## 3. 接管验收结论
 
@@ -74,59 +83,34 @@ short SHA     = 379b26d
 - 不提交密钥、token、cookie、日志、数据库文件、`outputs` 大型产物或 TradingView 授权资产。
 - 数据库写任务必须先给出范围、dry-run、run/batch identity、fencing 和回滚方案；接管完成不等于默认授权无边界生产写入。
 
-## 6. 已知工程缺口与优先级
+## 6. 工程缺口收口状态
 
-### P0：建立端到端 v4 语义防火墙
+原接管清单中的三个最高优先级缺口已经收口：
 
-当前 API overlay/screener 仍把旧 v3 Module C hash 视为兼容，旧 Strategy historical-backfill writer 也仍硬编码 v3 hash。若 v4 Head 缺失，生产读取可能静默退回不同语义；旧工具还可能写入错误标识的 run。
+1. **v4 语义防火墙**：PR #16 使生产读取只接受当前 v4 合同，旧 writer 默认禁用，v3-only 必须 empty/degraded。
+2. **Lifecycle observer 产品化与可观测性**：PR #18-#20 完成观察时点防泄漏、标准 worker、Compose 单实例运行、优雅退出、积压/DLQ/watermark 管理状态与前端展示。
+3. **可靠 scope catalog**：PR #21 新增 migration 040、可恢复 generation/bootstrap/finalizer、全部 canonical K-line 写删路径同事务维护和 activation fencing；PR #22 仅在 active complete generation 的 exact-empty 证据存在时跳过冷 `klines` probe，其余情况保留正确 fallback。
 
-下一步应：
+组合验证基线：Collector `356 passed`，API `179 passed / 8 skipped`，Web `104/104` 且 production build 通过。Disposable TimescaleDB 已验证 migration 040 幂等、真实 writer `present -> empty`、并发 finalizer fencing、active generation 原子切换、exact-empty 零 K-line probe，且 canonical K-line 行、索引、触发器、chunk、存储和内容指纹不变。没有连接或写入生产数据库。
 
-1. 让生产 API、健康状态和 screener 只接受当前 v4 hash；v3-only 必须 empty/degraded。
-2. 退役或默认禁用 Strategy 中可写 Module C 的旧 v3 backfill 路径；official 查询显式限定 v4、publication profile 和允许的 run group。
-3. 补 v3-only、v3/v4 混合与 official `NO_GO` 回归测试。
+当前没有仓库任务单授权扩大为全市场重算、historical replay 或正式策略回测；official 仍为 `NO_GO`。
 
-该项不需要数据库迁移，不改变现有历史审计数据，优先级最高。
+## 7. 后续开发方法
 
-### P0/P1：Lifecycle observer 产品化与可观测性
+后续不再把本节已完成事项当作待办重复实现。每轮从最新 `origin/master`：
 
-Lifecycle observer 已具备 lease、fencing、重试和 dead-letter 语义，但当前没有注册为标准 collector worker，也未由 Compose 与 `chan-c-stream` 一起持续启动；管理状态接口没有暴露 lifecycle outbox/DLQ。
+1. 检查新任务单、开放 PR、审查、评论与 CI。
+2. 使用子代理分别只读审计前端、API/Strategy 和数据库/Collector，给出有文件与测试证据的候选缺口。
+3. 只选择一个最高优先级、范围单一、可 TDD 验证且不触碰第 5 节禁止项的工作；没有充分证据时保持只读，不制造需求。
+4. 每项使用干净 worktree、独立分支和草稿 PR；先写失败回归测试，再做最小实现。
+5. 运行相关 Web/API/Collector/Strategy 测试、必要的 disposable 数据库验证、`git diff --check` 与敏感文件检查；设备 B 自审无阻塞后方可合入。
 
-下一步应：
-
-1. 合并重复启动入口，注册标准 worker，并加入 realtime Compose profile。
-2. 在管理状态中显示 pending/processing/failed/dead-letter、最旧积压和 observer watermark。
-3. 增加 head publication -> outbox -> lifecycle event/current projection 的小型 PostgreSQL 集成测试。
-
-部署后只写现有 lifecycle/outbox 表，不修改 K 线；异常积压必须 degraded/fail-closed。
-
-### P1：可靠 scope catalog 消除空 timeframe 冷查询
-
-PR #13 已避免无条件主查询，但缺 ingest watermark 时仍会直接探测大型 Timescale hypertable。真实冷/custom plan 仍约 4.2 至 4.5 秒，连接复用进入 generic plan 后才降至约 40 毫秒。不能简单把“缺 watermark”解释为“无 K 线”，因为旧数据可能存在 K 线但没有 watermark。
-
-下一步应新增带完整性状态的轻量 `kline_scope_catalog`：
-
-1. 由可恢复的只读扫描回填 `(symbol_id, timeframe)` 存在性和边界，整代完成后原子标记 complete。
-2. 所有 K 线写路径在同一事务维护正向 scope；删除路径使对应 scope 失效或重建。
-3. catalog 未完成或失效时继续正确但较慢的 fallback；只有 complete generation 中确实缺行才返回空。
-4. 用全新数据库连接冷测空周期，并核对正向样本响应与 K 线快照完全不变。
-
-数据库影响仅限新增小型 metadata 和一次只读回填扫描，不得改写 canonical K 线。
-
-## 7. 后续开发顺序
-
-推荐顺序：
-
-1. P0 v4 语义防火墙：先消除静默语义回退和旧写路径。
-2. P0/P1 lifecycle observer 产品化：保证后续增量发布不会让策略生命周期静默滞后。
-3. P1 scope catalog：在不牺牲正确性的前提下消除空周期冷查询抖动。
-
-每项使用独立分支和草稿 PR；先写回归测试，再做最小实现，运行相关 Web/API/Collector/Strategy 测试、迁移幂等验证、`git diff --check` 与敏感文件检查。任何一项都不得改变正式策略 `NO_GO`。
+任何后续工程项都不得改变正式策略 `NO_GO`，不得将 diagnostic/research 结果包装为 official 结论。
 
 ## 8. 下一次接管冷启动
 
 ```text
-1. git fetch origin --prune，记录最新 origin/master；不要把 379b26d 当作永久固定 SHA。
+1. git fetch origin --prune，记录最新 origin/master；不要把 c7a9edc 当作永久固定 SHA。
 2. 阅读 AGENTS.md、本文及新增任务单/审查意见。
 3. 确认工作树干净，确认禁止项和 official NO_GO 未变化。
 4. 从最新 master 建立单一范围分支；不得重跑 13 中已经完成的三层重建。
