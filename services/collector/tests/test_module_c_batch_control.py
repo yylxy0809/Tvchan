@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from argparse import Namespace
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import pytest
 
 from collector.module_c_batch_control import (
+    _strict_v2_provenance,
+    freeze_canary,
     load_selection,
     validate_canary_report,
     validate_canary_run_set,
+    validate_strict_build,
     validate_terminal_tasks,
 )
+from collector.module_c_eligibility import _canonical_sha256
 from trading_protocol import MODULE_C_CONFIG_HASH
 
 
@@ -111,3 +119,281 @@ def test_canary_report_run_set_must_exactly_match_completed_tasks() -> None:
     report["runs"][0]["run_id"] = 12
     with pytest.raises(RuntimeError, match="run set"):
         validate_canary_run_set(report, expected)
+
+
+def _strict_v2_source() -> dict[str, object]:
+    freshness_contract = {
+        "contract_version": "module-c-authoritative-freshness-v1",
+        "as_of": "2026-07-03T07:00:00+00:00",
+        "trading_calendar": {"id": "calendar", "sha256": "f" * 64},
+        "expected_closed_watermarks": {
+            timeframe: "2026-07-03T07:00:00+00:00"
+            for timeframe in ("5f", "30f", "1d", "1w", "1m")
+        },
+    }
+    provenance = {
+        "canonical_audit_run_id": "11111111-1111-1111-1111-111111111111",
+        "audit_evidence_sha256": "a" * 64,
+        "audit_checkpoint_sha256": "b" * 64,
+        "freshness_contract_version": "module-c-authoritative-freshness-v1",
+        "freshness_contract_sha256": _canonical_sha256(freshness_contract),
+        "catalog_generation_id": "22222222-2222-2222-2222-222222222222",
+        "catalog_control_revision": 7,
+        "catalog_manifest_sha256": "d" * 64,
+        "audit_active_universe_sha256": "e" * 64,
+    }
+    return {
+        **provenance,
+        "parameters": {
+            "policy": "strict-v2",
+            **provenance,
+            "freshness_contract": freshness_contract,
+        },
+    }
+
+
+def test_canary_strict_v2_provenance_is_copied_exactly() -> None:
+    source = _strict_v2_source()
+    provenance = {
+        field: source[field]
+        for field in (
+            "canonical_audit_run_id",
+            "audit_evidence_sha256",
+            "audit_checkpoint_sha256",
+            "freshness_contract_version",
+            "freshness_contract_sha256",
+            "catalog_generation_id",
+            "catalog_control_revision",
+            "catalog_manifest_sha256",
+            "audit_active_universe_sha256",
+        )
+    }
+
+    copied, parameters = _strict_v2_provenance(source)
+
+    assert copied == provenance
+    assert parameters["policy"] == "strict-v2"
+    assert parameters["freshness_contract"] == source["parameters"]["freshness_contract"]
+
+    source["audit_checkpoint_sha256"] = None
+    with pytest.raises(RuntimeError, match="provenance"):
+        _strict_v2_provenance(source)
+
+
+def test_canary_strict_v2_rejects_parameter_column_mismatch() -> None:
+    source = _strict_v2_source()
+    source["parameters"]["catalog_manifest_sha256"] = "0" * 64
+
+    with pytest.raises(RuntimeError, match="provenance"):
+        _strict_v2_provenance(source)
+
+
+def test_canary_strict_v2_rejects_self_hashed_non_exact_freshness_contract() -> None:
+    source = _strict_v2_source()
+    contract = source["parameters"]["freshness_contract"]
+    contract["unexpected"] = True
+    digest = _canonical_sha256(contract)
+    source["freshness_contract_sha256"] = digest
+    source["parameters"]["freshness_contract_sha256"] = digest
+
+    with pytest.raises(RuntimeError, match="provenance"):
+        _strict_v2_provenance(source)
+
+
+def test_freeze_canary_rejects_strict_v1_source() -> None:
+    source = _strict_v2_source()
+    source["parameters"]["policy"] = "strict-v1"
+
+    with pytest.raises(RuntimeError, match="provenance"):
+        _strict_v2_provenance(source)
+
+
+def test_freeze_canary_rejects_strict_v1_source_before_inserting(tmp_path) -> None:
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text(json.dumps(_selection()), encoding="utf-8")
+
+    class Connection:
+        inserted = False
+
+        @asynccontextmanager
+        async def transaction(self, *, isolation=None):
+            assert isolation == "serializable"
+            yield
+
+        async def fetchrow(self, sql, *_args):
+            if "from module_c_eligibility_builds" in sql.lower():
+                return {
+                    "config_hash": MODULE_C_CONFIG_HASH,
+                    "active_symbols": 20,
+                    "disposition_rows": 100,
+                    "parameters": {
+                        "policy": "strict-v1",
+                        "canonical_audit_run_id": "11111111-1111-1111-1111-111111111111",
+                    },
+                }
+            if "from module_c_eligibility where" in sql.lower():
+                return {
+                    "row_count": 100,
+                    "symbol_count": 20,
+                    "unresolved_eligible": 0,
+                    "timeframe_count": 5,
+                }
+            raise AssertionError(sql)
+
+        async def fetchval(self, sql, *_args):
+            assert "from kline_audit_runs" in sql.lower()
+            return "completed"
+
+        async def execute(self, *_args):
+            self.inserted = True
+            raise AssertionError("strict-v1 source must fail before insert")
+
+    connection = Connection()
+    args = Namespace(
+        selection_manifest=selection_path,
+        source_build_id="22222222-2222-2222-2222-222222222222",
+    )
+
+    with pytest.raises(RuntimeError, match="strict canonical audit"):
+        asyncio.run(freeze_canary(connection, args))
+    assert connection.inserted is False
+
+
+def test_new_batch_rejects_strict_v1_build() -> None:
+    class Connection:
+        async def fetchval(self, *_args):
+            raise AssertionError("strict-v1 must fail before audit lookup")
+
+    build = {
+        "parameters": {
+            "policy": "strict-v1",
+            "canonical_audit_run_id": "11111111-1111-1111-1111-111111111111",
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="strict canonical audit"):
+        asyncio.run(
+            validate_strict_build(
+                Connection(), build, build_id="legacy", require_v2=True
+            )
+        )
+
+
+def test_output_failure_rolls_back_frozen_canary(tmp_path, monkeypatch) -> None:
+    selection = _selection()
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text(json.dumps(selection), encoding="utf-8")
+    source = {
+        **_strict_v2_source(),
+        "config_hash": MODULE_C_CONFIG_HASH,
+        "active_symbols": 20,
+        "disposition_rows": 100,
+    }
+    levels = (5, 30, 1440, 10080, 43200)
+    rows = [
+        {
+            "symbol_id": symbol_id,
+            "symbol": entry["symbol"],
+            "timeframe": level,
+            "eligible": True,
+            "reasons": [],
+            "covered_until": datetime(2026, 7, 3, 7, tzinfo=timezone.utc),
+            "unresolved_rows": 0,
+        }
+        for symbol_id, entry in enumerate(selection["symbols"], start=1)
+        for level in levels
+    ]
+
+    class Connection:
+        transaction_failed = False
+        inserted_args = None
+        source_returned = False
+
+        @asynccontextmanager
+        async def transaction(self, *, isolation=None):
+            assert isolation == "serializable"
+            try:
+                yield
+            except Exception:
+                self.transaction_failed = True
+                raise
+
+        async def fetchrow(self, sql, *_args):
+            normalized = " ".join(sql.lower().split())
+            if "from module_c_eligibility_builds" in normalized and not self.source_returned:
+                self.source_returned = True
+                return source
+            if "count(*)::integer row_count" in normalized:
+                return {
+                    "row_count": 100,
+                    "symbol_count": 20,
+                    "unresolved_eligible": 0,
+                    "timeframe_count": 5,
+                }
+            if "from module_c_eligibility_builds" in normalized:
+                values = self.inserted_args
+                return {
+                    "manifest_version": values[1],
+                    "config_hash": values[2],
+                    "active_universe_hash": values[3],
+                    "manifest_hash": values[4],
+                    "active_symbols": 20,
+                    "disposition_rows": 100,
+                    "parameters": json.loads(values[5]),
+                    **{
+                        field: values[index]
+                        for index, field in enumerate(
+                            (
+                                "canonical_audit_run_id",
+                                "audit_evidence_sha256",
+                                "audit_checkpoint_sha256",
+                                "freshness_contract_version",
+                                "freshness_contract_sha256",
+                                "catalog_generation_id",
+                                "catalog_control_revision",
+                                "catalog_manifest_sha256",
+                                "audit_active_universe_sha256",
+                            ),
+                            start=7,
+                        )
+                    },
+                }
+            raise AssertionError(sql)
+
+        async def fetchval(self, sql, *_args):
+            if "from kline_audit_runs" in sql.lower():
+                return "completed"
+            if "from module_c_eligibility" in sql.lower():
+                return 100
+            raise AssertionError(sql)
+
+        async def fetch(self, sql, *_args):
+            assert "from module_c_eligibility" in sql.lower()
+            return rows
+
+        async def execute(self, sql, *args):
+            assert "insert into module_c_eligibility_builds" in sql.lower()
+            self.inserted_args = args
+            return "INSERT 0 1"
+
+        async def copy_records_to_table(self, *_args, **_kwargs):
+            return None
+
+    connection = Connection()
+
+    def fail_outputs(*_args):
+        raise OSError("output unavailable")
+
+    monkeypatch.setattr("collector.module_c_batch_control._write_outputs", fail_outputs)
+    args = Namespace(
+        selection_manifest=selection_path,
+        source_build_id="33333333-3333-3333-3333-333333333333",
+        build_id="44444444-4444-4444-4444-444444444444",
+        manifest_version="canary-v2-test",
+        output_dir=tmp_path / "outputs",
+    )
+
+    with pytest.raises(OSError, match="output unavailable"):
+        asyncio.run(freeze_canary(connection, args))
+    assert connection.transaction_failed is True
+    assert connection.inserted_args is not None
