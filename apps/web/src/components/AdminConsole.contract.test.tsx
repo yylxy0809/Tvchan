@@ -27,3 +27,11 @@ test("admin console exposes lifecycle observer health, backlog, and watermark", 
   assert.match(apiSource, /"unavailable" \| "degraded" \| "healthy"/);
   assert.match(apiSource, /expected_observer_name/);
 });
+
+test("admin console passes its authenticated admin token to durable token CRUD", () => {
+  const source = readFileSync(new URL("./AdminConsole.tsx", import.meta.url), "utf8");
+  assert.match(source, /listAdminTokens\(adminToken\)/);
+  assert.match(source, /createAdminToken\(adminToken,/);
+  assert.match(source, /disableAdminToken\(adminToken, id\)/);
+  assert.match(source, /deleteAdminToken\(adminToken, id\)/);
+});

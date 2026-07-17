@@ -96,7 +96,7 @@ export function AdminConsole({ adminToken }: Props) {
     setLoading(true);
     setError(null);
     try {
-      setTokens(await listAdminTokens());
+      setTokens(await listAdminTokens(adminToken));
     } catch (nextError) {
       setError(readError(nextError));
     } finally {
@@ -181,7 +181,7 @@ export function AdminConsole({ adminToken }: Props) {
     setMutating(true);
     setError(null);
     try {
-      const created = await createAdminToken({
+      const created = await createAdminToken(adminToken, {
         label: normalizedLabel,
         display_name: displayName.trim() || null,
       });
@@ -200,7 +200,7 @@ export function AdminConsole({ adminToken }: Props) {
     setMutating(true);
     setError(null);
     try {
-      const updated = await disableAdminToken(id);
+      const updated = await disableAdminToken(adminToken, id);
       setTokens((current) =>
         current.map((item) => (item.id === id ? updated : item)),
       );
@@ -215,7 +215,7 @@ export function AdminConsole({ adminToken }: Props) {
     setMutating(true);
     setError(null);
     try {
-      await deleteAdminToken(id);
+      await deleteAdminToken(adminToken, id);
       setTokens((current) => current.filter((item) => item.id !== id));
     } catch (nextError) {
       setError(readError(nextError));
