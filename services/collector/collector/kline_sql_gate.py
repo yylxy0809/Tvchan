@@ -8,16 +8,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
 import uuid
+from datetime import datetime
 from typing import Any, Sequence
 
 import asyncpg
 
 
 TIMEFRAMES = (5, 30, 1440, 10080, 43200)
+EVIDENCE_CONTRACT_VERSION = "module-c-strict-audit-v2"
 _SNAPSHOT_RE = re.compile(r"^[0-9A-Fa-f]+-[0-9A-Fa-f]+-[0-9]+$")
 
 PRIMARY_KEY_SQL = """
@@ -25,6 +28,218 @@ SELECT c.convalidated, pg_get_constraintdef(c.oid) AS definition
 FROM pg_constraint c
 WHERE c.conrelid='klines'::regclass AND c.contype='p'
 """
+
+EVIDENCE_CLOCK_SQL = """
+SELECT transaction_timestamp() AS observed_at,
+       pg_current_wal_lsn()::text AS evidence_lsn
+"""
+
+ACTIVE_UNIVERSE_SQL = """
+SELECT id AS symbol_id, code, exchange
+FROM symbols
+WHERE is_active AND market='A_SHARE'
+ORDER BY id
+"""
+
+ACTIVE_CATALOG_GENERATION_SQL = """
+SELECT control.active_generation_id AS generation_id,
+       control.revision,
+       generation.status,
+       generation.expected_scope_count,
+       generation.symbol_ids,
+       generation.timeframes
+FROM kline_scope_catalog_control control
+JOIN kline_scope_catalog_generations generation
+  ON generation.generation_id=control.active_generation_id
+WHERE control.control_key='active'
+  AND generation.status='complete'
+"""
+
+ACTIVE_CATALOG_MANIFEST_SQL = """
+SELECT symbol_id, timeframe, state, bounds_complete, min_ts, max_ts, updated_at
+FROM kline_scope_catalog
+WHERE generation_id=$1
+  AND symbol_id=ANY($2::integer[])
+  AND timeframe=ANY($3::integer[])
+ORDER BY symbol_id, timeframe
+"""
+
+
+class AuditRunAlreadyClaimed(RuntimeError):
+    pass
+
+
+class InvalidAuditEvidence(RuntimeError):
+    pass
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _manifest_sha256(records: Sequence[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(
+            json.dumps(
+                _json_value(record), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _normalize_timeframes(timeframes: Sequence[int]) -> tuple[int, ...]:
+    values = tuple(int(value) for value in timeframes)
+    if len(values) != len(TIMEFRAMES) or set(values) != set(TIMEFRAMES):
+        raise ValueError("canonical SQL gate requires the exact five Module C timeframes")
+    return TIMEFRAMES
+
+
+async def _claim_audit_run(conn: Any, run_id: uuid.UUID) -> None:
+    """Claim a new or failed run without ever resetting durable completed evidence."""
+    pending = json.dumps({
+        "contract_version": EVIDENCE_CONTRACT_VERSION,
+        "engine": "sql_gate",
+        "apply_mode": False,
+        "timeframes": list(TIMEFRAMES),
+        "evidence_status": "pending",
+    }, sort_keys=True)
+    async with conn.transaction():
+        existing = await conn.fetchrow(
+            "SELECT status FROM kline_audit_runs WHERE audit_run_id=$1 FOR UPDATE",
+            run_id,
+        )
+        if existing is None:
+            await conn.execute(
+                "INSERT INTO kline_audit_runs(audit_run_id,status,apply_mode,parameters) "
+                "VALUES($1,'running',false,$2::jsonb)",
+                run_id,
+                pending,
+            )
+            return
+        status = str(existing["status"])
+        if status in {"running", "completed"}:
+            raise AuditRunAlreadyClaimed(
+                f"canonical audit {run_id} is already {status}; use a new UUID"
+            )
+        if status != "failed":
+            raise AuditRunAlreadyClaimed(
+                f"canonical audit {run_id} has unsupported status {status}"
+            )
+        await conn.execute(
+            "DELETE FROM kline_audit_checkpoints WHERE audit_run_id=$1",
+            run_id,
+        )
+        await conn.execute(
+            "UPDATE kline_audit_runs SET started_at=now(),completed_at=NULL,status='running',"
+            "apply_mode=false,parameters=$2::jsonb,summary='{}'::jsonb,failure=NULL "
+            "WHERE audit_run_id=$1 AND status='failed'",
+            run_id,
+            pending,
+        )
+
+
+async def _capture_snapshot_evidence(conn: Any) -> dict[str, Any]:
+    """Capture strict audit evidence from the coordinator's exported snapshot."""
+    clock = await conn.fetchrow(EVIDENCE_CLOCK_SQL)
+    if clock is None or clock["observed_at"] is None or not clock["evidence_lsn"]:
+        raise InvalidAuditEvidence("audit snapshot clock/LSN evidence is missing")
+    universe_rows = await conn.fetch(ACTIVE_UNIVERSE_SQL)
+    universe = [
+        {
+            "symbol_id": int(row["symbol_id"]),
+            "symbol": f"{row['code']}.{str(row['exchange']).upper()}",
+        }
+        for row in universe_rows
+    ]
+    if not universe:
+        raise InvalidAuditEvidence("active A-share universe is empty")
+
+    generation = await conn.fetchrow(ACTIVE_CATALOG_GENERATION_SQL)
+    if generation is None:
+        raise InvalidAuditEvidence("active complete K-line scope catalog generation is missing")
+    generation_id = generation["generation_id"]
+    universe_ids = [record["symbol_id"] for record in universe]
+    generation_symbols = {int(value) for value in generation["symbol_ids"]}
+    generation_timeframes = {int(value) for value in generation["timeframes"]}
+    if not set(universe_ids).issubset(generation_symbols):
+        raise InvalidAuditEvidence("active catalog generation does not cover the active universe")
+    if not set(TIMEFRAMES).issubset(generation_timeframes):
+        raise InvalidAuditEvidence("active catalog generation does not cover the exact five levels")
+
+    catalog_rows = await conn.fetch(
+        ACTIVE_CATALOG_MANIFEST_SQL,
+        generation_id,
+        universe_ids,
+        list(TIMEFRAMES),
+    )
+    catalog: list[dict[str, Any]] = []
+    for row in catalog_rows:
+        state = str(row["state"])
+        min_ts = row["min_ts"]
+        max_ts = row["max_ts"]
+        valid = bool(row["bounds_complete"]) and (
+            (state == "empty" and min_ts is None and max_ts is None)
+            or (
+                state == "present"
+                and min_ts is not None
+                and max_ts is not None
+                and min_ts <= max_ts
+            )
+        )
+        if not valid:
+            raise InvalidAuditEvidence(
+                "active catalog contains unknown or incomplete required scope evidence"
+            )
+        catalog.append({
+            "symbol_id": int(row["symbol_id"]),
+            "timeframe": int(row["timeframe"]),
+            "state": state,
+            "bounds_complete": True,
+            "min_ts": _json_value(min_ts),
+            "max_ts": _json_value(max_ts),
+            "updated_at": _json_value(row["updated_at"]),
+        })
+    expected_keys = {
+        (symbol_id, timeframe)
+        for symbol_id in universe_ids
+        for timeframe in TIMEFRAMES
+    }
+    observed_keys = {
+        (record["symbol_id"], record["timeframe"])
+        for record in catalog
+    }
+    if len(catalog) != len(expected_keys) or observed_keys != expected_keys:
+        raise InvalidAuditEvidence(
+            "active catalog scope manifest is not exact for the audit universe"
+        )
+
+    evidence: dict[str, Any] = {
+        "contract_version": EVIDENCE_CONTRACT_VERSION,
+        "engine": "sql_gate",
+        "apply_mode": False,
+        "timeframes": list(TIMEFRAMES),
+        "observed_at": _json_value(clock["observed_at"]),
+        "evidence_lsn": str(clock["evidence_lsn"]),
+        "active_universe_count": len(universe),
+        "active_universe_sha256": _manifest_sha256(universe),
+        "catalog_generation_id": str(generation_id),
+        "catalog_control_revision": int(generation["revision"]),
+        "catalog_expected_scope_count": int(generation["expected_scope_count"]),
+        "catalog_required_scope_count": len(catalog),
+        "catalog_manifest_sha256": _manifest_sha256(catalog),
+    }
+    evidence["evidence_sha256"] = _manifest_sha256([evidence])
+    return evidence
 
 
 def _session_invalid(timeframe: int) -> str:
@@ -91,13 +306,15 @@ def build_gate_sql(timeframe: int) -> str:
     FROM daily_ends d
     LEFT JOIN base b ON b.symbol_id=d.symbol_id
       AND date_trunc('{bucket}', b.lts)=d.period_key
-    WHERE d.period_key < date_trunc('{bucket}', now() AT TIME ZONE 'Asia/Shanghai')
+    WHERE d.period_key < date_trunc(
+        '{bucket}', (SELECT observed_at FROM evidence_context) AT TIME ZONE 'Asia/Shanghai'
+    )
       AND b.symbol_id IS NULL
     GROUP BY d.symbol_id
 )"""
         higher_join = "LEFT JOIN daily_ends d ON d.symbol_id = b.symbol_id AND d.period_key = date_trunc('%s', b.lts)" % bucket
         missing_higher_join = "LEFT JOIN missing_higher mh ON mh.symbol_id = b.symbol_id"
-        higher_metrics = f"""count(*) FILTER (WHERE date_trunc('{bucket}', b.lts) >= date_trunc('{bucket}', now() AT TIME ZONE 'Asia/Shanghai'))::bigint AS current_open_periods,
+        higher_metrics = f"""count(*) FILTER (WHERE date_trunc('{bucket}', b.lts) >= date_trunc('{bucket}', (SELECT observed_at FROM evidence_context) AT TIME ZONE 'Asia/Shanghai'))::bigint AS current_open_periods,
        count(*) FILTER (WHERE d.expected_ts IS NOT NULL AND b.ts IS DISTINCT FROM d.expected_ts)::bigint AS timestamp_mismatches,
        count(*) FILTER (WHERE d.expected_ts IS NULL)::bigint AS missing_daily_basis,
        coalesce(max(mh.missing_higher_periods),0)::bigint AS missing_higher_periods"""
@@ -126,6 +343,8 @@ WITH base AS {base_materialization} (
     WHERE k.timeframe = {timeframe}
 ), universe AS (
     SELECT id AS symbol_id FROM symbols WHERE is_active AND market='A_SHARE'
+), evidence_context AS MATERIALIZED (
+    SELECT $2::timestamptz AS observed_at
 ){daily_ctes}{logical_duplicates_cte}, metrics AS (
     SELECT b.symbol_id, min(b.ts) AS shard_start, max(b.ts) AS shard_end,
        count(*)::bigint AS rows_scanned,
@@ -220,7 +439,13 @@ def summarize(record: Any) -> tuple[str, dict[str, Any]]:
     return "completed", summary
 
 
-async def _worker(database_url: str, snapshot: str, run_id: str, timeframe: int) -> None:
+async def _worker(
+    database_url: str,
+    snapshot: str,
+    run_id: str,
+    timeframe: int,
+    observed_at: datetime,
+) -> None:
     if not _SNAPSHOT_RE.fullmatch(snapshot):
         raise ValueError("invalid PostgreSQL snapshot identifier")
     connection = await asyncpg.connect(database_url)
@@ -230,7 +455,12 @@ async def _worker(database_url: str, snapshot: str, run_id: str, timeframe: int)
         try:
             await connection.execute(f"SET TRANSACTION SNAPSHOT '{snapshot}'")
             await connection.execute("SET LOCAL max_parallel_workers_per_gather = 4")
-            await connection.execute(build_gate_sql(timeframe), uuid.UUID(run_id), timeout=None)
+            await connection.execute(
+                build_gate_sql(timeframe),
+                uuid.UUID(run_id),
+                observed_at,
+                timeout=None,
+            )
         except BaseException:
             await transaction.rollback()
             raise
@@ -245,6 +475,7 @@ async def run_gate(
     run_id: str | None = None,
     timeframes: Sequence[int] = TIMEFRAMES,
 ) -> tuple[str, dict[str, Any]]:
+    timeframes = _normalize_timeframes(timeframes)
     run_id = run_id or str(uuid.uuid4())
     run_uuid = uuid.UUID(run_id)
     setup = await asyncpg.connect(database_url)
@@ -252,26 +483,25 @@ async def run_gate(
         primary_key = await setup.fetchrow(PRIMARY_KEY_SQL)
         if not primary_key or not primary_key["convalidated"] or "(symbol_id, timeframe, ts)" not in primary_key["definition"]:
             raise RuntimeError("klines canonical primary key is absent or unvalidated")
-        await setup.execute(
-            "INSERT INTO kline_audit_runs(audit_run_id,status,apply_mode,parameters) "
-            "VALUES($1,'running',false,$2::jsonb) "
-            "ON CONFLICT (audit_run_id) DO UPDATE SET status='running',completed_at=NULL,"
-            "failure=NULL,summary='{}'::jsonb,parameters=excluded.parameters",
-            run_uuid, json.dumps({"engine": "sql_gate", "timeframes": list(timeframes)}),
-        )
+        await _claim_audit_run(setup, run_uuid)
     finally:
         await setup.close()
 
     coordinator = await asyncpg.connect(database_url)
     coordinator_tx = coordinator.transaction(isolation="repeatable_read", readonly=True)
     coordinator_open = False
+    evidence: dict[str, Any] | None = None
     try:
         await coordinator_tx.start()
         coordinator_open = True
         snapshot = await coordinator.fetchval("SELECT pg_export_snapshot()")
+        evidence = await _capture_snapshot_evidence(coordinator)
+        observed_at = datetime.fromisoformat(str(evidence["observed_at"]))
         async with asyncio.TaskGroup() as workers:
             for timeframe in timeframes:
-                workers.create_task(_worker(database_url, snapshot, run_id, timeframe))
+                workers.create_task(
+                    _worker(database_url, snapshot, run_id, timeframe, observed_at)
+                )
         await coordinator_tx.commit()
         coordinator_open = False
     except BaseException as error:
@@ -283,8 +513,12 @@ async def run_gate(
         failure = await asyncpg.connect(database_url)
         try:
             await failure.execute(
-                "UPDATE kline_audit_runs SET status='failed',completed_at=now(),failure=$2 WHERE audit_run_id=$1",
-                run_uuid, str(error),
+                "UPDATE kline_audit_runs SET status='failed',completed_at=now(),failure=$2,"
+                "parameters=coalesce($3::jsonb,parameters) "
+                "WHERE audit_run_id=$1 AND status='running'",
+                run_uuid,
+                str(error),
+                json.dumps(evidence, sort_keys=True) if evidence is not None else None,
             )
         finally:
             await failure.close()
@@ -294,11 +528,29 @@ async def run_gate(
 
     final = await asyncpg.connect(database_url)
     try:
+        if evidence is None:
+            raise InvalidAuditEvidence("audit snapshot evidence was not captured")
         status, summary = summarize(await final.fetchrow(SUMMARY_SQL, run_uuid))
-        await final.execute(
-            "UPDATE kline_audit_runs SET status=$2,completed_at=now(),summary=$3::jsonb,failure=$4 WHERE audit_run_id=$1",
-            run_uuid, status, json.dumps(summary), None if status == "completed" else "canonical SQL gate found unresolved rows",
+        summary.update({
+            "contract_version": evidence["contract_version"],
+            "observed_at": evidence["observed_at"],
+            "evidence_lsn": evidence["evidence_lsn"],
+            "evidence_sha256": evidence["evidence_sha256"],
+        })
+        command_tag = await final.execute(
+            "UPDATE kline_audit_runs SET status=$2,completed_at=now(),summary=$3::jsonb,"
+            "failure=$4,parameters=$5::jsonb "
+            "WHERE audit_run_id=$1 AND status='running'",
+            run_uuid,
+            status,
+            json.dumps(summary, sort_keys=True),
+            None if status == "completed" else "canonical SQL gate found unresolved rows",
+            json.dumps(evidence, sort_keys=True),
         )
+        if command_tag != "UPDATE 1":
+            raise AuditRunAlreadyClaimed(
+                f"canonical audit {run_id} lost its running completion fence"
+            )
         return run_id, summary
     finally:
         await final.close()
@@ -317,6 +569,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             args.audit_run_id = str(uuid.UUID(args.audit_run_id))
         except ValueError:
             parser.error("--audit-run-id must be a UUID")
+    if args.timeframe is None:
+        args.timeframe = list(TIMEFRAMES)
+    else:
+        try:
+            args.timeframe = list(_normalize_timeframes(args.timeframe))
+        except ValueError as error:
+            parser.error(str(error))
     return args
 
 
@@ -325,7 +584,7 @@ async def _main(argv: Sequence[str] | None = None) -> None:
     run_id, summary = await run_gate(
         args.database_url,
         args.audit_run_id,
-        tuple(args.timeframe) if args.timeframe else TIMEFRAMES,
+        tuple(args.timeframe),
     )
     print(json.dumps({"audit_run_id": run_id, "summary": summary}, sort_keys=True))
     if not summary["gate_pass"]:
