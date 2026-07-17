@@ -101,8 +101,10 @@ def test_migration_043_twice_and_strict_v2_insert_contract() -> None:
                 audit_run_id: object = audit_id,
                 audit_evidence_sha256: str | None = sha,
                 audit_checkpoint_sha256: str | None = sha,
+                freshness_contract_version: str | None = "module-c-authoritative-freshness-v1",
                 freshness_contract_sha256: str | None = sha,
                 catalog_generation: object = generation_id,
+                catalog_control_revision: int | None = 0,
                 catalog_manifest_sha256: str | None = sha,
                 audit_active_universe_sha256: str | None = sha,
             ) -> None:
@@ -119,7 +121,7 @@ def test_migration_043_twice_and_strict_v2_insert_contract() -> None:
                     ) values (
                         $1, $2, 'config', 'universe', 'manifest', 0, 0,
                         '{"policy":"strict-v2"}', '{}', $3, $4, $5,
-                        'module-c-authoritative-freshness-v1', $6, $7, 0, $8, $9
+                        $6, $7, $8, $9, $10, $11
                     )
                     """,
                     build_id,
@@ -127,26 +129,32 @@ def test_migration_043_twice_and_strict_v2_insert_contract() -> None:
                     audit_run_id,
                     audit_evidence_sha256,
                     audit_checkpoint_sha256,
+                    freshness_contract_version,
                     freshness_contract_sha256,
                     catalog_generation,
+                    catalog_control_revision,
                     catalog_manifest_sha256,
                     audit_active_universe_sha256,
                 )
 
-            for missing_sha in (
-                "audit_evidence_sha256",
-                "audit_checkpoint_sha256",
-                "freshness_contract_sha256",
-                "catalog_manifest_sha256",
-                "audit_active_universe_sha256",
+            for missing_field, argument in (
+                ("canonical_audit_run_id", "audit_run_id"),
+                ("audit_evidence_sha256", "audit_evidence_sha256"),
+                ("audit_checkpoint_sha256", "audit_checkpoint_sha256"),
+                ("freshness_contract_version", "freshness_contract_version"),
+                ("freshness_contract_sha256", "freshness_contract_sha256"),
+                ("catalog_generation_id", "catalog_generation"),
+                ("catalog_control_revision", "catalog_control_revision"),
+                ("catalog_manifest_sha256", "catalog_manifest_sha256"),
+                ("audit_active_universe_sha256", "audit_active_universe_sha256"),
             ):
                 missing_id = uuid4()
                 with pytest.raises(asyncpg.CheckViolationError):
                     async with conn.transaction():
                         await insert_strict(
                             missing_id,
-                            f"missing-{missing_sha}-{missing_id}",
-                            **{missing_sha: None},
+                            f"missing-{missing_field}-{missing_id}",
+                            **{argument: None},
                         )
 
             valid_id = uuid4()

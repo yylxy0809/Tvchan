@@ -29,6 +29,8 @@ def test_migration_043_adds_strict_v2_typed_provenance_idempotently() -> None:
     assert "<> 'strict-v2'" in sql
     assert sql.count("~ '^[0-9a-f]{64}$'") == 5
     assert "freshness_contract_version = 'module-c-authoritative-freshness-v1'" in sql
+    assert "freshness_contract_version is not null" in sql
+    assert "drop constraint if exists ck_module_c_eligibility_strict_v2_provenance" in sql
     for sha_column in (
         "audit_evidence_sha256",
         "audit_checkpoint_sha256",

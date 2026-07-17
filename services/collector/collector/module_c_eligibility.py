@@ -17,7 +17,13 @@ from typing import Any, Iterable, Mapping
 
 import asyncpg
 
-from collector.kline_sql_gate import _manifest_sha256
+from collector.kline_sql_gate import (
+    ACTIVE_CATALOG_GENERATION_SQL,
+    ACTIVE_CATALOG_MANIFEST_SQL,
+    ANOMALY_FIELDS,
+    _json_value,
+    _manifest_sha256,
+)
 
 
 TIMEFRAMES = ("5f", "30f", "1d", "1w", "1m")
@@ -122,9 +128,8 @@ def _canonical_sha256(record: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload + b"\n").hexdigest()
 
 
-def load_freshness_contract(path: Path) -> FreshnessContract:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or set(payload) != {
+def parse_freshness_contract(payload: Mapping[str, Any]) -> FreshnessContract:
+    if not isinstance(payload, Mapping) or set(payload) != {
         "contract_version",
         "as_of",
         "trading_calendar",
@@ -175,6 +180,13 @@ def load_freshness_contract(path: Path) -> FreshnessContract:
         normalized=normalized,
         sha256=_canonical_sha256(normalized),
     )
+
+
+def load_freshness_contract(path: Path) -> FreshnessContract:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("authoritative freshness contract must be a JSON object")
+    return parse_freshness_contract(payload)
 
 
 def evaluate_dispositions(
@@ -329,6 +341,76 @@ def _semantic_bound(value: Any, *, empty: bool, label: str) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+async def _verify_active_catalog(
+    connection: asyncpg.Connection,
+    symbols: list[Symbol],
+    *,
+    generation_id: uuid.UUID,
+    control_revision: int,
+    expected_scope_count: int,
+    manifest_sha256: str,
+) -> None:
+    generation = await connection.fetchrow(ACTIVE_CATALOG_GENERATION_SQL)
+    if generation is None:
+        raise RuntimeError("active complete K-line scope catalog generation is missing")
+    symbol_ids = [symbol.symbol_id for symbol in symbols]
+    if (
+        uuid.UUID(str(generation["generation_id"])) != generation_id
+        or int(generation["revision"]) != control_revision
+        or int(generation["expected_scope_count"]) != expected_scope_count
+        or not set(symbol_ids).issubset({int(value) for value in generation["symbol_ids"]})
+        or not set(TIMEFRAME_CODES.values()).issubset(
+            {int(value) for value in generation["timeframes"]}
+        )
+    ):
+        raise RuntimeError("active K-line scope catalog no longer matches audit evidence")
+    catalog_rows = await connection.fetch(
+        ACTIVE_CATALOG_MANIFEST_SQL,
+        generation_id,
+        symbol_ids,
+        list(TIMEFRAME_CODES.values()),
+    )
+    catalog: list[dict[str, Any]] = []
+    for row in catalog_rows:
+        state = str(row["state"])
+        min_ts = row["min_ts"]
+        max_ts = row["max_ts"]
+        if not bool(row["bounds_complete"]) or not (
+            (state == "empty" and min_ts is None and max_ts is None)
+            or (
+                state == "present"
+                and min_ts is not None
+                and max_ts is not None
+                and min_ts <= max_ts
+            )
+        ):
+            raise RuntimeError("active K-line scope catalog contains invalid evidence")
+        catalog.append({
+            "symbol_id": int(row["symbol_id"]),
+            "timeframe": int(row["timeframe"]),
+            "state": state,
+            "bounds_complete": True,
+            "min_ts": _json_value(min_ts),
+            "max_ts": _json_value(max_ts),
+            "updated_at": _json_value(row["updated_at"]),
+        })
+    expected_keys = {
+        (symbol_id, timeframe)
+        for symbol_id in symbol_ids
+        for timeframe in TIMEFRAME_CODES.values()
+    }
+    observed_keys = {
+        (record["symbol_id"], record["timeframe"])
+        for record in catalog
+    }
+    if (
+        len(catalog) != len(expected_keys)
+        or observed_keys != expected_keys
+        or _manifest_sha256(catalog) != manifest_sha256
+    ):
+        raise RuntimeError("active K-line scope catalog manifest does not match audit evidence")
+
+
 async def _load_strict_inputs(
     connection: asyncpg.Connection,
     audit_run_id: str,
@@ -392,10 +474,18 @@ async def _load_strict_inputs(
     ]
     if len(symbols) != active_count or _manifest_sha256(universe_manifest) != active_sha256:
         raise RuntimeError("active universe does not match canonical audit evidence")
+    await _verify_active_catalog(
+        connection,
+        symbols,
+        generation_id=catalog_generation_id,
+        control_revision=catalog_control_revision,
+        expected_scope_count=catalog_expected,
+        manifest_sha256=catalog_sha256,
+    )
 
     checkpoint_rows = await connection.fetch(
         "SELECT symbol_id,timeframe,status,shard_start,shard_end,rows_scanned,"
-        "metadata->>'disposition' AS disposition FROM kline_audit_checkpoints "
+        "metadata FROM kline_audit_checkpoints "
         "WHERE audit_run_id=$1::uuid ORDER BY symbol_id,timeframe,shard_start,shard_end",
         audit_run_id,
     )
@@ -409,6 +499,8 @@ async def _load_strict_inputs(
     canonical_dispositions: dict[tuple[int, str], str] = {}
     freshness_reasons: dict[tuple[int, str], str] = {}
     checkpoint_manifest: list[dict[str, Any]] = []
+    anomaly_aggregates = Counter({field: 0 for field in ANOMALY_FIELDS})
+    rows_scanned_total = 0
     for row in checkpoint_rows:
         symbol_id = int(row["symbol_id"])
         timeframe_code = int(row["timeframe"])
@@ -419,12 +511,25 @@ async def _load_strict_inputs(
         if row["status"] != "completed" or timeframe_code not in CODE_TO_TIMEFRAME:
             raise RuntimeError("canonical audit checkpoint is not completed")
         timeframe = CODE_TO_TIMEFRAME[timeframe_code]
-        disposition = str(row["disposition"] or "")
-        if disposition not in {"eligible", "unresolved"}:
-            raise RuntimeError("canonical audit checkpoint disposition is invalid")
+        metadata = _json_object(row["metadata"])
+        anomalies: dict[str, int] = {}
+        for field in ANOMALY_FIELDS:
+            value = metadata.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(
+                    f"canonical audit checkpoint {field} is not a non-negative integer"
+                )
+            anomalies[field] = value
+            anomaly_aggregates[field] += value
+        anomaly_total = sum(anomalies.values())
+        disposition = str(metadata.get("disposition") or "")
+        expected_disposition = "eligible" if anomaly_total == 0 else "unresolved"
+        if disposition != expected_disposition:
+            raise RuntimeError("canonical audit checkpoint disposition is inconsistent")
         rows_scanned = int(row["rows_scanned"])
         if rows_scanned < 0:
             raise RuntimeError("canonical audit checkpoint rows_scanned is negative")
+        rows_scanned_total += rows_scanned
         empty = rows_scanned == 0
         shard_start = _semantic_bound(row["shard_start"], empty=empty, label="shard_start")
         shard_end = _semantic_bound(row["shard_end"], empty=empty, label="shard_end")
@@ -450,20 +555,43 @@ async def _load_strict_inputs(
             "actual_shard_start": _utc_text(shard_start) if shard_start else None,
             "actual_shard_end": _utc_text(shard_end) if shard_end else None,
             "disposition": disposition,
+            "anomaly_total": anomaly_total,
+            **anomalies,
         })
     if observed_keys != expected_keys or len(checkpoint_rows) != active_count * len(TIMEFRAMES):
         raise RuntimeError("canonical audit lacks an exact five-level checkpoint set")
     if int(summary.get("checkpoints") or 0) != len(checkpoint_rows):
         raise RuntimeError("canonical audit summary checkpoint count is inconsistent")
     disposition_counts = Counter(canonical_dispositions.values())
-    summary_eligible = int(summary.get("eligible") or 0)
-    summary_unresolved = int(summary.get("unresolved") or 0)
+    def summary_integer(field: str) -> int:
+        value = summary[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(field)
+        return value
+
+    try:
+        summary_checkpoints = summary_integer("checkpoints")
+        summary_rows_scanned = summary_integer("rows_scanned")
+        summary_eligible = summary_integer("eligible")
+        summary_unresolved = summary_integer("unresolved")
+        summary_anomalies = {
+            field: summary_integer(field) for field in ANOMALY_FIELDS
+        }
+        summary_anomaly_total = summary_integer("anomaly_total")
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("canonical audit summary is incomplete") from error
     if (
-        summary_eligible != disposition_counts["eligible"]
+        summary_checkpoints != len(checkpoint_rows)
+        or summary_rows_scanned != rows_scanned_total
+        or summary_eligible != disposition_counts["eligible"]
         or summary_unresolved != disposition_counts["unresolved"]
         or summary_eligible + summary_unresolved != len(checkpoint_rows)
+        or summary_anomalies != dict(anomaly_aggregates)
+        or summary_anomaly_total != sum(anomaly_aggregates.values())
+        or not isinstance(summary.get("gate_pass"), bool)
+        or summary["gate_pass"] is not (summary_anomaly_total == 0)
     ):
-        raise RuntimeError("canonical audit summary disposition counts are inconsistent")
+        raise RuntimeError("canonical audit summary aggregates are inconsistent")
 
     return StrictInputs(
         symbols=symbols,
@@ -577,7 +705,7 @@ async def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                     ) for row in rows],
                     columns=("build_id", "symbol_id", "symbol", "timeframe", "eligible", "reasons", "covered_until", "unresolved_rows"),
                 )
-        _write_outputs(args.output_dir, rows, metadata)
+            _write_outputs(args.output_dir, rows, metadata)
         return metadata
     finally:
         await connection.close()

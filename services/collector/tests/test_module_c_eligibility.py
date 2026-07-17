@@ -18,7 +18,9 @@ from collector.module_c_eligibility import (
     build_summary,
     evaluate_dispositions,
     load_freshness_contract,
+    parse_freshness_contract,
 )
+from collector.kline_sql_gate import ANOMALY_FIELDS, _json_value, _manifest_sha256
 
 
 NOW = datetime(2026, 7, 3, 7, tzinfo=timezone.utc)
@@ -135,6 +137,21 @@ def test_freshness_contract_rejects_naive_timestamps(tmp_path) -> None:
         load_freshness_contract(path)
 
 
+def test_freshness_mapping_validator_rejects_non_exact_contract() -> None:
+    payload = {
+        "contract_version": FRESHNESS_CONTRACT_VERSION,
+        "as_of": "2026-07-03T07:00:00+00:00",
+        "trading_calendar": {"id": "calendar", "sha256": "a" * 64},
+        "expected_closed_watermarks": {
+            timeframe: "2026-07-03T07:00:00+00:00"
+            for timeframe in ("5f", "30f", "1d", "1w", "1m")
+        },
+        "unexpected": True,
+    }
+    with pytest.raises(ValueError, match="exact schema"):
+        parse_freshness_contract(payload)
+
+
 class StrictInputConnection:
     observed_at = datetime(2026, 7, 3, 8, tzinfo=timezone.utc)
     checkpoint_end = NOW
@@ -144,13 +161,52 @@ class StrictInputConnection:
         self.checkpoint_count = checkpoint_count
         self.evidence_complete = evidence_complete
         self.transaction_isolations: list[str | None] = []
+        self.transaction_failed = False
         self.executed: list[str] = []
         self.copied = 0
+        self.catalog_revision = 7
+        self.catalog_manifest_sha256_override: str | None = None
+        self.catalog_updated_at = datetime(2026, 7, 3, 7, tzinfo=timezone.utc)
+        self.checkpoint_metadata_overrides: dict[str, object] = {}
+        self.checkpoint_metadata_by_timeframe: dict[int, dict[str, object]] = {}
+        self.summary_overrides: dict[str, object] = {}
+
+    def catalog_rows(self):
+        return [
+            {
+                "symbol_id": 1,
+                "timeframe": timeframe,
+                "state": "present",
+                "bounds_complete": True,
+                "min_ts": datetime(2020, 1, 1, tzinfo=timezone.utc),
+                "max_ts": self.checkpoint_end,
+                "updated_at": self.catalog_updated_at,
+            }
+            for timeframe in (5, 30, 1440, 10080, 43200)
+        ]
+
+    def catalog_manifest_sha256(self) -> str:
+        return _manifest_sha256([
+            {
+                "symbol_id": row["symbol_id"],
+                "timeframe": row["timeframe"],
+                "state": row["state"],
+                "bounds_complete": True,
+                "min_ts": _json_value(row["min_ts"]),
+                "max_ts": _json_value(row["max_ts"]),
+                "updated_at": _json_value(row["updated_at"]),
+            }
+            for row in self.catalog_rows()
+        ])
 
     @asynccontextmanager
     async def transaction(self, *, isolation=None):
         self.transaction_isolations.append(isolation)
-        yield
+        try:
+            yield
+        except Exception:
+            self.transaction_failed = True
+            raise
 
     async def execute(self, sql: str, *_args):
         self.executed.append(" ".join(sql.lower().split()))
@@ -164,6 +220,15 @@ class StrictInputConnection:
 
     async def fetchrow(self, sql: str, *_args):
         normalized = " ".join(sql.lower().split())
+        if "from kline_scope_catalog_control control" in normalized:
+            return {
+                "generation_id": self.generation_id,
+                "revision": self.catalog_revision,
+                "status": "complete",
+                "expected_scope_count": 5,
+                "symbol_ids": [1],
+                "timeframes": [5, 30, 1440, 10080, 43200],
+            }
         if "from kline_audit_runs" in normalized:
             parameters = {
                 "contract_version": "module-c-strict-audit-v2",
@@ -174,14 +239,18 @@ class StrictInputConnection:
                 "observed_wal_lsn": "0/16B6C50",
                 "transaction_snapshot": "100:100:",
                 "active_universe_count": 1,
-                "active_universe_sha256": "producer-hash",
+                "active_universe_sha256": _manifest_sha256([
+                    {"symbol_id": 1, "symbol": "600000.SH"}
+                ]),
                 "catalog_generation_id": str(self.generation_id),
                 "catalog_control_revision": 7,
                 "catalog_expected_scope_count": 5,
                 "catalog_required_scope_count": 5,
-                "catalog_manifest_sha256": "c" * 64,
+                "catalog_manifest_sha256": (
+                    self.catalog_manifest_sha256_override
+                    or self.catalog_manifest_sha256()
+                ),
             }
-            from collector.kline_sql_gate import _manifest_sha256
             parameters["evidence_sha256"] = _manifest_sha256([parameters])
             summary = {
                 "contract_version": "module-c-strict-audit-v2",
@@ -189,8 +258,13 @@ class StrictInputConnection:
                 "evidence_sha256": parameters["evidence_sha256"],
                 "evidence_complete": self.evidence_complete,
                 "checkpoints": 5,
+                "rows_scanned": 50,
                 "eligible": 5,
                 "unresolved": 0,
+                **{field: 0 for field in ANOMALY_FIELDS},
+                "anomaly_total": 0,
+                "gate_pass": True,
+                **self.summary_overrides,
             }
             return {
                 "status": "completed",
@@ -204,6 +278,8 @@ class StrictInputConnection:
         normalized = " ".join(sql.lower().split())
         if "from symbols" in normalized:
             return [{"symbol_id": 1, "code": "600000", "exchange": "SH"}]
+        if "from kline_scope_catalog" in normalized:
+            return self.catalog_rows()
         if "from kline_audit_checkpoints" in normalized:
             return [
                 {
@@ -213,7 +289,12 @@ class StrictInputConnection:
                     "shard_start": datetime(2020, 1, 1, tzinfo=timezone.utc),
                     "shard_end": self.checkpoint_end,
                     "rows_scanned": 10,
-                    "disposition": "eligible",
+                    "metadata": {
+                        **{field: 0 for field in ANOMALY_FIELDS},
+                        "disposition": "eligible",
+                        **self.checkpoint_metadata_overrides,
+                        **self.checkpoint_metadata_by_timeframe.get(timeframe, {}),
+                    },
                 }
                 for timeframe in (5, 30, 1440, 10080, 43200)[: self.checkpoint_count]
             ]
@@ -238,7 +319,8 @@ def _freshness_fixture(tmp_path: Path) -> Path:
 
 
 def _bind_producer_hash(row, producer_hash: str):
-    from collector.kline_sql_gate import _manifest_sha256
+    if "parameters" not in row:
+        return row
 
     parameters = row["parameters"]
     parameters["active_universe_sha256"] = producer_hash
@@ -362,12 +444,86 @@ def test_strict_input_rejects_summary_disposition_count_mismatch(
 
     async def fetchrow(sql: str, *args):
         row = _bind_producer_hash(await original(sql, *args), producer_hash)
-        row["summary"]["eligible"] = 4
-        row["summary"]["unresolved"] = 1
+        if "summary" in row:
+            row["summary"]["eligible"] = 4
+            row["summary"]["unresolved"] = 1
         return row
 
     monkeypatch.setattr(connection, "fetchrow", fetchrow)
-    with pytest.raises(RuntimeError, match="summary disposition counts"):
+    with pytest.raises(RuntimeError, match="summary aggregates"):
+        asyncio.run(_load_strict_inputs(connection, str(UUID(int=1)), freshness))
+
+
+@pytest.mark.parametrize("field", ANOMALY_FIELDS)
+def test_strict_input_requires_every_checkpoint_anomaly_field(field, tmp_path) -> None:
+    freshness = load_freshness_contract(_freshness_fixture(tmp_path))
+    connection = StrictInputConnection()
+    connection.checkpoint_metadata_overrides[field] = None
+
+    with pytest.raises(RuntimeError, match=field):
+        asyncio.run(_load_strict_inputs(connection, str(UUID(int=1)), freshness))
+
+
+@pytest.mark.parametrize("field", ["rows_scanned", *ANOMALY_FIELDS, "anomaly_total"])
+def test_strict_input_rejects_each_tampered_summary_aggregate(field, tmp_path) -> None:
+    freshness = load_freshness_contract(_freshness_fixture(tmp_path))
+    connection = StrictInputConnection()
+    connection.summary_overrides[field] = 1
+
+    with pytest.raises(RuntimeError, match="summary aggregates"):
+        asyncio.run(_load_strict_inputs(connection, str(UUID(int=1)), freshness))
+
+
+def test_strict_input_rejects_active_catalog_revision_or_manifest_drift(tmp_path) -> None:
+    freshness = load_freshness_contract(_freshness_fixture(tmp_path))
+    revision_drift = StrictInputConnection()
+    revision_drift.catalog_revision = 8
+    with pytest.raises(RuntimeError, match="catalog no longer matches"):
+        asyncio.run(_load_strict_inputs(revision_drift, str(UUID(int=1)), freshness))
+
+    manifest_drift = StrictInputConnection()
+    manifest_drift.catalog_manifest_sha256_override = "0" * 64
+    with pytest.raises(RuntimeError, match="manifest does not match"):
+        asyncio.run(_load_strict_inputs(manifest_drift, str(UUID(int=1)), freshness))
+
+
+def test_strict_input_accepts_consistent_unresolved_checkpoint_and_excludes_scope(
+    tmp_path,
+) -> None:
+    freshness = load_freshness_contract(_freshness_fixture(tmp_path))
+    connection = StrictInputConnection()
+    connection.checkpoint_metadata_by_timeframe[5] = {
+        "invalid_ohlc": 1,
+        "disposition": "unresolved",
+    }
+    connection.summary_overrides.update({
+        "invalid_ohlc": 1,
+        "anomaly_total": 1,
+        "eligible": 4,
+        "unresolved": 1,
+        "gate_pass": False,
+    })
+
+    strict = asyncio.run(_load_strict_inputs(connection, str(UUID(int=1)), freshness))
+    rows = evaluate_dispositions(
+        strict.symbols,
+        strict.coverage,
+        {},
+        {},
+        strict.canonical_dispositions,
+        strict.freshness_reasons,
+    )
+    five_minute = next(row for row in rows if row.timeframe == "5f")
+    assert five_minute.eligible is False
+    assert "canonical_gate_unresolved" in five_minute.reasons
+
+
+def test_strict_input_rejects_gate_pass_inconsistent_with_anomaly_total(tmp_path) -> None:
+    freshness = load_freshness_contract(_freshness_fixture(tmp_path))
+    connection = StrictInputConnection()
+    connection.summary_overrides["gate_pass"] = False
+
+    with pytest.raises(RuntimeError, match="summary aggregates"):
         asyncio.run(_load_strict_inputs(connection, str(UUID(int=1)), freshness))
 
 
@@ -405,6 +561,36 @@ def test_dry_run_performs_full_validation_inside_repeatable_read(
     assert connection.transaction_isolations == ["repeatable_read"]
     assert connection.executed == []
     assert connection.copied == 0
+
+
+def test_output_failure_rolls_back_non_dry_build(tmp_path, monkeypatch) -> None:
+    connection = StrictInputConnection()
+
+    async def connect(_database_url: str):
+        return connection
+
+    def fail_outputs(*_args):
+        raise OSError("output unavailable")
+
+    monkeypatch.setattr("collector.module_c_eligibility.asyncpg.connect", connect)
+    monkeypatch.setattr("collector.module_c_eligibility._write_outputs", fail_outputs)
+    args = Namespace(
+        database_url="postgresql://audit",
+        manifest_version="strict-v2-test",
+        config_hash="config",
+        build_id=str(UUID(int=2)),
+        audit_run_id=str(UUID(int=1)),
+        freshness_contract=_freshness_fixture(tmp_path),
+        output_dir=tmp_path / "outputs",
+        dry_run=False,
+    )
+
+    with pytest.raises(OSError, match="output unavailable"):
+        asyncio.run(build_manifest(args))
+
+    assert connection.transaction_failed is True
+    assert len(connection.executed) == 1
+    assert connection.copied == 1
 
 
 def test_non_dry_build_requires_explicit_audit_and_freshness_before_connect(tmp_path) -> None:

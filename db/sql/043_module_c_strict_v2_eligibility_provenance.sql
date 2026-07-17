@@ -43,35 +43,31 @@ begin
             on delete restrict;
     end if;
 
-    if not exists (
-        select 1
-          from pg_constraint
-         where conrelid = 'module_c_eligibility_builds'::regclass
-           and conname = 'ck_module_c_eligibility_strict_v2_provenance'
-    ) then
-        alter table module_c_eligibility_builds
-            add constraint ck_module_c_eligibility_strict_v2_provenance
-            check (
-                coalesce(parameters ->> 'policy', '') <> 'strict-v2'
-                or (
-                    canonical_audit_run_id is not null
-                    and audit_evidence_sha256 is not null
-                    and audit_evidence_sha256 ~ '^[0-9a-f]{64}$'
-                    and audit_checkpoint_sha256 is not null
-                    and audit_checkpoint_sha256 ~ '^[0-9a-f]{64}$'
-                    and freshness_contract_version = 'module-c-authoritative-freshness-v1'
-                    and freshness_contract_sha256 is not null
-                    and freshness_contract_sha256 ~ '^[0-9a-f]{64}$'
-                    and catalog_generation_id is not null
-                    and catalog_control_revision is not null
-                    and catalog_control_revision >= 0
-                    and catalog_manifest_sha256 is not null
-                    and catalog_manifest_sha256 ~ '^[0-9a-f]{64}$'
-                    and audit_active_universe_sha256 is not null
-                    and audit_active_universe_sha256 ~ '^[0-9a-f]{64}$'
-                )
-            );
-    end if;
+    alter table module_c_eligibility_builds
+        drop constraint if exists ck_module_c_eligibility_strict_v2_provenance;
+    alter table module_c_eligibility_builds
+        add constraint ck_module_c_eligibility_strict_v2_provenance
+        check (
+            coalesce(parameters ->> 'policy', '') <> 'strict-v2'
+            or (
+                canonical_audit_run_id is not null
+                and audit_evidence_sha256 is not null
+                and audit_evidence_sha256 ~ '^[0-9a-f]{64}$'
+                and audit_checkpoint_sha256 is not null
+                and audit_checkpoint_sha256 ~ '^[0-9a-f]{64}$'
+                and freshness_contract_version is not null
+                and freshness_contract_version = 'module-c-authoritative-freshness-v1'
+                and freshness_contract_sha256 is not null
+                and freshness_contract_sha256 ~ '^[0-9a-f]{64}$'
+                and catalog_generation_id is not null
+                and catalog_control_revision is not null
+                and catalog_control_revision >= 0
+                and catalog_manifest_sha256 is not null
+                and catalog_manifest_sha256 ~ '^[0-9a-f]{64}$'
+                and audit_active_universe_sha256 is not null
+                and audit_active_universe_sha256 ~ '^[0-9a-f]{64}$'
+            )
+        );
 end
 $$;
 

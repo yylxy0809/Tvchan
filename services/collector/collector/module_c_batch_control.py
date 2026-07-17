@@ -20,10 +20,10 @@ from collector.module_c_eligibility import (
     Disposition,
     FRESHNESS_CONTRACT_VERSION,
     _SHA256_RE,
-    _canonical_sha256,
     _stable_hash,
     _write_outputs,
     build_summary,
+    parse_freshness_contract,
 )
 from trading_protocol import MODULE_C_CONFIG_HASH
 
@@ -95,6 +95,12 @@ def _strict_v2_provenance(
             "Strict-v2 eligibility provenance is incomplete or inconsistent"
         ) from error
     freshness_contract = source_parameters.get("freshness_contract")
+    try:
+        validated_freshness = parse_freshness_contract(freshness_contract)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Strict-v2 eligibility provenance is incomplete or inconsistent"
+        ) from error
     if (
         source_parameters.get("policy") != "strict-v2"
         or provenance != parameter_provenance
@@ -109,10 +115,7 @@ def _strict_v2_provenance(
             )
         )
         or provenance["freshness_contract_version"] != FRESHNESS_CONTRACT_VERSION
-        or not isinstance(freshness_contract, Mapping)
-        or freshness_contract.get("contract_version") != FRESHNESS_CONTRACT_VERSION
-        or _canonical_sha256(dict(freshness_contract))
-        != provenance["freshness_contract_sha256"]
+        or validated_freshness.sha256 != provenance["freshness_contract_sha256"]
     ):
         raise RuntimeError("Strict-v2 eligibility provenance is incomplete or inconsistent")
     parameters = {
@@ -120,7 +123,7 @@ def _strict_v2_provenance(
         "canonical_audit_run_id": str(provenance["canonical_audit_run_id"]),
         "audit_evidence_sha256": str(provenance["audit_evidence_sha256"]),
         "audit_checkpoint_sha256": str(provenance["audit_checkpoint_sha256"]),
-        "freshness_contract": dict(freshness_contract),
+        "freshness_contract": validated_freshness.normalized,
         "freshness_contract_version": str(provenance["freshness_contract_version"]),
         "freshness_contract_sha256": str(provenance["freshness_contract_sha256"]),
         "catalog_generation_id": str(provenance["catalog_generation_id"]),
@@ -176,7 +179,11 @@ def load_selection(path: Path) -> tuple[tuple[str, ...], str, dict[str, Any]]:
 
 
 async def validate_strict_build(
-    conn: asyncpg.Connection, build: Mapping[str, Any], *, build_id: str
+    conn: asyncpg.Connection,
+    build: Mapping[str, Any],
+    *,
+    build_id: str,
+    require_v2: bool = False,
 ) -> None:
     parameters = _json_object(build["parameters"])
     policy = parameters.get("policy")
@@ -185,7 +192,11 @@ async def validate_strict_build(
         audit_run_id = provenance["canonical_audit_run_id"]
     else:
         audit_run_id = parameters.get("canonical_audit_run_id")
-    if policy not in {"strict-v1", "strict-v2"} or not audit_run_id:
+    if (
+        policy not in {"strict-v1", "strict-v2"}
+        or (require_v2 and policy != "strict-v2")
+        or not audit_run_id
+    ):
         raise RuntimeError("Eligibility build is not bound to a completed strict canonical audit")
     audit_status = await conn.fetchval(
         "select status from kline_audit_runs where audit_run_id=$1::uuid", audit_run_id
@@ -285,7 +296,9 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
             raise RuntimeError(f"Unknown source eligibility build: {args.source_build_id}")
         if str(source["config_hash"]) != MODULE_C_CONFIG_HASH:
             raise RuntimeError("Source eligibility config_hash is not the production Module C contract")
-        await validate_strict_build(conn, source, build_id=args.source_build_id)
+        await validate_strict_build(
+            conn, source, build_id=args.source_build_id, require_v2=True
+        )
         source_provenance, copied_parameters = _strict_v2_provenance(source)
         source_rows = int(await conn.fetchval(
             "select count(*) from module_c_eligibility where build_id=$1::uuid",
@@ -423,21 +436,23 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         ))
         if persisted != 100:
             raise RuntimeError(f"Canary eligibility rows are incomplete: {persisted}/100")
-    metadata = {
-        "build_id": str(build_id),
-        "manifest_version": args.manifest_version,
-        "config_hash": MODULE_C_CONFIG_HASH,
-        "active_universe_hash": active_hash,
-        "manifest_hash": manifest_hash,
-        "active_symbols": 20,
-        **source_provenance,
-        "excluded_summary": {
-            "excluded_scopes": sum(not row.eligible for row in dispositions),
-            "reasons": dict(sorted(Counter(reason for row in dispositions for reason in row.reasons).items())),
-        },
-        **summary,
-    }
-    _write_outputs(args.output_dir, dispositions, metadata)
+        metadata = {
+            "build_id": str(build_id),
+            "manifest_version": args.manifest_version,
+            "config_hash": MODULE_C_CONFIG_HASH,
+            "active_universe_hash": active_hash,
+            "manifest_hash": manifest_hash,
+            "active_symbols": 20,
+            **source_provenance,
+            "excluded_summary": {
+                "excluded_scopes": sum(not row.eligible for row in dispositions),
+                "reasons": dict(sorted(Counter(
+                    reason for row in dispositions for reason in row.reasons
+                ).items())),
+            },
+            **summary,
+        }
+        _write_outputs(args.output_dir, dispositions, metadata)
     return metadata
 
 
@@ -480,7 +495,9 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         )
         if build is None or str(build["config_hash"]) != MODULE_C_CONFIG_HASH:
             raise RuntimeError("Eligibility build is missing or has the wrong config_hash")
-        await validate_strict_build(conn, build, build_id=args.eligibility_build_id)
+        await validate_strict_build(
+            conn, build, build_id=args.eligibility_build_id, require_v2=True
+        )
         rows = int(await conn.fetchval(
             "select count(*) from module_c_eligibility where build_id=$1::uuid",
             args.eligibility_build_id,
