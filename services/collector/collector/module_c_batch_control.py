@@ -18,6 +18,9 @@ from collector.module_c_execution_report import HEAD_COVERAGE_SQL
 from collector.module_c_eligibility import (
     CODE_TO_TIMEFRAME,
     Disposition,
+    FRESHNESS_CONTRACT_VERSION,
+    _SHA256_RE,
+    _canonical_sha256,
     _stable_hash,
     _write_outputs,
     build_summary,
@@ -30,6 +33,17 @@ LEVEL_NAMES = tuple(CODE_TO_TIMEFRAME[level] for level in LEVELS)
 REQUIRED_CANARY_TRAITS = frozenset(
     {"main_board", "chinext", "star", "bj", "suspended_or_sparse", "gap", "price_limit", "long_history"}
 )
+STRICT_V2_PROVENANCE_FIELDS = (
+    "canonical_audit_run_id",
+    "audit_evidence_sha256",
+    "audit_checkpoint_sha256",
+    "freshness_contract_version",
+    "freshness_contract_sha256",
+    "catalog_generation_id",
+    "catalog_control_revision",
+    "catalog_manifest_sha256",
+    "audit_active_universe_sha256",
+)
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -39,6 +53,84 @@ def _json_object(value: Any) -> dict[str, Any]:
         decoded = json.loads(value)
         return dict(decoded) if isinstance(decoded, Mapping) else {}
     return {}
+
+
+def _strict_v2_provenance(
+    source: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    source_parameters = _json_object(source["parameters"])
+    try:
+        provenance = {
+            "canonical_audit_run_id": str(uuid.UUID(str(source["canonical_audit_run_id"]))),
+            "audit_evidence_sha256": str(source["audit_evidence_sha256"]),
+            "audit_checkpoint_sha256": str(source["audit_checkpoint_sha256"]),
+            "freshness_contract_version": str(source["freshness_contract_version"]),
+            "freshness_contract_sha256": str(source["freshness_contract_sha256"]),
+            "catalog_generation_id": str(uuid.UUID(str(source["catalog_generation_id"]))),
+            "catalog_control_revision": int(source["catalog_control_revision"]),
+            "catalog_manifest_sha256": str(source["catalog_manifest_sha256"]),
+            "audit_active_universe_sha256": str(source["audit_active_universe_sha256"]),
+        }
+        parameter_provenance = {
+            "canonical_audit_run_id": str(
+                uuid.UUID(str(source_parameters["canonical_audit_run_id"]))
+            ),
+            "audit_evidence_sha256": str(source_parameters["audit_evidence_sha256"]),
+            "audit_checkpoint_sha256": str(source_parameters["audit_checkpoint_sha256"]),
+            "freshness_contract_version": str(
+                source_parameters["freshness_contract_version"]
+            ),
+            "freshness_contract_sha256": str(source_parameters["freshness_contract_sha256"]),
+            "catalog_generation_id": str(
+                uuid.UUID(str(source_parameters["catalog_generation_id"]))
+            ),
+            "catalog_control_revision": int(source_parameters["catalog_control_revision"]),
+            "catalog_manifest_sha256": str(source_parameters["catalog_manifest_sha256"]),
+            "audit_active_universe_sha256": str(
+                source_parameters["audit_active_universe_sha256"]
+            ),
+        }
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise RuntimeError(
+            "Strict-v2 eligibility provenance is incomplete or inconsistent"
+        ) from error
+    freshness_contract = source_parameters.get("freshness_contract")
+    if (
+        source_parameters.get("policy") != "strict-v2"
+        or provenance != parameter_provenance
+        or any(
+            not _SHA256_RE.fullmatch(provenance[field])
+            for field in (
+                "audit_evidence_sha256",
+                "audit_checkpoint_sha256",
+                "freshness_contract_sha256",
+                "catalog_manifest_sha256",
+                "audit_active_universe_sha256",
+            )
+        )
+        or provenance["freshness_contract_version"] != FRESHNESS_CONTRACT_VERSION
+        or not isinstance(freshness_contract, Mapping)
+        or freshness_contract.get("contract_version") != FRESHNESS_CONTRACT_VERSION
+        or _canonical_sha256(dict(freshness_contract))
+        != provenance["freshness_contract_sha256"]
+    ):
+        raise RuntimeError("Strict-v2 eligibility provenance is incomplete or inconsistent")
+    parameters = {
+        "policy": "strict-v2",
+        "canonical_audit_run_id": str(provenance["canonical_audit_run_id"]),
+        "audit_evidence_sha256": str(provenance["audit_evidence_sha256"]),
+        "audit_checkpoint_sha256": str(provenance["audit_checkpoint_sha256"]),
+        "freshness_contract": dict(freshness_contract),
+        "freshness_contract_version": str(provenance["freshness_contract_version"]),
+        "freshness_contract_sha256": str(provenance["freshness_contract_sha256"]),
+        "catalog_generation_id": str(provenance["catalog_generation_id"]),
+        "catalog_control_revision": int(provenance["catalog_control_revision"]),
+        "catalog_manifest_sha256": str(provenance["catalog_manifest_sha256"]),
+        "audit_active_universe_sha256": str(
+            provenance["audit_active_universe_sha256"]
+        ),
+    }
+    return provenance, parameters
 
 
 def load_selection(path: Path) -> tuple[tuple[str, ...], str, dict[str, Any]]:
@@ -87,8 +179,13 @@ async def validate_strict_build(
     conn: asyncpg.Connection, build: Mapping[str, Any], *, build_id: str
 ) -> None:
     parameters = _json_object(build["parameters"])
-    audit_run_id = parameters.get("canonical_audit_run_id")
-    if parameters.get("policy") != "strict-v1" or not audit_run_id:
+    policy = parameters.get("policy")
+    if policy == "strict-v2":
+        provenance, _copied_parameters = _strict_v2_provenance(build)
+        audit_run_id = provenance["canonical_audit_run_id"]
+    else:
+        audit_run_id = parameters.get("canonical_audit_run_id")
+    if policy not in {"strict-v1", "strict-v2"} or not audit_run_id:
         raise RuntimeError("Eligibility build is not bound to a completed strict canonical audit")
     audit_status = await conn.fetchval(
         "select status from kline_audit_runs where audit_run_id=$1::uuid", audit_run_id
@@ -173,7 +270,11 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         source = await conn.fetchrow(
             """
             select build_id::text, config_hash, active_symbols, disposition_rows,
-                   parameters, summary
+                   parameters, summary, canonical_audit_run_id::text,
+                   audit_evidence_sha256, audit_checkpoint_sha256,
+                   freshness_contract_version, freshness_contract_sha256,
+                   catalog_generation_id::text, catalog_control_revision,
+                   catalog_manifest_sha256, audit_active_universe_sha256
               from module_c_eligibility_builds
              where build_id=$1::uuid
              for share
@@ -185,6 +286,7 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         if str(source["config_hash"]) != MODULE_C_CONFIG_HASH:
             raise RuntimeError("Source eligibility config_hash is not the production Module C contract")
         await validate_strict_build(conn, source, build_id=args.source_build_id)
+        source_provenance, copied_parameters = _strict_v2_provenance(source)
         source_rows = int(await conn.fetchval(
             "select count(*) from module_c_eligibility where build_id=$1::uuid",
             args.source_build_id,
@@ -231,12 +333,9 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         build_id = uuid.UUID(args.build_id) if args.build_id else uuid.uuid4()
         summary = build_summary(dispositions)
         parameters = {
-            "policy": "strict-v1",
+            **copied_parameters,
             "scope": "canary",
             "source_build_id": args.source_build_id,
-            "canonical_audit_run_id": _json_object(source["parameters"]).get(
-                "canonical_audit_run_id"
-            ),
             "selection_contract_version": selection["contract_version"],
             "selection_manifest_sha256": selection_sha,
             "selection_traits": sorted(
@@ -247,8 +346,12 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
             """
             insert into module_c_eligibility_builds (
                 build_id, manifest_version, config_hash, active_universe_hash,
-                manifest_hash, active_symbols, disposition_rows, parameters, summary
-            ) values ($1,$2,$3,$4,$5,20,100,$6::jsonb,$7::jsonb)
+                manifest_hash, active_symbols, disposition_rows, parameters, summary,
+                canonical_audit_run_id,audit_evidence_sha256,audit_checkpoint_sha256,
+                freshness_contract_version,freshness_contract_sha256,catalog_generation_id,
+                catalog_control_revision,catalog_manifest_sha256,audit_active_universe_sha256
+            ) values ($1,$2,$3,$4,$5,20,100,$6::jsonb,$7::jsonb,$8::uuid,$9,$10,$11,$12,
+                      $13::uuid,$14,$15,$16)
             on conflict (build_id) do nothing
             """,
             build_id,
@@ -258,6 +361,15 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
             manifest_hash,
             json.dumps(parameters, sort_keys=True),
             json.dumps(summary, sort_keys=True),
+            source_provenance["canonical_audit_run_id"],
+            source_provenance["audit_evidence_sha256"],
+            source_provenance["audit_checkpoint_sha256"],
+            source_provenance["freshness_contract_version"],
+            source_provenance["freshness_contract_sha256"],
+            source_provenance["catalog_generation_id"],
+            source_provenance["catalog_control_revision"],
+            source_provenance["catalog_manifest_sha256"],
+            source_provenance["audit_active_universe_sha256"],
         )
         if inserted.endswith(" 1"):
             await conn.copy_records_to_table(
@@ -283,7 +395,12 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         existing = await conn.fetchrow(
             """
             select manifest_version, config_hash, active_universe_hash, manifest_hash,
-                   active_symbols, disposition_rows, parameters
+                   active_symbols, disposition_rows, parameters,
+                   canonical_audit_run_id::text,audit_evidence_sha256,
+                   audit_checkpoint_sha256,freshness_contract_version,
+                   freshness_contract_sha256,catalog_generation_id::text,
+                   catalog_control_revision,catalog_manifest_sha256,
+                   audit_active_universe_sha256
               from module_c_eligibility_builds where build_id=$1
             """,
             build_id,
@@ -296,6 +413,7 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
             "active_symbols": 20,
             "disposition_rows": 100,
             "parameters": parameters,
+            **source_provenance,
         }
         actual = {**dict(existing), "parameters": _json_object(existing["parameters"])}
         if actual != expected:
@@ -312,7 +430,7 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         "active_universe_hash": active_hash,
         "manifest_hash": manifest_hash,
         "active_symbols": 20,
-        "canonical_audit_run_id": _json_object(source["parameters"]).get("canonical_audit_run_id"),
+        **source_provenance,
         "excluded_summary": {
             "excluded_scopes": sum(not row.eligible for row in dispositions),
             "reasons": dict(sorted(Counter(reason for row in dispositions for reason in row.reasons).items())),
@@ -351,7 +469,11 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         build = await conn.fetchrow(
             """
             select build_id::text, config_hash, manifest_hash, active_symbols,
-                   disposition_rows, parameters
+                   disposition_rows, parameters, canonical_audit_run_id::text,
+                   audit_evidence_sha256, audit_checkpoint_sha256,
+                   freshness_contract_version, freshness_contract_sha256,
+                   catalog_generation_id::text, catalog_control_revision,
+                   catalog_manifest_sha256, audit_active_universe_sha256
               from module_c_eligibility_builds where build_id=$1::uuid for share
             """,
             args.eligibility_build_id,
