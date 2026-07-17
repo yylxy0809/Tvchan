@@ -266,12 +266,21 @@ async def validate_pristine_task_manifest(
             select symbol_id, symbol, timeframe, eligible, reasons, covered_until,
                    case when eligible then 'pending' else 'excluded' end expected_status,
                    mod((hashtextextended(symbol, 0) & 2147483647)::integer, 1024)::smallint
-                       expected_shard_bucket
-              from module_c_eligibility
-             where build_id=$2::uuid
+                       expected_shard_bucket,
+                   coalesce((
+                       select jsonb_object_agg(head.mode, head.run_id)
+                         from scheme2_chan_c_published_heads head
+                        where head.symbol_id = eligibility.symbol_id
+                          and head.chan_level = eligibility.timeframe
+                          and head.base_timeframe = eligibility.timeframe
+                          and head.status = 'published'
+                   ), '{}'::jsonb) expected_heads
+              from module_c_eligibility eligibility
+             where eligibility.build_id=$2::uuid
         ), actual as materialized (
             select symbol_id, symbol, chan_level, eligible, exclusion_reasons,
-                   target_bar_until, shard_bucket, status, attempts, lease_version,
+                   target_bar_until, shard_bucket, expected_heads, status,
+                   attempts, lease_version,
                    worker_id, claim_token, lease_until, lease_heartbeat_at,
                    run_id, bar_count, stroke_count, segment_count, center_count,
                    signal_count, last_error, started_at, finished_at
@@ -290,6 +299,7 @@ async def validate_pristine_task_manifest(
                 or actual.exclusion_reasons is distinct from expected.reasons
                 or actual.target_bar_until is distinct from expected.covered_until
                 or actual.shard_bucket is distinct from expected.expected_shard_bucket
+                or actual.expected_heads is distinct from expected.expected_heads
                 or actual.status is distinct from expected.expected_status
                 or actual.attempts <> 0 or actual.lease_version <> 0
                 or actual.worker_id is not null or actual.claim_token is not null

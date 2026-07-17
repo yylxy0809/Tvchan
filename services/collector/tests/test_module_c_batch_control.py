@@ -281,6 +281,27 @@ def test_pristine_task_manifest_rejects_missing_extra_or_drifted_rows(
     assert "actual.attempts <> 0" in connection.query
 
 
+def test_pristine_task_manifest_rejects_only_expected_heads_drift() -> None:
+    connection = _TaskManifestConnection(expected=100, tasks=100, mismatches=1)
+
+    with pytest.raises(RuntimeError, match="drifted or non-pristine"):
+        asyncio.run(
+            validate_pristine_task_manifest(
+                connection,
+                batch_id=42,
+                build_id="33333333-3333-3333-3333-333333333333",
+                disposition_rows=100,
+            )
+        )
+
+    assert "jsonb_object_agg(head.mode, head.run_id)" in connection.query
+    assert "head.status = 'published'" in connection.query
+    assert (
+        "actual.expected_heads is distinct from expected.expected_heads"
+        in connection.query
+    )
+
+
 def test_canary_strict_v2_provenance_is_copied_exactly() -> None:
     source = _strict_v2_source()
     provenance = {
