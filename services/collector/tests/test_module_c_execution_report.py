@@ -25,6 +25,8 @@ EVIDENCE_SHA = "a" * 64
 CHECKPOINT_SHA = "b" * 64
 CATALOG_SHA = "c" * 64
 UNIVERSE_SHA = "d" * 64
+MANIFEST_SHA = "e" * 64
+CONFIG_HASH = "module-c:test-config"
 FRESHNESS_CONTRACT = {
     "contract_version": "module-c-authoritative-freshness-v1",
     "as_of": "2026-07-18T00:00:00+00:00",
@@ -92,6 +94,7 @@ class Conn:
         future_leaks=0,
         strict_policy="strict-v2",
         provenance_overrides=None,
+        canonical_gate_pass=True,
     ):
         self.batch_status = batch_status
         self.task_status = task_status
@@ -103,6 +106,7 @@ class Conn:
         self.future_leaks = future_leaks
         self.strict_policy = strict_policy
         self.provenance_overrides = provenance_overrides or {}
+        self.canonical_gate_pass = canonical_gate_pass
         self.canonical_args = None
 
     async def fetchrow(self, sql, *args):
@@ -111,7 +115,9 @@ class Conn:
                 "batch_id": args[0],
                 "eligibility_build_id": "build",
                 "run_group_id": "group",
-                "config_hash": "config",
+                "config_hash": CONFIG_HASH,
+                "parent_config_hash": CONFIG_HASH,
+                "build_config_hash": CONFIG_HASH,
                 "publication_namespace": "production",
                 "profile_id": "native-five-level",
                 "shard_count": 4,
@@ -128,12 +134,12 @@ class Conn:
                 "image_digest": "sha256:test",
                 "vendor_manifest_sha256": "b" * 64,
                 "eligible_manifest_uri": "manifest.jsonl",
-                "eligible_manifest_sha256": "c" * 64,
+                "eligible_manifest_sha256": MANIFEST_SHA,
                 "input_watermark": {},
                 "audit_references": [],
                 "manifest_version": "strict-v2",
                 "active_universe_hash": "d" * 64,
-                "manifest_hash": "e" * 64,
+                "manifest_hash": MANIFEST_SHA,
                 "eligibility_parameters": _strict_parameters(policy=self.strict_policy),
                 "eligibility_summary": {},
                 "canonical_audit_run_id": AUDIT_ID,
@@ -154,7 +160,7 @@ class Conn:
                 "audit_run_id": AUDIT_ID,
                 "status": "completed",
                 "apply_mode": False,
-                "summary": {"gate_pass": True},
+                "summary": {"gate_pass": self.canonical_gate_pass},
                 "parameters": {},
             }
         if "report:official" in sql:
@@ -305,6 +311,44 @@ def test_report_fails_visible_when_frozen_column_and_parameters_drift() -> None:
     assert report["next_phase_decision"]["decision"] == "NO_GO"
 
 
+@pytest.mark.parametrize("canonical_gate_pass", [False, None])
+def test_report_fails_closed_when_pinned_canonical_gate_did_not_pass(
+    canonical_gate_pass,
+) -> None:
+    report = asyncio.run(
+        build_report(Conn(canonical_gate_pass=canonical_gate_pass), 8)
+    )
+
+    assert report["canonical_gate"]["gate_available"] is True
+    assert report["canonical_gate"]["gate_pass"] is False
+    assert report["next_phase_decision"]["decision"] == "NO_GO"
+    assert "canonical_gate_failed" in {
+        blocker["code"] for blocker in report["next_phase_decision"]["blockers"]
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides,failure_code",
+    [
+        ({"eligible_manifest_sha256": "f" * 64}, "drift"),
+        ({"eligible_manifest_sha256": None}, "unavailable"),
+        ({"parent_config_hash": "module-c:other"}, "drift"),
+        ({"build_config_hash": None}, "unavailable"),
+    ],
+)
+def test_report_fails_closed_when_batch_identity_provenance_is_invalid(
+    overrides,
+    failure_code,
+) -> None:
+    report = asyncio.run(
+        build_report(Conn(provenance_overrides=overrides), 8)
+    )
+
+    assert report["strict_v2_provenance"]["decision"] == "FAIL"
+    assert report["strict_v2_provenance"]["failure_code"] == failure_code
+    assert report["next_phase_decision"]["decision"] == "NO_GO"
+
+
 def test_canonical_gate_is_pinned_and_report_queries_never_scan_klines() -> None:
     canonical = " ".join(CANONICAL_SQL.lower().split())
     assert "where audit_run_id = $1::uuid" in canonical
@@ -323,6 +367,8 @@ def test_canonical_gate_is_pinned_and_report_queries_never_scan_klines() -> None
         "audit_active_universe_sha256",
     ):
         assert f"eligibility.{field}" in batch
+    assert "evidence.config_hash as parent_config_hash" in batch
+    assert "eligibility.config_hash as build_config_hash" in batch
     for sql in report_module.__dict__.values():
         if isinstance(sql, str) and "report:" in sql:
             assert " from klines" not in " ".join(sql.lower().split())

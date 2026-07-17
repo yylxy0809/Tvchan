@@ -33,10 +33,13 @@ select batch.batch_id, batch.eligibility_build_id::text, batch.run_group_id,
        batch.disposition_rows, batch.created_at, batch.started_at,
        batch.finished_at, batch.updated_at,
        evidence.batch_key, evidence.batch_kind, evidence.code_commit,
+       evidence.config_hash as parent_config_hash,
        evidence.image_digest, evidence.vendor_manifest_sha256,
        evidence.eligible_manifest_uri, evidence.eligible_manifest_sha256,
        evidence.input_watermark, evidence.audit_references,
-       eligibility.manifest_version, eligibility.active_universe_hash,
+       eligibility.manifest_version,
+       eligibility.config_hash as build_config_hash,
+       eligibility.active_universe_hash,
        eligibility.manifest_hash, eligibility.parameters as eligibility_parameters,
        eligibility.summary as eligibility_summary,
        eligibility.canonical_audit_run_id::text,
@@ -304,6 +307,43 @@ async def build_strict_v2_provenance(
             "Eligibility build does not declare the strict-v2 policy",
             policy=str(parameters.get("policy") or ""),
         )
+    identity = {
+        "eligible_manifest_sha256": batch.get("eligible_manifest_sha256"),
+        "eligibility_manifest_sha256": batch.get("manifest_hash"),
+        "parent_config_hash": batch.get("parent_config_hash"),
+        "child_config_hash": batch.get("config_hash"),
+        "build_config_hash": batch.get("build_config_hash"),
+    }
+    manifest_values = (
+        identity["eligible_manifest_sha256"],
+        identity["eligibility_manifest_sha256"],
+    )
+    config_values = (
+        identity["parent_config_hash"],
+        identity["child_config_hash"],
+        identity["build_config_hash"],
+    )
+    if (
+        any(
+            not isinstance(value, str) or not _SHA256_RE.fullmatch(value)
+            for value in manifest_values
+        )
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in config_values
+        )
+    ):
+        return _failed_provenance(
+            "unavailable",
+            "Strict-v2 batch manifest or config identity is incomplete",
+            observed={"batch_identity": identity},
+        )
+    if len(set(manifest_values)) != 1 or len(set(config_values)) != 1:
+        return _failed_provenance(
+            "drift",
+            "Strict-v2 batch manifest or config identity drifted",
+            observed={"batch_identity": identity},
+        )
     try:
         frozen = {
             "canonical_audit_run_id": str(
@@ -559,8 +599,15 @@ async def build_report(
         and canonical.get("apply_mode") is False
         and canonical.get("audit_run_id") == pinned_audit_run_id
     )
+    canonical_gate_pass = canonical_summary.get("gate_pass") is True
     if not canonical_ready:
         block("canonical_gate_unavailable", canonical, "Complete the read-only canonical gate and retain its audit evidence.")
+    elif not canonical_gate_pass:
+        block(
+            "canonical_gate_failed",
+            canonical,
+            "Resolve the pinned canonical audit blockers before continuing.",
+        )
 
     manifest = {
         "generated_at": generated_at,
@@ -574,7 +621,7 @@ async def build_report(
         "readonly": True,
         "audit": canonical,
         "gate_available": canonical_ready,
-        "gate_pass": bool(canonical_summary.get("gate_pass", False)),
+        "gate_pass": canonical_gate_pass,
     }
     coverage = {
         "generated_at": generated_at,
