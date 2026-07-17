@@ -35,6 +35,13 @@ def test_gate_has_five_database_side_checkpoint_workers() -> None:
         assert "select k.*" in sql
         assert "from universe" in sql
         assert "'missing_rows'" in sql
+        assert "c.generation_id=$3::uuid" in sql
+        assert "'catalog_empty_has_rows'" in sql
+        assert "'catalog_present_missing_rows'" in sql
+        assert "'catalog_present_bounds_mismatch'" in sql
+        assert "'catalog_scope_missing'" in sql
+        assert "'catalog_scope_unknown'" in sql
+        assert "'catalog_scope_incomplete'" in sql
     assert "where false" in build_gate_sql(5).lower()
     assert "having count(*) > 1" in build_gate_sql(1440).lower()
 
@@ -54,6 +61,77 @@ def test_validation_contract_is_aggregated_in_sql() -> None:
     assert "between 785 and 900" in sql
     assert "unexpected_source" in sql
     assert "source not in (2,4,9)" in sql
+
+
+def test_catalog_scope_is_cross_checked_inside_each_imported_snapshot() -> None:
+    sql = " ".join(build_gate_sql(5).lower().split())
+
+    assert "catalog_scope as materialized" in sql
+    assert "join kline_scope_catalog c" in sql
+    assert "c.generation_id=$3::uuid" in sql
+    assert "c.state='empty' and m.rows_scanned > 0" in sql
+    assert "c.state='present' and coalesce(m.rows_scanned,0)=0" in sql
+    assert "c.state='present' and coalesce(m.rows_scanned,0)>0" in sql
+    assert "c.min_ts is distinct from m.shard_start" in sql
+    assert "c.max_ts is distinct from m.shard_end" in sql
+    assert "c.symbol_id is null then 1 else 0 end::bigint as catalog_scope_missing" in sql
+    assert "c.state is distinct from 'present'" in sql
+    assert "c.state is distinct from 'empty'" in sql
+    assert "c.bounds_complete is distinct from true" in sql
+
+
+def test_worker_binds_captured_generation_to_snapshot_query(monkeypatch) -> None:
+    class Transaction:
+        async def start(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    class Connection:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, tuple[object, ...]]] = []
+
+        def transaction(self, **_kwargs: object) -> Transaction:
+            return Transaction()
+
+        async def execute(
+            self,
+            sql: str,
+            *args: object,
+            **_kwargs: object,
+        ) -> str:
+            self.executed.append((sql, args))
+            return "OK"
+
+        async def close(self) -> None:
+            return None
+
+    connection = Connection()
+
+    async def connect(_database_url: str) -> Connection:
+        return connection
+
+    monkeypatch.setattr(gate.asyncpg, "connect", connect)
+    run_id = uuid4()
+    generation_id = uuid4()
+    observed_at = datetime(2026, 7, 18, 1, 2, 3, tzinfo=timezone.utc)
+
+    asyncio.run(gate._worker(
+        "postgresql://audit",
+        "00000003-0000001B-1",
+        str(run_id),
+        5,
+        observed_at,
+        generation_id,
+    ))
+
+    sql, args = connection.executed[-1]
+    assert "c.generation_id=$3::uuid" in sql
+    assert args == (run_id, observed_at, generation_id)
 
 
 def test_30_minute_session_contract_includes_opening_snapshot() -> None:
@@ -89,6 +167,12 @@ def test_summary_completes_scan_and_reports_gate_result() -> None:
         "unexpected_source": 0, "current_open_periods": 0,
         "timestamp_mismatches": 0, "missing_daily_basis": 0,
         "missing_higher_periods": 0,
+        "catalog_empty_has_rows": 0,
+        "catalog_present_missing_rows": 0,
+        "catalog_present_bounds_mismatch": 0,
+        "catalog_scope_missing": 0,
+        "catalog_scope_unknown": 0,
+        "catalog_scope_incomplete": 0,
         "missing_rows": 0,
     }
     status, summary = summarize(clean)
@@ -101,6 +185,19 @@ def test_summary_completes_scan_and_reports_gate_result() -> None:
     assert status == "completed"
     assert summary["anomaly_total"] == 2
     assert summary["gate_pass"] is False
+
+    for field in (
+        "catalog_empty_has_rows",
+        "catalog_present_missing_rows",
+        "catalog_present_bounds_mismatch",
+        "catalog_scope_missing",
+        "catalog_scope_unknown",
+        "catalog_scope_incomplete",
+    ):
+        status, summary = summarize(dict(clean, **{field: 1}, eligible=4, unresolved=1))
+        assert status == "completed"
+        assert summary["anomaly_total"] == 1
+        assert summary["gate_pass"] is False
 
 
 def test_cli_requires_the_exact_five_level_contract() -> None:
@@ -127,7 +224,11 @@ class EvidenceConnection:
     async def fetchrow(self, sql: str, *args: object):
         normalized = " ".join(sql.lower().split())
         if "pg_current_wal_lsn" in normalized:
-            return {"observed_at": self.observed_at, "evidence_lsn": "0/16B6C50"}
+            return {
+                "observed_at": self.observed_at,
+                "observed_wal_lsn": "0/16B6C50",
+                "transaction_snapshot": "100:100:",
+            }
         if "from kline_scope_catalog_control" in normalized:
             return {
                 "generation_id": uuid4(),
@@ -172,7 +273,8 @@ def test_snapshot_evidence_is_exact_ordered_and_complete() -> None:
     assert evidence["apply_mode"] is False
     assert evidence["timeframes"] == list(TIMEFRAMES)
     assert evidence["observed_at"] == "2026-07-18T01:02:03+00:00"
-    assert evidence["evidence_lsn"] == "0/16B6C50"
+    assert evidence["observed_wal_lsn"] == "0/16B6C50"
+    assert evidence["transaction_snapshot"] == "100:100:"
     assert evidence["active_universe_count"] == 2
     assert len(evidence["active_universe_sha256"]) == 64
     assert evidence["catalog_control_revision"] == 9
@@ -261,6 +363,12 @@ def _summary_record(*, checkpoints: int, eligible: int, unresolved: int) -> dict
         "timestamp_mismatches": 0,
         "missing_daily_basis": 0,
         "missing_higher_periods": 0,
+        "catalog_empty_has_rows": 0,
+        "catalog_present_missing_rows": 0,
+        "catalog_present_bounds_mismatch": 0,
+        "catalog_scope_missing": 0,
+        "catalog_scope_unknown": 0,
+        "catalog_scope_incomplete": 0,
         "missing_rows": 0,
     }
 
@@ -284,7 +392,8 @@ def test_finalization_fails_closed_when_checkpoint_contract_is_incomplete() -> N
     evidence = {
         "contract_version": "module-c-strict-audit-v2",
         "observed_at": "2026-07-18T01:02:03+00:00",
-        "evidence_lsn": "0/16B6C50",
+        "observed_wal_lsn": "0/16B6C50",
+        "transaction_snapshot": "100:100:",
         "evidence_sha256": "a" * 64,
         "active_universe_count": 2,
     }
@@ -304,7 +413,8 @@ def test_finalization_requires_every_checkpoint_disposition() -> None:
     evidence = {
         "contract_version": "module-c-strict-audit-v2",
         "observed_at": "2026-07-18T01:02:03+00:00",
-        "evidence_lsn": "0/16B6C50",
+        "observed_wal_lsn": "0/16B6C50",
+        "transaction_snapshot": "100:100:",
         "evidence_sha256": "a" * 64,
         "active_universe_count": 2,
     }

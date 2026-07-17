@@ -31,7 +31,8 @@ WHERE c.conrelid='klines'::regclass AND c.contype='p'
 
 EVIDENCE_CLOCK_SQL = """
 SELECT transaction_timestamp() AS observed_at,
-       pg_current_wal_lsn()::text AS evidence_lsn
+       pg_current_wal_lsn()::text AS observed_wal_lsn,
+       txid_current_snapshot()::text AS transaction_snapshot
 """
 
 ACTIVE_UNIVERSE_SQL = """
@@ -151,7 +152,12 @@ async def _claim_audit_run(conn: Any, run_id: uuid.UUID) -> None:
 async def _capture_snapshot_evidence(conn: Any) -> dict[str, Any]:
     """Capture strict audit evidence from the coordinator's exported snapshot."""
     clock = await conn.fetchrow(EVIDENCE_CLOCK_SQL)
-    if clock is None or clock["observed_at"] is None or not clock["evidence_lsn"]:
+    if (
+        clock is None
+        or clock["observed_at"] is None
+        or not clock["observed_wal_lsn"]
+        or not clock["transaction_snapshot"]
+    ):
         raise InvalidAuditEvidence("audit snapshot clock/LSN evidence is missing")
     universe_rows = await conn.fetch(ACTIVE_UNIVERSE_SQL)
     universe = [
@@ -233,7 +239,10 @@ async def _capture_snapshot_evidence(conn: Any) -> dict[str, Any]:
         "apply_mode": False,
         "timeframes": list(TIMEFRAMES),
         "observed_at": _json_value(clock["observed_at"]),
-        "evidence_lsn": str(clock["evidence_lsn"]),
+        # This is diagnostic context, not a snapshot boundary.  The exported
+        # snapshot and transaction_snapshot carry the visibility contract.
+        "observed_wal_lsn": str(clock["observed_wal_lsn"]),
+        "transaction_snapshot": str(clock["transaction_snapshot"]),
         "active_universe_count": len(universe),
         "active_universe_sha256": _manifest_sha256(universe),
         "catalog_generation_id": str(generation_id),
@@ -347,6 +356,24 @@ WITH base AS {base_materialization} (
     WHERE k.timeframe = {timeframe}
 ), universe AS (
     SELECT id AS symbol_id FROM symbols WHERE is_active AND market='A_SHARE'
+), catalog_scope AS MATERIALIZED (
+    SELECT u.symbol_id, c.state, c.bounds_complete, c.min_ts, c.max_ts,
+       CASE WHEN c.symbol_id IS NULL THEN 1 ELSE 0 END::bigint AS catalog_scope_missing,
+       CASE WHEN c.symbol_id IS NOT NULL
+                  AND c.state IS DISTINCT FROM 'present'
+                  AND c.state IS DISTINCT FROM 'empty'
+            THEN 1 ELSE 0 END::bigint AS catalog_scope_unknown,
+       CASE WHEN c.symbol_id IS NOT NULL AND (
+                  c.bounds_complete IS DISTINCT FROM TRUE OR
+                  (c.state='empty' AND (c.min_ts IS NOT NULL OR c.max_ts IS NOT NULL)) OR
+                  (c.state='present' AND
+                    (c.min_ts IS NULL OR c.max_ts IS NULL OR c.min_ts > c.max_ts))
+            ) THEN 1 ELSE 0 END::bigint AS catalog_scope_incomplete
+    FROM universe u
+    LEFT JOIN kline_scope_catalog c
+      ON c.generation_id=$3::uuid
+     AND c.symbol_id=u.symbol_id
+     AND c.timeframe={timeframe}
 ), evidence_context AS MATERIALIZED (
     SELECT $2::timestamptz AS observed_at
 ){daily_ctes}{logical_duplicates_cte}, metrics AS (
@@ -368,26 +395,46 @@ WITH base AS {base_materialization} (
        {higher_metrics}
     FROM base b {higher_join} {missing_higher_join}
     GROUP BY b.symbol_id
-), prepared_present AS (
+), catalog_checked AS (
+    SELECT c.symbol_id,
+       coalesce(m.shard_start,'-infinity'::timestamptz) AS shard_start,
+       coalesce(m.shard_end,'-infinity'::timestamptz) AS shard_end,
+       coalesce(m.rows_scanned,0)::bigint AS rows_scanned,
+       coalesce(m.invalid_ohlc,0)::bigint AS invalid_ohlc,
+       coalesce(m.negative_volume,0)::bigint AS negative_volume,
+       coalesce(m.negative_amount,0)::bigint AS negative_amount,
+       coalesce(m.illegal_sessions,0)::bigint AS illegal_sessions,
+       coalesce(m.incomplete_rows,0)::bigint AS incomplete_rows,
+       coalesce(m.unexpected_source,0)::bigint AS unexpected_source,
+       coalesce(m.sources,'{{}}'::jsonb) AS sources,
+       coalesce(m.current_open_periods,0)::bigint AS current_open_periods,
+       coalesce(m.timestamp_mismatches,0)::bigint AS timestamp_mismatches,
+       coalesce(m.missing_daily_basis,0)::bigint AS missing_daily_basis,
+       coalesce(m.missing_higher_periods,0)::bigint AS missing_higher_periods,
+       CASE WHEN c.state='empty' AND m.rows_scanned > 0 THEN 1 ELSE 0 END::bigint
+         AS catalog_empty_has_rows,
+       CASE WHEN c.state='present' AND coalesce(m.rows_scanned,0)=0
+            THEN 1 ELSE 0 END::bigint AS catalog_present_missing_rows,
+       CASE WHEN c.state='present' AND coalesce(m.rows_scanned,0)>0 AND
+              (c.min_ts IS DISTINCT FROM m.shard_start OR
+               c.max_ts IS DISTINCT FROM m.shard_end)
+            THEN 1 ELSE 0 END::bigint AS catalog_present_bounds_mismatch,
+       c.catalog_scope_missing,
+       c.catalog_scope_unknown,
+       c.catalog_scope_incomplete
+    FROM catalog_scope c
+    LEFT JOIN metrics m USING (symbol_id)
+), prepared AS (
     SELECT m.*, coalesce(d.duplicate_rows,0)::bigint AS logical_duplicate_rows,
        (m.invalid_ohlc + m.negative_volume + m.negative_amount + m.illegal_sessions +
         m.incomplete_rows + m.unexpected_source + m.current_open_periods +
         m.timestamp_mismatches + m.missing_daily_basis + m.missing_higher_periods +
+        m.catalog_empty_has_rows + m.catalog_present_missing_rows +
+        m.catalog_present_bounds_mismatch + m.catalog_scope_missing +
+        m.catalog_scope_unknown + m.catalog_scope_incomplete +
         coalesce(d.duplicate_rows,0))::bigint AS anomaly_total
-    FROM metrics m
+    FROM catalog_checked m
     LEFT JOIN logical_duplicates d USING (symbol_id)
-), prepared (
-    symbol_id,shard_start,shard_end,rows_scanned,invalid_ohlc,negative_volume,
-    negative_amount,illegal_sessions,incomplete_rows,unexpected_source,sources,
-    current_open_periods,timestamp_mismatches,missing_daily_basis,missing_higher_periods,
-    logical_duplicate_rows,anomaly_total
-) AS (
-    SELECT * FROM prepared_present
-    UNION ALL
-    SELECT u.symbol_id, '-infinity'::timestamptz, '-infinity'::timestamptz,
-       0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint,
-       '{{}}'::jsonb, 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint, 1::bigint
-    FROM universe u LEFT JOIN metrics m USING(symbol_id) WHERE m.symbol_id IS NULL
 )
 INSERT INTO kline_audit_checkpoints
     (audit_run_id,symbol_id,timeframe,shard_start,shard_end,status,rows_scanned,metadata)
@@ -399,6 +446,12 @@ SELECT $1::uuid, symbol_id, {timeframe}, shard_start, shard_end, 'completed', ro
          'unexpected_source',unexpected_source,'current_open_periods',current_open_periods,
          'timestamp_mismatches',timestamp_mismatches,'missing_daily_basis',missing_daily_basis,
          'missing_higher_periods',missing_higher_periods,
+         'catalog_empty_has_rows',catalog_empty_has_rows,
+         'catalog_present_missing_rows',catalog_present_missing_rows,
+         'catalog_present_bounds_mismatch',catalog_present_bounds_mismatch,
+         'catalog_scope_missing',catalog_scope_missing,
+         'catalog_scope_unknown',catalog_scope_unknown,
+         'catalog_scope_incomplete',catalog_scope_incomplete,
          'missing_rows',CASE WHEN rows_scanned=0 THEN 1 ELSE 0 END,
          'sources',sources,'disposition',CASE WHEN anomaly_total=0 THEN 'eligible' ELSE 'unresolved' END)
 FROM prepared
@@ -423,6 +476,12 @@ SELECT count(*)::bigint AS checkpoints, coalesce(sum(rows_scanned),0)::bigint AS
        coalesce(sum((metadata->>'timestamp_mismatches')::bigint),0)::bigint AS timestamp_mismatches,
        coalesce(sum((metadata->>'missing_daily_basis')::bigint),0)::bigint AS missing_daily_basis
        ,coalesce(sum((metadata->>'missing_higher_periods')::bigint),0)::bigint AS missing_higher_periods
+       ,coalesce(sum((metadata->>'catalog_empty_has_rows')::bigint),0)::bigint AS catalog_empty_has_rows
+       ,coalesce(sum((metadata->>'catalog_present_missing_rows')::bigint),0)::bigint AS catalog_present_missing_rows
+       ,coalesce(sum((metadata->>'catalog_present_bounds_mismatch')::bigint),0)::bigint AS catalog_present_bounds_mismatch
+       ,coalesce(sum((metadata->>'catalog_scope_missing')::bigint),0)::bigint AS catalog_scope_missing
+       ,coalesce(sum((metadata->>'catalog_scope_unknown')::bigint),0)::bigint AS catalog_scope_unknown
+       ,coalesce(sum((metadata->>'catalog_scope_incomplete')::bigint),0)::bigint AS catalog_scope_incomplete
        ,coalesce(sum((metadata->>'missing_rows')::bigint),0)::bigint AS missing_rows
 FROM kline_audit_checkpoints WHERE audit_run_id=$1::uuid
 """
@@ -432,6 +491,9 @@ ANOMALY_FIELDS = (
     "incomplete_rows", "logical_duplicate_rows", "unexpected_source",
     "current_open_periods", "timestamp_mismatches", "missing_daily_basis",
     "missing_higher_periods",
+    "catalog_empty_has_rows", "catalog_present_missing_rows",
+    "catalog_present_bounds_mismatch", "catalog_scope_missing",
+    "catalog_scope_unknown", "catalog_scope_incomplete",
     "missing_rows",
 )
 
@@ -452,7 +514,8 @@ async def _finalize_audit_run(
     summary.update({
         "contract_version": evidence["contract_version"],
         "observed_at": evidence["observed_at"],
-        "evidence_lsn": evidence["evidence_lsn"],
+        "observed_wal_lsn": evidence["observed_wal_lsn"],
+        "transaction_snapshot": evidence["transaction_snapshot"],
         "evidence_sha256": evidence["evidence_sha256"],
     })
     expected = int(evidence["active_universe_count"]) * len(TIMEFRAMES)
@@ -507,6 +570,7 @@ async def _worker(
     run_id: str,
     timeframe: int,
     observed_at: datetime,
+    generation_id: uuid.UUID,
 ) -> None:
     if not _SNAPSHOT_RE.fullmatch(snapshot):
         raise ValueError("invalid PostgreSQL snapshot identifier")
@@ -521,6 +585,7 @@ async def _worker(
                 build_gate_sql(timeframe),
                 uuid.UUID(run_id),
                 observed_at,
+                generation_id,
                 timeout=None,
             )
         except BaseException:
@@ -561,10 +626,18 @@ async def run_gate(
         snapshot = await coordinator.fetchval("SELECT pg_export_snapshot()")
         evidence = await _capture_snapshot_evidence(coordinator)
         observed_at = datetime.fromisoformat(str(evidence["observed_at"]))
+        generation_id = uuid.UUID(str(evidence["catalog_generation_id"]))
         async with asyncio.TaskGroup() as workers:
             for timeframe in timeframes:
                 workers.create_task(
-                    _worker(database_url, snapshot, run_id, timeframe, observed_at)
+                    _worker(
+                        database_url,
+                        snapshot,
+                        run_id,
+                        timeframe,
+                        observed_at,
+                        generation_id,
+                    )
                 )
         await coordinator_tx.commit()
         coordinator_open = False
@@ -591,6 +664,9 @@ async def run_gate(
         if coordinator is not None:
             await coordinator.close()
 
+    # If this post-snapshot connection fails, the durable run can remain
+    # running.  Retry with a new UUID, or have an operator mark this UUID
+    # failed before deliberately reusing it; never reset running evidence.
     final = await asyncpg.connect(database_url)
     try:
         if evidence is None:
@@ -602,7 +678,9 @@ async def run_gate(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fast database-side canonical K-line gate")
+    parser = argparse.ArgumentParser(
+        description="Strict exact-five Module C database-side canonical K-line gate"
+    )
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
     parser.add_argument("--audit-run-id")
     parser.add_argument("--timeframe", action="append", type=int, choices=TIMEFRAMES)
