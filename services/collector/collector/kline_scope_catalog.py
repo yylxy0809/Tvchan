@@ -226,13 +226,25 @@ async def create_generation(
         raise ValueError("timeframes must be non-empty supported K-line codes")
     async with conn.transaction():
         control = await conn.fetchrow(
-            """select active_generation_id
+            """select active_generation_id, revision
                  from kline_scope_catalog_control
                 where control_key = 'active'
                 for update"""
         )
         if control is None:
             raise InvalidScopeGeneration("scope catalog active control row is missing")
+        building = await conn.fetchrow(
+            """select generation_id
+                 from kline_scope_catalog_generations
+                where status = 'building'
+                limit 1
+                for update"""
+        )
+        if building is not None:
+            raise InvalidScopeGeneration(
+                "scope catalog building generation already exists: "
+                f"{building['generation_id']}"
+            )
         symbol_ids = list(await conn.fetchval(
             "select coalesce(array_agg(id order by id), '{}'::integer[]) from symbols where is_active"
         ))
@@ -241,9 +253,11 @@ async def create_generation(
             raise InvalidScopeGeneration("generation scope manifest must not be empty")
         await conn.execute(
             """insert into kline_scope_catalog_generations(
-                   generation_id, status, expected_scope_count, symbol_ids, timeframes
-               ) values ($1, 'building', $2, $3, $4)""",
+                   generation_id, status, expected_scope_count, symbol_ids, timeframes,
+                   base_active_generation_id, base_control_revision
+               ) values ($1, 'building', $2, $3, $4, $5, $6)""",
             generation_id, expected_scope_count, symbol_ids, list(normalized),
+            control["active_generation_id"], int(control["revision"]),
         )
         await conn.execute(
             """insert into kline_scope_catalog(generation_id, symbol_id, timeframe)
@@ -483,7 +497,7 @@ async def finalize_generation(conn: Any, *, generation_id: UUID) -> dict[str, An
     """Validate and atomically activate one complete building generation."""
     async with conn.transaction():
         control = await conn.fetchrow(
-            """select active_generation_id
+            """select active_generation_id, revision
                  from kline_scope_catalog_control
                 where control_key = 'active'
                 for update"""
@@ -491,7 +505,8 @@ async def finalize_generation(conn: Any, *, generation_id: UUID) -> dict[str, An
         if control is None:
             raise InvalidScopeGeneration("scope catalog active control row is missing")
         generation = await conn.fetchrow(
-            """select generation_id, status, expected_scope_count
+            """select generation_id, status, expected_scope_count,
+                      base_active_generation_id, base_control_revision
                  from kline_scope_catalog_generations
                 where generation_id = $1
                 for update""",
@@ -504,6 +519,25 @@ async def finalize_generation(conn: Any, *, generation_id: UUID) -> dict[str, An
             raise InvalidScopeGeneration(
                 f"scope catalog generation {generation_id} is {status}, not building"
             )
+        previous_generation_id = control["active_generation_id"]
+        control_revision = int(control["revision"])
+        if status == "building":
+            base_control_revision = generation["base_control_revision"]
+            base_active_generation_id = generation["base_active_generation_id"]
+            if base_control_revision is None:
+                raise InvalidScopeGeneration(
+                    f"scope catalog generation {generation_id} has no base control revision"
+                )
+            if previous_generation_id != base_active_generation_id:
+                raise InvalidScopeGeneration(
+                    f"scope catalog generation {generation_id} base active generation changed: "
+                    f"expected={base_active_generation_id}, current={previous_generation_id}"
+                )
+            if control_revision != int(base_control_revision):
+                raise InvalidScopeGeneration(
+                    f"scope catalog generation {generation_id} control revision changed: "
+                    f"expected={base_control_revision}, current={control_revision}"
+                )
         summary = await conn.fetchrow(GENERATION_SUMMARY_SQL, generation_id)
         expected = int(generation["expected_scope_count"])
         scope_count = int(summary["scope_count"])
@@ -514,7 +548,6 @@ async def finalize_generation(conn: Any, *, generation_id: UUID) -> dict[str, An
                 f"scope catalog generation incomplete: expected={expected}, scopes={scope_count}, "
                 f"unknown={unknown_count}, incomplete={incomplete_count}"
             )
-        previous_generation_id = control["active_generation_id"]
         if status == "complete":
             if previous_generation_id != generation_id:
                 raise InvalidScopeGeneration(
@@ -534,12 +567,21 @@ async def finalize_generation(conn: Any, *, generation_id: UUID) -> dict[str, An
                 where generation_id = $1 and status = 'building'""",
             generation_id,
         )
-        await conn.execute(
+        control_changed = _updated_count(await conn.execute(
             """update kline_scope_catalog_control
-                  set active_generation_id = $1, updated_at = clock_timestamp()
-                where control_key = 'active'""",
-            generation_id,
-        )
+                  set active_generation_id = $1,
+                      revision = revision + 1,
+                      updated_at = clock_timestamp()
+                where control_key = 'active'
+                  and revision = $2
+                  and active_generation_id is not distinct from $3""",
+            generation_id, int(generation["base_control_revision"]),
+            generation["base_active_generation_id"],
+        ))
+        if control_changed != 1:
+            raise InvalidScopeGeneration(
+                f"scope catalog generation {generation_id} lost its control revision fence"
+            )
         if previous_generation_id is not None and previous_generation_id != generation_id:
             await conn.execute(
                 """update kline_scope_catalog_generations

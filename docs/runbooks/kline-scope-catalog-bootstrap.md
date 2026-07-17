@@ -11,9 +11,10 @@ or automatic restart.
 
 ## Safety gates
 
-- Run only after migration `040_kline_scope_catalog.sql` has been reviewed and
+- Run only after migrations `040_kline_scope_catalog.sql` and
+  `041_kline_scope_catalog_generation_fencing.sql` have been reviewed and
   applied with `ON_ERROR_STOP=1`.
-- Apply migration 040 before starting any collector code from the catalog-aware
+- Apply migrations 040 and 041 before starting any collector code from the catalog-aware
   release. Every canonical K-line writer maintains catalog metadata in the same
   transaction, so starting new writers against an older schema must fail rather
   than silently diverge. The production Compose dependency on `db-migrate`
@@ -26,12 +27,27 @@ or automatic restart.
   same generation and only its remaining incomplete rows are scanned (both
   `unknown` rows and writer-touched `present` rows with incomplete bounds).
 
-Apply only migration 040 when the preceding migration chain is already present:
+Before applying migration 041, verify that no legacy generation is still
+`building`. Migration 041 fails explicitly in that state and never chooses,
+fails, completes, or otherwise rewrites a legacy generation for the operator.
+Finish or explicitly fail it with the migration-040 tooling before retrying.
+
+```sql
+select generation_id, created_at
+from kline_scope_catalog_generations
+where status = 'building';
+```
+
+Apply migrations 040 and 041 when the preceding migration chain is already present:
 
 ```powershell
 .\scripts\apply-db-migrations.ps1 `
   -ContainerName tv_backend_timescaledb `
   -Only 040_kline_scope_catalog.sql
+
+.\scripts\apply-db-migrations.ps1 `
+  -ContainerName tv_backend_timescaledb `
+  -Only 041_kline_scope_catalog_generation_fencing.sql
 ```
 
 ## Create and bootstrap a generation
@@ -132,17 +148,38 @@ while old writers no longer maintain it.
 
 ```sql
 begin;
-select active_generation_id
+select active_generation_id, revision
 from kline_scope_catalog_control
 where control_key = 'active'
 for update;
 
+do $$
+begin
+  if exists (
+    select 1
+    from kline_scope_catalog_generations
+    where status = 'building'
+  ) then
+    raise exception 'refusing pointer clear while a scope catalog generation is building';
+  end if;
+end
+$$;
+
 update kline_scope_catalog_control
 set active_generation_id = null,
+    revision = revision + 1,
     updated_at = clock_timestamp()
 where control_key = 'active';
 commit;
 ```
 
-Record the removed generation ID before committing. Diagnose or build a new
-generation; never relabel an incomplete or failed generation as complete.
+Record the removed generation ID and resulting revision before committing.
+The transaction refuses to clear the pointer while a generation is building.
+Every manual pointer clear or restoration must increment `revision`; this
+prevents an older building generation from activating after pointer clearing or
+an ABA-style pointer restore. Migration 041 enforces this in the database:
+changing the pointer requires exactly `revision + 1`; an unchanged pointer may
+keep the revision or increment it by exactly one for an explicit fence. A
+pre-041 finalizer that changes only the pointer is rejected and its transaction
+rolls back. Diagnose or build a new generation; never relabel an incomplete or
+failed generation as complete.
