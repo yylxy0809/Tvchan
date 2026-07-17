@@ -89,6 +89,8 @@ services:
       USE_SEED_DATA: "false"
       DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@timescaledb:5432/${POSTGRES_DB:-tradingview_local}
       REDIS_URL: redis://redis:6379/0
+      CHAN_LIFECYCLE_OBSERVER: ${CHAN_LIFECYCLE_OBSERVER:-chan-lifecycle-v1}
+      CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS: ${CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS:-120}
       LLM_ENABLED: ${LLM_ENABLED:-true}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.siliconflow.cn/v1}

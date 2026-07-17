@@ -53,6 +53,8 @@ export type LifecycleObserverStatus = {
   status: "unavailable" | "degraded" | "healthy";
   deployed: boolean;
   expected_observer_name: string;
+  heartbeat_age_seconds?: number | null;
+  heartbeat_stale_after_seconds?: number;
   reason?: string;
   error?: string;
   counts?: {

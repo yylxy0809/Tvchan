@@ -65,15 +65,21 @@ def test_lifecycle_status_exposes_backlog_watermark_and_degraded_health() -> Non
             "observer_name": "chan-lifecycle-v1",
             "last_outbox_id": 37,
             "updated_at": watermark_at,
+            "heartbeat_age_seconds": 240,
         },
     ])
 
-    status = asyncio.run(_lifecycle_observer_status(FakePool(connection), "chan-lifecycle-v1"))
+    status = asyncio.run(
+        _lifecycle_observer_status(FakePool(connection), "chan-lifecycle-v1", stale_after_seconds=120)
+    )
 
     assert status == {
         "status": "degraded",
+        "reason": "backlog",
         "deployed": True,
         "expected_observer_name": "chan-lifecycle-v1",
+        "heartbeat_age_seconds": 240,
+        "heartbeat_stale_after_seconds": 120,
         "counts": {"pending": 2, "processing": 1, "failed": 3, "dead_letter": 4},
         "oldest_backlog_at": oldest,
         "oldest_backlog_age_seconds": 90,
@@ -91,7 +97,40 @@ def test_lifecycle_status_exposes_backlog_watermark_and_degraded_health() -> Non
     assert "where observer_name = $1" in connection.queries[-1]
 
 
-def test_lifecycle_status_treats_empty_deployed_tables_as_healthy() -> None:
+def test_lifecycle_status_treats_empty_deployed_tables_with_fresh_heartbeat_as_healthy() -> None:
+    watermark_at = datetime(2026, 7, 17, 1, 1, tzinfo=UTC)
+    connection = FakeConnection([
+        {
+            "pending": 0,
+            "processing": 0,
+            "failed": 0,
+            "dead_letter": 0,
+            "oldest_backlog_at": None,
+            "oldest_backlog_age_seconds": None,
+            "max_outbox_id": 0,
+        },
+        {
+            "observer_name": "chan-lifecycle-v1",
+            "last_outbox_id": 0,
+            "updated_at": watermark_at,
+            "heartbeat_age_seconds": 30,
+        },
+    ])
+
+    status = asyncio.run(
+        _lifecycle_observer_status(FakePool(connection), "chan-lifecycle-v1", stale_after_seconds=120)
+    )
+
+    assert status["status"] == "healthy"
+    assert status["deployed"] is True
+    assert status["expected_observer_name"] == "chan-lifecycle-v1"
+    assert status["counts"] == {"pending": 0, "processing": 0, "failed": 0, "dead_letter": 0}
+    assert status["heartbeat_age_seconds"] == 30
+    assert status["heartbeat_stale_after_seconds"] == 120
+    assert status["observer_watermark"]["updated_at"] == watermark_at
+
+
+def test_lifecycle_status_degrades_when_idle_observer_heartbeat_is_missing() -> None:
     connection = FakeConnection([
         {
             "pending": 0,
@@ -105,13 +144,71 @@ def test_lifecycle_status_treats_empty_deployed_tables_as_healthy() -> None:
         None,
     ])
 
-    status = asyncio.run(_lifecycle_observer_status(FakePool(connection), "chan-lifecycle-v1"))
+    status = asyncio.run(
+        _lifecycle_observer_status(FakePool(connection), "chan-lifecycle-v1", stale_after_seconds=120)
+    )
 
-    assert status["status"] == "healthy"
-    assert status["deployed"] is True
-    assert status["expected_observer_name"] == "chan-lifecycle-v1"
-    assert status["counts"] == {"pending": 0, "processing": 0, "failed": 0, "dead_letter": 0}
-    assert status["observer_watermark"] is None
+    assert status["status"] == "degraded"
+    assert status["reason"] == "heartbeat_missing"
+    assert status["heartbeat_age_seconds"] is None
+    assert status["heartbeat_stale_after_seconds"] == 120
+
+
+def test_lifecycle_status_degrades_when_idle_observer_heartbeat_is_stale() -> None:
+    connection = FakeConnection([
+        {
+            "pending": 0,
+            "processing": 0,
+            "failed": 0,
+            "dead_letter": 0,
+            "oldest_backlog_at": None,
+            "oldest_backlog_age_seconds": None,
+            "max_outbox_id": 0,
+        },
+        {
+            "observer_name": "chan-lifecycle-v1",
+            "last_outbox_id": 0,
+            "updated_at": datetime(2026, 7, 17, 1, 1, tzinfo=UTC),
+            "heartbeat_age_seconds": 121,
+        },
+    ])
+
+    status = asyncio.run(
+        _lifecycle_observer_status(FakePool(connection), "chan-lifecycle-v1", stale_after_seconds=120)
+    )
+
+    assert status["status"] == "degraded"
+    assert status["reason"] == "heartbeat_stale"
+    assert status["heartbeat_age_seconds"] == 121
+    assert "clock_timestamp() - updated_at" in connection.queries[-1]
+
+
+def test_lifecycle_status_reports_watermark_lag_before_stale_heartbeat() -> None:
+    connection = FakeConnection([
+        {
+            "pending": 0,
+            "processing": 0,
+            "failed": 0,
+            "dead_letter": 0,
+            "oldest_backlog_at": None,
+            "oldest_backlog_age_seconds": None,
+            "max_outbox_id": 42,
+        },
+        {
+            "observer_name": "chan-lifecycle-v1",
+            "last_outbox_id": 37,
+            "updated_at": datetime(2026, 7, 17, 1, 1, tzinfo=UTC),
+            "heartbeat_age_seconds": 121,
+        },
+    ])
+
+    status = asyncio.run(
+        _lifecycle_observer_status(FakePool(connection), "chan-lifecycle-v1", stale_after_seconds=120)
+    )
+
+    assert status["status"] == "degraded"
+    assert status["reason"] == "watermark_lag"
+    assert status["heartbeat_age_seconds"] == 121
 
 
 def test_lifecycle_status_only_maps_missing_tables_to_rolling_deploy_unavailable() -> None:

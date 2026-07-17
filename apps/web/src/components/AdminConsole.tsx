@@ -469,6 +469,8 @@ export function AdminConsole({ adminToken }: Props) {
             <p>last outbox: {opsStatus?.lifecycle_observer.observer_watermark?.last_outbox_id ?? "--"}</p>
             <p>max outbox: {opsStatus?.lifecycle_observer.max_outbox_id ?? "--"}</p>
             <p>lag: {opsStatus?.lifecycle_observer.observer_watermark?.lag ?? "--"}</p>
+            <p>heartbeat age: {formatAge(opsStatus?.lifecycle_observer.heartbeat_age_seconds)}</p>
+            <p>stale after: {formatAge(opsStatus?.lifecycle_observer.heartbeat_stale_after_seconds)}</p>
             <p>updated: {formatDate(opsStatus?.lifecycle_observer.observer_watermark?.updated_at)}</p>
           </div>
         </div>

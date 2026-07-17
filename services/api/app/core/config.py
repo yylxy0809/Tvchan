@@ -27,6 +27,9 @@ class Settings:
     chan_lifecycle_observer: str = field(
         default_factory=lambda: os.getenv("CHAN_LIFECYCLE_OBSERVER", "chan-lifecycle-v1")
     )
+    chan_lifecycle_observer_stale_seconds: int = field(
+        default_factory=lambda: int(os.getenv("CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS", "120"))
+    )
     use_seed_data: bool = os.getenv("USE_SEED_DATA", "true").lower() in {
         "1",
         "true",
@@ -67,6 +70,8 @@ class Settings:
     wencai_timeout_seconds: float = float(os.getenv("WENCAI_TIMEOUT_SECONDS", "20"))
 
     def __post_init__(self) -> None:
+        if self.chan_lifecycle_observer_stale_seconds <= 0:
+            raise RuntimeError("CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS must be greater than zero")
         if self.app_env.strip().lower() == "production":
             _validate_production_token("API_TOKEN", self.api_token)
             if self.admin_api_token:

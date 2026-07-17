@@ -263,8 +263,12 @@ class LifecycleObserver:
         )
         if row is None:
             return False
-        await conn.execute(UPSERT_WATERMARK_SQL, self.observer_name)
+        await self.pulse(conn)
         return True
+
+    async def pulse(self, conn: Any) -> None:
+        """Refresh liveness without advancing past the first unfinished outbox row."""
+        await conn.execute(UPSERT_WATERMARK_SQL, self.observer_name)
 
     async def renew(self, conn: Any, claimed: dict[str, Any], *, lease_seconds: int = 60) -> bool:
         row = await conn.fetchrow(

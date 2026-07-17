@@ -119,6 +119,7 @@ async def run_observer(
                 continue
             if not args.loop:
                 break
+            await observer.pulse(connection)
             await _wait_for_stop(stop_event, args.poll_interval)
         if args.rebuild_current:
             await observer.rebuild_current_projection(connection)

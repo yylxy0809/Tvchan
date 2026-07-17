@@ -43,6 +43,25 @@ class FakeObserver:
         raise AssertionError("projection rebuild must remain explicit")
 
 
+class IdleObserver(FakeObserver):
+    def __init__(self, stop_event: asyncio.Event) -> None:
+        super().__init__()
+        self.stop_event = stop_event
+        self.pulse_calls = 0
+        self.events: list[str] = []
+
+    async def process_next(self, _connection: object, **kwargs: object) -> int:
+        self.process_calls += 1
+        self.process_kwargs.append(kwargs)
+        self.events.append("process")
+        return 0
+
+    async def pulse(self, _connection: object) -> None:
+        self.pulse_calls += 1
+        self.events.append("pulse")
+        self.stop_event.set()
+
+
 def test_parse_args_rejects_invalid_runtime_configuration() -> None:
     with pytest.raises(SystemExit):
         lifecycle_observer_worker.parse_args(["--database-url", "", "--loop"])
@@ -117,4 +136,51 @@ def test_run_observer_rejects_duplicate_startup_before_claiming() -> None:
         ))
 
     assert observer.process_calls == 0
+    assert connection.closed is True
+
+
+def test_looping_observer_pulses_watermark_when_the_outbox_is_idle() -> None:
+    stop_event = asyncio.Event()
+    connection = FakeConnection()
+    observer = IdleObserver(stop_event)
+    config = lifecycle_observer_worker.parse_args([
+        "--database-url", "postgresql://db",
+        "--loop",
+        "--poll-interval", "0.01",
+    ])
+
+    processed = asyncio.run(lifecycle_observer_worker.run_observer(
+        config,
+        stop_event=stop_event,
+        connect=lambda _url: asyncio.sleep(0, result=connection),
+        observer_factory=lambda **_kwargs: observer,
+        emit_status=False,
+    ))
+
+    assert processed == 0
+    assert observer.events == ["process", "pulse"]
+    assert observer.pulse_calls == 1
+    assert connection.closed is True
+
+
+def test_once_observer_does_not_leave_a_heartbeat_after_it_exits() -> None:
+    stop_event = asyncio.Event()
+    connection = FakeConnection()
+    observer = IdleObserver(stop_event)
+    config = lifecycle_observer_worker.parse_args([
+        "--database-url", "postgresql://db",
+        "--once",
+    ])
+
+    processed = asyncio.run(lifecycle_observer_worker.run_observer(
+        config,
+        stop_event=stop_event,
+        connect=lambda _url: asyncio.sleep(0, result=connection),
+        observer_factory=lambda **_kwargs: observer,
+        emit_status=False,
+    ))
+
+    assert processed == 0
+    assert observer.events == ["process"]
+    assert observer.pulse_calls == 0
     assert connection.closed is True
