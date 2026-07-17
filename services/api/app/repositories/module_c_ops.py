@@ -42,6 +42,18 @@ STRICT_PROVENANCE_FIELDS = (
 )
 RUNNING_COUNTS_SQL = """
 /* module-c-execution:running-counts */
+with running as (
+    select parent.id as batch_id, parent.created_at
+      from chan_c_batches parent
+      join chan_c_full_recompute_batches child on child.batch_id=parent.id
+     where parent.status='running' or child.status='running'
+    union
+    select parent.id as batch_id, parent.created_at
+      from chan_c_batches parent
+      join chan_c_full_recompute_batches child on child.batch_id=parent.id
+      join chan_c_full_recompute_tasks task on task.batch_id=parent.id
+     where task.status='running'
+)
 select clock_timestamp() as observed_at,
        (select count(*)::bigint
           from chan_c_batches parent
@@ -51,7 +63,15 @@ select clock_timestamp() as observed_at,
        (select count(*)::bigint from chan_c_full_recompute_batches where status='running')
            as running_child_batches,
        (select count(*)::bigint from chan_c_full_recompute_tasks where status='running')
-           as running_tasks
+           as running_tasks,
+       coalesce(
+           (select array_agg(
+                       running.batch_id::text
+                       order by running.created_at desc, running.batch_id desc
+                   )
+              from running),
+           array[]::text[]
+       ) as running_batch_ids
 """
 
 
@@ -554,13 +574,20 @@ def _catalog_manifest_matches(
 
 async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[str, Any]:
     counts = _dict(await conn.fetchrow(RUNNING_COUNTS_SQL))
-    batch = _dict(await conn.fetchrow(BATCH_SQL, batch_id))
+    running_batch_ids = [str(value) for value in counts["running_batch_ids"]]
+    effective_batch_id = (
+        batch_id
+        if batch_id is not None
+        else (int(running_batch_ids[0]) if running_batch_ids else None)
+    )
+    batch = _dict(await conn.fetchrow(BATCH_SQL, effective_batch_id))
     result = {
         "observed_at": counts["observed_at"],
         "readonly": True,
         "running_parent_batches": int(counts["running_parent_batches"]),
         "running_child_batches": int(counts["running_child_batches"]),
         "running_tasks": int(counts["running_tasks"]),
+        "running_batch_ids": running_batch_ids,
         "batch": None,
     }
     if not batch:
@@ -834,7 +861,7 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
     )
 
     result["batch"] = {
-        "batch_id": int(batch["batch_id"]),
+        "batch_id": str(batch["batch_id"]),
         "batch_key": str(batch["batch_key"]),
         "batch_kind": str(batch["batch_kind"]),
         "parent_status": str(batch["parent_status"]),

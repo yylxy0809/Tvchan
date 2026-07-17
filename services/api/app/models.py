@@ -349,7 +349,7 @@ class ModuleCExecutionProvenanceResponse(BaseModel):
 
 
 class ModuleCExecutionBatchResponse(BaseModel):
-    batch_id: int
+    batch_id: str
     batch_key: str
     batch_kind: str
     parent_status: str
@@ -377,6 +377,7 @@ class ModuleCExecutionStatusResponse(BaseModel):
     running_parent_batches: int
     running_child_batches: int
     running_tasks: int
+    running_batch_ids: list[str]
     batch: ModuleCExecutionBatchResponse | None = None
 
 
