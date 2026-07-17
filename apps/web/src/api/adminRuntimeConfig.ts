@@ -137,6 +137,7 @@ export type ModuleCExecutionProvenance = {
   eligibility_manifest_matches: boolean;
   config_hash_matches: boolean;
   frozen_config_matches: boolean;
+  execution_identity_matches: boolean;
   live_universe_matches: boolean;
   catalog_manifest_matches: boolean;
   evidence_complete: boolean;

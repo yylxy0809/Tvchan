@@ -607,6 +607,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
             <p>manifest matches: {formatBoolean(moduleCBatch?.provenance.eligibility_manifest_matches)}</p>
             <p>config matches: {formatBoolean(moduleCBatch?.provenance.config_hash_matches)}</p>
             <p>frozen config matches: {formatBoolean(moduleCBatch?.provenance.frozen_config_matches)}</p>
+            <p>execution identity matches: {formatBoolean(moduleCBatch?.provenance.execution_identity_matches)}</p>
           </div>
           <div className="admin-feature-card">
             <h3>Freshness and catalog drift</h3>

@@ -131,7 +131,8 @@ test("admin console renders read-only Module C execution evidence without contro
     "canonical_audit_run_id", "audit_evidence_sha256", "audit_checkpoint_sha256",
     "freshness_contract_sha256", "expected_closed_watermarks", "actual_checkpoint_watermarks",
     "catalog_generation_id", "catalog_control_revision", "catalog_revision_matches", "drift_reasons",
-    "frozen_config_matches", "live_universe_matches", "catalog_manifest_matches", "future_scopes",
+    "frozen_config_matches", "execution_identity_matches", "live_universe_matches",
+    "catalog_manifest_matches", "future_scopes",
   ]) {
     assert.match(source, new RegExp(field));
     assert.match(apiSource, new RegExp(field));
