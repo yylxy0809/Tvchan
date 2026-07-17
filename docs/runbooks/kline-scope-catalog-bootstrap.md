@@ -77,6 +77,26 @@ do {
 } while ($payload.selected -gt 0)
 ```
 
+Each invocation performs one set-based exact K-line aggregate and one
+version-fenced bulk catalog update for at most `batch-size` targets. The batch
+size is an I/O bound, not a concurrency setting: run exactly one bootstrap
+client. For every successful response, require
+`updated + cas_skipped == selected`. A skipped row means a catalog-aware K-line
+writer (or a competing bootstrap during a test) changed its version after the
+scan; leave it incomplete and let the next invocation rescan it. Any timeout,
+cancellation, or SQL error rolls back the entire invocation.
+
+For the first production generation, increase the same resumable generation
+through `5`, `25`, `50`, then `100` targets only after three healthy batches at
+the preceding size. Record elapsed time, scopes/second, CAS skips, database
+wait events, WAL/temp-file deltas, CPU, disk latency, worker RSS, and the
+canonical K-line fingerprint. Stop starting new batches if any invariant or
+SQL operation fails, more than one bootstrap scan is active, a K-line writer
+waits over five seconds, a batch exceeds 60 seconds at sizes 5/25 or 120 seconds
+at sizes 50/100, disk space falls below 15 GB, RSS exceeds 1.2 GB, or
+`cas_skipped > max(1, 5% * selected)`. Keep the generation `building` and resume
+with the same UUID after diagnosis; use `--fail` only when abandoning it.
+
 Inspect the generation before activation:
 
 ```powershell
@@ -89,6 +109,7 @@ switches the active pointer in one transaction. Catalog-aware K-line writers
 hold a shared lock on the catalog control row for their full write transaction;
 finalization takes the matching exclusive lock, so it cannot activate a
 generation while a writer is still changing its scope metadata.
+`selected == 0` by itself is never an activation signal.
 
 ```powershell
 python -m collector.worker kline-scope-bootstrap `

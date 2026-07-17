@@ -33,46 +33,17 @@ select symbol_id, timeframe, state, updated_at
  limit $2
 """
 
-SCAN_SCOPE_SQL = """
-select count(*)::bigint as bar_count, min(ts) as min_ts, max(ts) as max_ts
-  from klines
- where symbol_id = $1 and timeframe = $2
-"""
-
-CAS_SCOPE_SQL = """
-update kline_scope_catalog
-   set state = $4,
-       bounds_complete = true,
-       min_ts = $5,
-       max_ts = $6,
-       updated_at = clock_timestamp()
- where generation_id = $1
-   and symbol_id = $2
-   and timeframe = $3
-   and state = 'unknown'
-   and not bounds_complete
-   and updated_at = $7
-"""
-
-CAS_INCOMPLETE_PRESENT_SCOPE_SQL = """
-update kline_scope_catalog
-   set state = $4,
-       bounds_complete = true,
-       min_ts = $5,
-       max_ts = $6,
-       updated_at = clock_timestamp()
- where generation_id = $1
-   and symbol_id = $2
-   and timeframe = $3
-   and state = 'present'
-   and not bounds_complete
-   and updated_at = $7
-"""
-
 CONTROL_SHARE_SQL = """
 select control_key
   from kline_scope_catalog_control
  where control_key = 'active'
+ for share
+"""
+
+GENERATION_SHARE_SQL = """
+select generation_id, status
+  from kline_scope_catalog_generations
+ where generation_id = $1
  for share
 """
 
@@ -149,6 +120,28 @@ update kline_scope_catalog catalog
    and catalog.updated_at = target.selected_version
 """
 
+BOOTSTRAP_CAS_EXACT_SCOPES_SQL = """
+update kline_scope_catalog catalog
+   set state = target.state,
+       bounds_complete = true,
+       min_ts = target.min_ts,
+       max_ts = target.max_ts,
+       updated_at = clock_timestamp()
+  from unnest(
+       $1::uuid[], $2::integer[], $3::integer[], $4::varchar[],
+       $5::timestamptz[], $6::timestamptz[], $7::varchar[], $8::timestamptz[]
+  ) as target(
+       generation_id, symbol_id, timeframe, state, min_ts, max_ts,
+       selected_state, selected_version
+  )
+ where catalog.generation_id = target.generation_id
+   and catalog.symbol_id = target.symbol_id
+   and catalog.timeframe = target.timeframe
+   and catalog.state = target.selected_state
+   and not catalog.bounds_complete
+   and catalog.updated_at = target.selected_version
+"""
+
 INVALIDATE_SCOPES_SQL = """
 update kline_scope_catalog catalog
    set state = 'unknown',
@@ -212,6 +205,17 @@ def parse_timeframes(raw: str) -> tuple[int, ...]:
 async def _lock_catalog_control_shared(conn: Any) -> None:
     if await conn.fetchrow(CONTROL_SHARE_SQL) is None:
         raise InvalidScopeGeneration("scope catalog active control row is missing")
+
+
+async def _lock_building_generation_shared(conn: Any, generation_id: UUID) -> None:
+    generation = await conn.fetchrow(GENERATION_SHARE_SQL, generation_id)
+    if generation is None:
+        raise InvalidScopeGeneration(f"scope catalog generation not found: {generation_id}")
+    status = str(generation["status"])
+    if status != "building":
+        raise InvalidScopeGeneration(
+            f"scope catalog generation {generation_id} is {status}, not building"
+        )
 
 
 async def create_generation(
@@ -285,35 +289,53 @@ async def bootstrap_generation_batch(
         raise ValueError("batch_size must be between 1 and 100")
     async with conn.transaction():
         await _lock_catalog_control_shared(conn)
+        await _lock_building_generation_shared(conn, generation_id)
         scopes = await conn.fetch(UNKNOWN_SCOPES_SQL, generation_id, batch_size)
-        updated = 0
-        cas_skipped = 0
-        for scope in scopes:
-            symbol_id = int(scope["symbol_id"])
-            timeframe = int(scope["timeframe"])
-            scope_state = str(scope["state"])
-            scanned = await conn.fetchrow(SCAN_SCOPE_SQL, symbol_id, timeframe)
-            bar_count = int(scanned["bar_count"])
-            state = "present" if bar_count else "empty"
-            min_ts = scanned["min_ts"] if bar_count else None
-            max_ts = scanned["max_ts"] if bar_count else None
-            if scope_state == "unknown":
-                command_tag = await conn.execute(
-                    CAS_SCOPE_SQL,
-                    generation_id, symbol_id, timeframe, state, min_ts, max_ts,
-                    scope["updated_at"],
-                )
-            elif scope_state == "present":
-                command_tag = await conn.execute(
-                    CAS_INCOMPLETE_PRESENT_SCOPE_SQL,
-                    generation_id, symbol_id, timeframe, state, min_ts, max_ts,
-                    scope["updated_at"],
-                )
-            else:
-                raise RuntimeError(f"incomplete scope has invalid state: {scope_state}")
-            changed = _updated_count(command_tag)
-            updated += changed
-            cas_skipped += int(changed == 0)
+        invalid = [
+            str(scope["state"])
+            for scope in scopes
+            if str(scope["state"]) not in {"unknown", "present"}
+        ]
+        if invalid:
+            raise RuntimeError(f"incomplete scope has invalid state: {invalid[0]}")
+        if not scopes:
+            return {"selected": 0, "updated": 0, "cas_skipped": 0}
+        targeted_scopes = tuple(
+            (int(scope["symbol_id"]), int(scope["timeframe"])) for scope in scopes
+        )
+        scanned = await conn.fetch(
+            SCAN_SCOPES_SQL,
+            [symbol_id for symbol_id, _timeframe in targeted_scopes],
+            [timeframe for _symbol_id, timeframe in targeted_scopes],
+        )
+        exact: dict[tuple[int, int], tuple[str, Any, Any]] = {}
+        for row in scanned:
+            bar_count = int(row["bar_count"])
+            exact[(int(row["symbol_id"]), int(row["timeframe"]))] = (
+                "present" if bar_count else "empty",
+                row["min_ts"] if bar_count else None,
+                row["max_ts"] if bar_count else None,
+            )
+        expected_scopes = set(targeted_scopes)
+        if len(scanned) != len(targeted_scopes) or set(exact) != expected_scopes:
+            raise RuntimeError(
+                "bulk scope scan returned incomplete or duplicate results: "
+                f"expected={len(targeted_scopes)}, rows={len(scanned)}, unique={len(exact)}"
+            )
+        targets = [
+            {
+                "generation_id": generation_id,
+                "symbol_id": int(scope["symbol_id"]),
+                "timeframe": int(scope["timeframe"]),
+                "state": str(scope["state"]),
+                "updated_at": scope["updated_at"],
+            }
+            for scope in scopes
+        ]
+        updated = await _record_bootstrap_exact_scopes(
+            conn, targets=targets, exact=exact,
+        )
+        cas_skipped = len(scopes) - updated
     return {"selected": len(scopes), "updated": updated, "cas_skipped": cas_skipped}
 
 
@@ -400,6 +422,27 @@ async def _record_exact_scopes(
         [exact[(int(row["symbol_id"]), int(row["timeframe"]))][0] for row in targets],
         [exact[(int(row["symbol_id"]), int(row["timeframe"]))][1] for row in targets],
         [exact[(int(row["symbol_id"]), int(row["timeframe"]))][2] for row in targets],
+        [row["updated_at"] for row in targets],
+    ))
+
+
+async def _record_bootstrap_exact_scopes(
+    conn: Any,
+    *,
+    targets: Sequence[dict[str, Any]],
+    exact: dict[tuple[int, int], tuple[str, Any, Any]],
+) -> int:
+    if not targets:
+        return 0
+    return _updated_count(await conn.execute(
+        BOOTSTRAP_CAS_EXACT_SCOPES_SQL,
+        [row["generation_id"] for row in targets],
+        [int(row["symbol_id"]) for row in targets],
+        [int(row["timeframe"]) for row in targets],
+        [exact[(int(row["symbol_id"]), int(row["timeframe"]))][0] for row in targets],
+        [exact[(int(row["symbol_id"]), int(row["timeframe"]))][1] for row in targets],
+        [exact[(int(row["symbol_id"]), int(row["timeframe"]))][2] for row in targets],
+        [str(row["state"]) for row in targets],
         [row["updated_at"] for row in targets],
     ))
 

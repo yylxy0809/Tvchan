@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from pathlib import Path
 import re
@@ -107,9 +108,25 @@ def test_create_generation_rejects_a_second_building_generation() -> None:
 
 
 class BootstrapConnection:
-    def __init__(self, generation_id: UUID, *, fail_symbol_once: int | None = None) -> None:
+    def __init__(
+        self,
+        generation_id: UUID,
+        *,
+        fail_symbol_once: int | None = None,
+        fail_bulk_cas_once: bool = False,
+        generation_status: str = "building",
+        scan_result_mode: str = "complete",
+    ) -> None:
         self.generation_id = generation_id
         self.fail_symbol_once = fail_symbol_once
+        self.fail_bulk_cas_once = fail_bulk_cas_once
+        self.generation_status = generation_status
+        self.scan_result_mode = scan_result_mode
+        self.before_bulk_cas = None
+        self.unknown_fetches = 0
+        self.bulk_scans = 0
+        self.bulk_cas = 0
+        self.events: list[str] = []
         self.states = {
             (1, 5): {"state": "unknown", "bounds_complete": False, "min_ts": None, "max_ts": None, "updated_at": "v1"},
             (2, 5): {"state": "unknown", "bounds_complete": False, "min_ts": None, "max_ts": None, "updated_at": "v1"},
@@ -117,48 +134,94 @@ class BootstrapConnection:
 
     @asynccontextmanager
     async def transaction(self):
-        yield
+        snapshot = deepcopy(self.states)
+        self.events.append("begin")
+        try:
+            yield
+        except BaseException:
+            self.states = snapshot
+            self.events.append("rollback")
+            raise
+        else:
+            self.events.append("commit")
 
-    async def fetch(self, sql: str, generation_id: UUID, limit: int):
-        assert "not bounds_complete" in sql.lower()
-        assert generation_id == self.generation_id
-        return [
-            {"symbol_id": symbol_id, "timeframe": timeframe, "state": row["state"], "updated_at": row["updated_at"]}
-            for (symbol_id, timeframe), row in self.states.items()
-            if not row["bounds_complete"]
-        ][:limit]
+    async def fetch(self, sql: str, *args: object):
+        if "not bounds_complete" in sql.lower():
+            generation_id, limit = args
+            self.events.append("select-incomplete")
+            self.unknown_fetches += 1
+            assert generation_id == self.generation_id
+            return [
+                {"symbol_id": symbol_id, "timeframe": timeframe, "state": row["state"], "updated_at": row["updated_at"]}
+                for (symbol_id, timeframe), row in self.states.items()
+                if not row["bounds_complete"]
+            ][:limit]
+        assert "left join klines" in sql.lower()
+        symbol_ids, timeframes = args
+        self.events.append("scan-all")
+        self.bulk_scans += 1
+        if self.fail_symbol_once in symbol_ids:
+            self.fail_symbol_once = None
+            raise RuntimeError("interrupted scan")
+        rows = list(reversed([
+            {
+                "symbol_id": symbol_id,
+                "timeframe": timeframe,
+                "bar_count": 3 if symbol_id == 1 else 0,
+                "min_ts": "2026-01-01" if symbol_id == 1 else None,
+                "max_ts": "2026-01-03" if symbol_id == 1 else None,
+            }
+            for symbol_id, timeframe in zip(symbol_ids, timeframes, strict=True)
+        ]))
+        if self.scan_result_mode == "missing":
+            return rows[:-1]
+        if self.scan_result_mode == "duplicate":
+            return [*rows, rows[0]]
+        return rows
 
     async def fetchrow(self, sql: str, *args: object):
         if "kline_scope_catalog_control" in sql.lower():
+            assert "for share" in sql.lower()
+            self.events.append("control-lock")
             return {"control_key": "active"}
-        symbol_id, timeframe = args
-        assert "from klines" in sql.lower()
-        if self.fail_symbol_once == symbol_id:
-            self.fail_symbol_once = None
-            raise RuntimeError("interrupted scan")
-        if symbol_id == 1:
-            return {"bar_count": 3, "min_ts": "2026-01-01", "max_ts": "2026-01-03"}
-        return {"bar_count": 0, "min_ts": None, "max_ts": None}
+        assert "kline_scope_catalog_generations" in sql.lower()
+        assert "for share" in sql.lower()
+        assert args == (self.generation_id,)
+        self.events.append("generation-lock")
+        return {"generation_id": self.generation_id, "status": self.generation_status}
 
     async def execute(self, sql: str, *args: object) -> str:
-        generation_id, symbol_id, timeframe, state, min_ts, max_ts = args[:6]
-        row = self.states[(symbol_id, timeframe)]
-        if "state = 'unknown'" in sql.lower():
-            matches = (
-                row["state"] == "unknown"
-                and not row["bounds_complete"]
-                and row["updated_at"] == args[6]
+        assert "from unnest" in sql.lower()
+        assert "catalog.state = target.selected_state" in sql.lower()
+        assert "not catalog.bounds_complete" in sql.lower()
+        assert "catalog.updated_at = target.selected_version" in sql.lower()
+        self.events.append("bulk-cas")
+        self.bulk_cas += 1
+        if self.before_bulk_cas is not None:
+            self.before_bulk_cas()
+        (
+            generations, symbol_ids, timeframes, states, min_values, max_values,
+            selected_states, versions,
+        ) = args
+        updated = 0
+        for generation_id, symbol_id, timeframe, state, min_ts, max_ts, selected_state, version in zip(
+            generations, symbol_ids, timeframes, states, min_values, max_values,
+            selected_states, versions,
+            strict=True,
+        ):
+            assert generation_id == self.generation_id
+            row = self.states[(symbol_id, timeframe)]
+            if row["updated_at"] != version or row["state"] != selected_state or row["bounds_complete"]:
+                continue
+            row.update(
+                state=state, bounds_complete=True, min_ts=min_ts, max_ts=max_ts,
+                updated_at="scan",
             )
-        else:
-            matches = (
-                row["state"] == "present"
-                and not row["bounds_complete"]
-                and row["updated_at"] == args[6]
-            )
-        if not matches:
-            return "UPDATE 0"
-        row.update(state=state, bounds_complete=True, min_ts=min_ts, max_ts=max_ts, updated_at="scan")
-        return "UPDATE 1"
+            updated += 1
+            if self.fail_bulk_cas_once:
+                self.fail_bulk_cas_once = False
+                raise RuntimeError("interrupted bulk CAS")
+        return f"UPDATE {updated}"
 
 
 def test_bootstrap_is_resumable_after_an_interrupted_short_batch() -> None:
@@ -168,46 +231,123 @@ def test_bootstrap_is_resumable_after_an_interrupted_short_batch() -> None:
     with pytest.raises(RuntimeError, match="interrupted scan"):
         asyncio.run(bootstrap_generation_batch(connection, generation_id=generation_id, batch_size=2))
 
-    assert connection.states[(1, 5)]["state"] == "present"
+    assert connection.states[(1, 5)]["state"] == "unknown"
     assert connection.states[(2, 5)]["state"] == "unknown"
+    assert connection.events[-1] == "rollback"
 
     result = asyncio.run(bootstrap_generation_batch(connection, generation_id=generation_id, batch_size=2))
-    assert result == {"selected": 1, "updated": 1, "cas_skipped": 0}
+    assert result == {"selected": 2, "updated": 2, "cas_skipped": 0}
+    assert connection.states[(1, 5)]["state"] == "present"
     assert connection.states[(2, 5)]["state"] == "empty"
+
+
+def test_bootstrap_uses_one_bulk_scan_and_one_bulk_cas_per_batch() -> None:
+    generation_id = uuid4()
+    connection = BootstrapConnection(generation_id)
+
+    result = asyncio.run(bootstrap_generation_batch(
+        connection, generation_id=generation_id, batch_size=2,
+    ))
+
+    assert result == {"selected": 2, "updated": 2, "cas_skipped": 0}
+    assert connection.unknown_fetches == 1
+    assert connection.bulk_scans == 1
+    assert connection.bulk_cas == 1
+    assert connection.events == [
+        "begin", "control-lock", "generation-lock", "select-incomplete",
+        "scan-all", "bulk-cas", "commit",
+    ]
+
+
+def test_bootstrap_bulk_cas_failure_rolls_back_whole_batch_and_retries() -> None:
+    generation_id = uuid4()
+    connection = BootstrapConnection(generation_id, fail_bulk_cas_once=True)
+
+    with pytest.raises(RuntimeError, match="interrupted bulk CAS"):
+        asyncio.run(bootstrap_generation_batch(
+            connection, generation_id=generation_id, batch_size=2,
+        ))
+
+    assert all(not row["bounds_complete"] for row in connection.states.values())
+    result = asyncio.run(bootstrap_generation_batch(
+        connection, generation_id=generation_id, batch_size=2,
+    ))
+    assert result == {"selected": 2, "updated": 2, "cas_skipped": 0}
+
+
+def test_bootstrap_empty_batch_does_not_scan_or_cas() -> None:
+    generation_id = uuid4()
+    connection = BootstrapConnection(generation_id)
+    for row in connection.states.values():
+        row.update(state="empty", bounds_complete=True, updated_at="complete")
+
+    result = asyncio.run(bootstrap_generation_batch(
+        connection, generation_id=generation_id, batch_size=2,
+    ))
+
+    assert result == {"selected": 0, "updated": 0, "cas_skipped": 0}
+    assert connection.events == [
+        "begin", "control-lock", "generation-lock", "select-incomplete", "commit",
+    ]
+    assert connection.bulk_scans == 0
+    assert connection.bulk_cas == 0
+
+
+@pytest.mark.parametrize("scan_result_mode", ["missing", "duplicate"])
+def test_bootstrap_rejects_inexact_bulk_scan_results(scan_result_mode: str) -> None:
+    generation_id = uuid4()
+    connection = BootstrapConnection(generation_id, scan_result_mode=scan_result_mode)
+
+    with pytest.raises(RuntimeError, match="incomplete or duplicate"):
+        asyncio.run(bootstrap_generation_batch(
+            connection, generation_id=generation_id, batch_size=2,
+        ))
+
+    assert connection.bulk_cas == 0
+    assert all(not row["bounds_complete"] for row in connection.states.values())
 
 
 def test_bootstrap_cas_never_overwrites_a_concurrent_present_scope() -> None:
     generation_id = uuid4()
     connection = BootstrapConnection(generation_id)
 
-    original_fetchrow = connection.fetchrow
-
-    async def concurrent_write(sql: str, *args: object):
-        result = await original_fetchrow(sql, *args)
-        if not args:
-            return result
-        symbol_id, timeframe = args
-        connection.states[(symbol_id, timeframe)].update(
+    def concurrent_write() -> None:
+        connection.states[(1, 5)].update(
             state="present", bounds_complete=False,
             min_ts="writer-min", max_ts="writer-max", updated_at="writer-v2"
         )
-        return result
 
-    connection.fetchrow = concurrent_write  # type: ignore[method-assign]
-    result = asyncio.run(bootstrap_generation_batch(connection, generation_id=generation_id, batch_size=1))
+    connection.before_bulk_cas = concurrent_write
+    result = asyncio.run(bootstrap_generation_batch(connection, generation_id=generation_id, batch_size=2))
 
-    assert result == {"selected": 1, "updated": 0, "cas_skipped": 1}
+    assert result == {"selected": 2, "updated": 1, "cas_skipped": 1}
     assert connection.states[(1, 5)] == {
         "state": "present", "bounds_complete": False,
         "min_ts": "writer-min", "max_ts": "writer-max", "updated_at": "writer-v2",
     }
+    assert connection.states[(2, 5)]["bounds_complete"] is True
 
-    connection.fetchrow = original_fetchrow  # type: ignore[method-assign]
+    connection.before_bulk_cas = None
     resumed = asyncio.run(bootstrap_generation_batch(
         connection, generation_id=generation_id, batch_size=1,
     ))
     assert resumed == {"selected": 1, "updated": 1, "cas_skipped": 0}
     assert connection.states[(1, 5)]["bounds_complete"] is True
+
+
+def test_bootstrap_rejects_non_building_generation_before_selecting_scopes() -> None:
+    generation_id = uuid4()
+    connection = BootstrapConnection(generation_id, generation_status="failed")
+
+    with pytest.raises(InvalidScopeGeneration, match="failed, not building"):
+        asyncio.run(bootstrap_generation_batch(
+            connection, generation_id=generation_id, batch_size=2,
+        ))
+
+    assert connection.events == ["begin", "control-lock", "generation-lock", "rollback"]
+    assert connection.unknown_fetches == 0
+    assert connection.bulk_scans == 0
+    assert connection.bulk_cas == 0
 
 
 def test_writer_hook_marks_unknown_present_without_claiming_complete_bounds() -> None:
