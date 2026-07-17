@@ -73,7 +73,7 @@ def test_module_c_cli_parses_defaults(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["chan_module_c_recompute"])
     args = parse_args()
     assert args.chan_levels == "5f,30f,1d,1w,1m"
-    assert args.symbol_limit == 10
+    assert args.symbol_limit is None
 
 
 def test_collector_owned_adapter_disables_sub_peak_strokes() -> None:
@@ -328,7 +328,16 @@ def test_batch_init_rejects_terminal_recompute_batch_before_writes(status: str) 
         async def fetchrow(self, query, *_args):
             self.fetchrow_calls += 1
             if "from chan_c_batches" in query.lower():
-                return {"status": "running"}
+                return {
+                    "status": "running",
+                    "batch_kind": "baseline",
+                    "run_group_id": "batch-11",
+                    "config_hash": MODULE_C_CONFIG_HASH,
+                    "publication_namespace": "canonical",
+                    "profile_id": "module-c-v4",
+                    "eligible_manifest_sha256": "manifest",
+                    "manifest_hash": "manifest",
+                }
             assert "from chan_c_full_recompute_batches" in query.lower()
             return expected_batch
 
@@ -358,9 +367,54 @@ def test_batch_init_rejects_terminal_recompute_batch_before_writes(status: str) 
 
 
 def test_batch_init_casts_config_hash_for_asyncpg() -> None:
-    sql = inspect.getsource(recompute.ensure_recompute_batch)
+    sql = inspect.getsource(recompute.ensure_recompute_batch_on_connection)
     assert "$4::varchar" in sql
     assert "build.config_hash = $4::text" in sql
+
+
+def test_worker_verify_only_refuses_to_create_missing_child() -> None:
+    class Conn:
+        def transaction(self):
+            return _FakeTransaction()
+
+        async def fetchrow(self, query, *_args):
+            if "from chan_c_batches" in query.lower():
+                return {
+                    "status": "running", "batch_kind": "canary",
+                    "run_group_id": "rg", "config_hash": MODULE_C_CONFIG_HASH,
+                    "publication_namespace": "production", "profile_id": "module-c-native-5lvl",
+                    "eligible_manifest_sha256": "manifest", "manifest_hash": "manifest",
+                }
+            return None
+
+        async def execute(self, *_args):
+            raise AssertionError("verify-only worker must not create durable rows")
+
+    writer = SimpleNamespace(_pool=SimpleNamespace(acquire=lambda: _FakeAcquire(Conn())))
+    with pytest.raises(RuntimeError, match="not prepared"):
+        asyncio.run(ensure_recompute_batch(
+            kline_writer=writer, batch_id=42,
+            eligibility_build_id="00000000-0000-0000-0000-000000000001",
+            run_group_id="rg", config_hash=MODULE_C_CONFIG_HASH,
+            publication_namespace="production", profile_id="module-c-native-5lvl",
+            shard_count=4, levels=["5f", "30f", "1d", "1w", "1m"],
+        ))
+
+
+@pytest.mark.parametrize("extra", [["--symbols", "001220.SZ"], ["--symbol-limit", "20"]])
+def test_production_scope_flags_fail_before_database_pool(monkeypatch, extra) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "chan-module-c-recompute",
+            "--run-group-id", "rg",
+            "--batch-id", "42",
+            "--eligibility-build-id", "00000000-0000-0000-0000-000000000001",
+            *extra,
+        ],
+    )
+    with pytest.raises(ValueError, match="dry-run only"):
+        asyncio.run(recompute.main())
 
 
 def test_claimed_task_uses_one_level_and_frozen_cutoff(monkeypatch) -> None:
