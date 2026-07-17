@@ -80,3 +80,22 @@ def test_iwencai_sidebar_events_worker_is_registered() -> None:
         text=True,
     )
     assert "iwencai-sidebar-events\t" in result.stdout
+
+
+def test_lifecycle_observer_is_a_single_standard_realtime_worker() -> None:
+    compose = (ROOT / "deploy" / "docker-compose.backend.yml").read_text(encoding="utf-8")
+    example = (ROOT / "deploy" / "backend.env.example").read_text(encoding="utf-8")
+
+    assert compose.count("  lifecycle-observer-worker:") == 1
+    worker = compose[compose.index("  lifecycle-observer-worker:"):compose.index("  chan-module-c-recompute-worker:")]
+    assert 'profiles: ["workers", "realtime-pipeline", "realtime-chan-c"]' in worker
+    assert 'command: ["python", "-m", "collector.worker", "lifecycle-observer"]' in worker
+    assert 'LIFECYCLE_LOOP: "1"' in worker
+    assert "LIFECYCLE_LEASE_SECONDS:" in worker
+    assert "LIFECYCLE_MAX_ATTEMPTS:" in worker
+    assert "LIFECYCLE_RETRY_DELAY_SECONDS:" in worker
+    assert "restart: unless-stopped" in worker
+    assert "replicas:" not in worker
+    assert "CHAN_LIFECYCLE_OBSERVER=chan-lifecycle-v1" in example
+    assert "LIFECYCLE_LEASE_SECONDS=300" in example
+    assert "LIFECYCLE_MAX_ATTEMPTS=5" in example

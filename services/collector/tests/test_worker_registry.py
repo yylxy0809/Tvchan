@@ -17,6 +17,7 @@ def test_list_workers_is_sorted() -> None:
     assert names == sorted(names)
     assert "chan-c-stream" in names
     assert "chan-module-c-recompute" in names
+    assert "lifecycle-observer" in names
     assert "chan-recompute" not in names
     assert "chan-tail-publisher" not in names
     assert "realtime-pipeline" not in names

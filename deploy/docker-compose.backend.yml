@@ -268,6 +268,27 @@ services:
     command: ["python", "-m", "collector.worker", "chan-c-stream"]
     restart: unless-stopped
 
+  lifecycle-observer-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.collector
+    profiles: ["workers", "realtime-pipeline", "realtime-chan-c"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *collector_env
+      CHAN_LIFECYCLE_OBSERVER: ${CHAN_LIFECYCLE_OBSERVER:-chan-lifecycle-v1}
+      LIFECYCLE_LOOP: "1"
+      LIFECYCLE_POLL_INTERVAL: ${LIFECYCLE_POLL_INTERVAL:-5}
+      LIFECYCLE_LEASE_SECONDS: ${LIFECYCLE_LEASE_SECONDS:-300}
+      LIFECYCLE_MAX_ATTEMPTS: ${LIFECYCLE_MAX_ATTEMPTS:-5}
+      LIFECYCLE_RETRY_DELAY_SECONDS: ${LIFECYCLE_RETRY_DELAY_SECONDS:-30}
+    command: ["python", "-m", "collector.worker", "lifecycle-observer"]
+    restart: unless-stopped
+
   chan-module-c-recompute-worker:
     build:
       context: ..
