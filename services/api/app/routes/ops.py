@@ -4,13 +4,64 @@ import asyncio
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.core.config import Settings, get_settings
 from app.core.security import require_admin_token
+from app.models import ModuleCExecutionStatusResponse
 from app.repositories.chan_postgres import get_module_c_published_head_coverage_db
+from app.repositories.module_c_ops import get_module_c_execution_status
 
 router = APIRouter(prefix="/admin/ops", tags=["admin-ops"])
+
+
+@router.get(
+    "/module-c/execution",
+    response_model=ModuleCExecutionStatusResponse,
+)
+async def module_c_execution_status(
+    request: Request,
+    batch_id: int | None = None,
+    _admin=Depends(require_admin_token),
+) -> ModuleCExecutionStatusResponse:
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="module_c_execution_database_unavailable",
+        )
+    try:
+        payload = await asyncio.wait_for(
+            _module_c_execution_snapshot(pool, batch_id=batch_id),
+            timeout=4.0,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="module_c_execution_query_timeout",
+        ) from exc
+    except Exception as exc:
+        detail = (
+            "module_c_execution_schema_not_deployed"
+            if getattr(exc, "sqlstate", None) == "42P01"
+            else "module_c_execution_database_unavailable"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        ) from exc
+    if batch_id is not None and payload["batch"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="module_c_execution_batch_not_found",
+        )
+    return ModuleCExecutionStatusResponse(**payload)
+
+
+async def _module_c_execution_snapshot(pool, *, batch_id: int | None) -> dict[str, Any]:
+    async with pool.acquire() as conn:
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            return await get_module_c_execution_status(conn, batch_id=batch_id)
 
 
 @router.get("/status")

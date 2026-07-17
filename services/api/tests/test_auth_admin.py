@@ -221,3 +221,16 @@ def test_admin_token_management_requires_database_pool() -> None:
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Database token store is not available"
+
+
+def test_module_c_execution_status_preserves_admin_auth_boundary_before_database() -> None:
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"))
+    path = "/api/v1/admin/ops/module-c/execution"
+
+    assert client.get(path).status_code == 401
+    user_response = client.get(path, headers={"Authorization": "Bearer api-token"})
+    assert user_response.status_code == 403
+    assert user_response.json()["detail"] == "Admin token required"
+    admin_response = client.get(path, headers={"Authorization": "Bearer admin-token"})
+    assert admin_response.status_code == 503
+    assert admin_response.json()["detail"] == "module_c_execution_database_unavailable"

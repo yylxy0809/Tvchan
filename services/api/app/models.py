@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -242,6 +242,119 @@ class AdminTokenCreateResponse(AdminTokenResponse):
 
 class AdminTokenListResponse(BaseModel):
     items: list[AdminTokenResponse]
+
+
+class ModuleCExecutionTaskResponse(BaseModel):
+    chan_level: int
+    status: str
+    count: int
+    attempts: int
+    bars: int
+    strokes: int
+    segments: int
+    centers: int
+    signals: int
+    latest_update: datetime | None = None
+
+
+class ModuleCExecutionProgressResponse(BaseModel):
+    shard_count: int
+    active_symbols: int
+    disposition_rows: int
+    latest_task_update: datetime | None = None
+    retryable_failed: int | None = None
+    exhausted_failed: int | None = None
+    expired_leases: int
+    tasks: list[ModuleCExecutionTaskResponse] = Field(default_factory=list)
+
+
+class ModuleCFrozenConfigResponse(BaseModel):
+    contract: str | None = None
+    levels: list[str] = Field(default_factory=list)
+    modes: list[str] = Field(default_factory=list)
+    concurrency_per_worker: int | None = None
+    shard_count: int | None = None
+    max_attempts: int | None = None
+    eligibility_build_id: str | None = None
+
+
+class ModuleCFreshnessExpectedResponse(BaseModel):
+    timeframe: str
+    expected: datetime | None = None
+
+
+class ModuleCFreshnessActualResponse(ModuleCFreshnessExpectedResponse):
+    actual_min: datetime | None = None
+    actual_max: datetime | None = None
+    empty_scopes: int
+    stale_scopes: int
+
+
+class ModuleCFreshnessResponse(BaseModel):
+    as_of: datetime | None = None
+    status: Literal["current", "stale", "unavailable"]
+    reasons: list[str] = Field(default_factory=list)
+    expected_closed_watermarks: list[ModuleCFreshnessExpectedResponse]
+    actual_checkpoint_watermarks: list[ModuleCFreshnessActualResponse]
+
+
+class ModuleCExecutionProvenanceResponse(BaseModel):
+    policy: str | None = None
+    eligibility_build_id: str | None = None
+    manifest_version: str | None = None
+    eligibility_manifest_sha256: str | None = None
+    build_manifest_sha256: str | None = None
+    canonical_audit_run_id: str | None = None
+    audit_evidence_sha256: str | None = None
+    audit_checkpoint_sha256: str | None = None
+    audit_status: str | None = None
+    audit_apply_mode: bool | None = None
+    freshness_contract_version: str | None = None
+    freshness_contract_sha256: str | None = None
+    catalog_generation_id: str | None = None
+    catalog_control_revision: int | None = None
+    catalog_manifest_sha256: str | None = None
+    audit_active_universe_sha256: str | None = None
+    catalog_generation_status: str | None = None
+    catalog_is_active: bool
+    live_catalog_control_revision: int | None = None
+    catalog_revision_matches: bool
+    eligibility_manifest_matches: bool
+    config_hash_matches: bool
+    evidence_complete: bool
+    drift_reasons: list[str] = Field(default_factory=list)
+
+
+class ModuleCExecutionBatchResponse(BaseModel):
+    batch_id: int
+    batch_key: str
+    batch_kind: str
+    parent_status: str
+    child_status: str
+    publication_namespace: str
+    profile_id: str
+    run_group_id: str
+    code_commit: str
+    image_digest: str
+    vendor_manifest_sha256: str
+    config_hash: str
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    updated_at: datetime
+    execution: ModuleCExecutionProgressResponse
+    frozen_config: ModuleCFrozenConfigResponse
+    freshness: ModuleCFreshnessResponse
+    provenance: ModuleCExecutionProvenanceResponse
+
+
+class ModuleCExecutionStatusResponse(BaseModel):
+    observed_at: datetime
+    readonly: Literal[True]
+    running_parent_batches: int
+    running_child_batches: int
+    running_tasks: int
+    batch: ModuleCExecutionBatchResponse | None = None
 
 
 class RuntimeConfigResponse(BaseModel):
