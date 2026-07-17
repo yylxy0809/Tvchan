@@ -45,6 +45,7 @@ def _event_record(row: dict[str, Any], dataset_class: str) -> dict[str, Any]:
         "structure_type": str(row["structure_type"]),
         "event_type": event_type,
         "effective_time": _serialize(row["effective_time"]),
+        "observed_time": _serialize(row["observed_time"]),
         "point_time": _serialize(row["point_time"]),
         "first_seen_time": _serialize(row["effective_time"]) if event_type == "first_seen" else None,
         "confirm_time": _serialize(row["effective_time"]) if event_type == "confirmed" else None,
@@ -86,7 +87,8 @@ def build_lifecycle_datasets(
     future_rows = 0
     for row in events:
         effective_time = utc_time(row["effective_time"])
-        if effective_time > as_of:
+        observed_time = utc_time(row["observed_time"])
+        if effective_time > as_of or observed_time > as_of:
             future_rows += 1
             continue
         profile = str(row["publication_profile"])
