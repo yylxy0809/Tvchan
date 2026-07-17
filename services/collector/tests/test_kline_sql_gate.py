@@ -88,7 +88,7 @@ def test_catalog_empty_scope_without_rows_is_unresolved() -> None:
     assert "case when anomaly_total=0 then 'eligible' else 'unresolved' end" in sql
 
 
-def test_worker_binds_captured_generation_to_snapshot_query(monkeypatch) -> None:
+def test_worker_binds_captured_generation_to_snapshot_query() -> None:
     class Transaction:
         async def start(self) -> None:
             return None
@@ -120,16 +120,12 @@ def test_worker_binds_captured_generation_to_snapshot_query(monkeypatch) -> None
 
     connection = Connection()
 
-    async def connect(_database_url: str) -> Connection:
-        return connection
-
-    monkeypatch.setattr(gate.asyncpg, "connect", connect)
     run_id = uuid4()
     generation_id = uuid4()
     observed_at = datetime(2026, 7, 18, 1, 2, 3, tzinfo=timezone.utc)
 
     asyncio.run(gate._worker(
-        "postgresql://audit",
+        connection,
         "00000003-0000001B-1",
         str(run_id),
         5,
@@ -410,6 +406,160 @@ def test_concurrent_same_uuid_is_rejected_by_advisory_lock(monkeypatch) -> None:
     assert setup.closed is True
 
 
+def test_claim_and_writer_fence_keys_are_distinct() -> None:
+    claim_key, writer_fence_key = gate._advisory_lock_keys(uuid4())
+
+    assert claim_key != writer_fence_key
+
+
+def test_takeover_is_rejected_while_old_writer_shared_lock_exists(monkeypatch) -> None:
+    class SetupConnection:
+        def __init__(self) -> None:
+            self.try_count = 0
+            self.unlock_count = 0
+            self.closed = False
+
+        async def fetchval(self, sql: str, *_args: object) -> bool:
+            normalized = " ".join(sql.lower().split())
+            if "pg_try_advisory_lock" in normalized:
+                self.try_count += 1
+                return self.try_count == 1
+            if "pg_advisory_unlock" in normalized:
+                self.unlock_count += 1
+                return True
+            raise AssertionError(sql)
+
+        async def fetchrow(self, _sql: str, *_args: object):
+            raise AssertionError("takeover must fail before durable claim")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    setup = SetupConnection()
+
+    async def connect(_database_url: str) -> SetupConnection:
+        return setup
+
+    monkeypatch.setattr(gate.asyncpg, "connect", connect)
+
+    with pytest.raises(gate.AuditLockOwnershipLost, match="writer fence"):
+        asyncio.run(gate.run_gate("postgresql://audit", str(uuid4())))
+
+    assert setup.try_count == 2
+    assert setup.unlock_count == 1
+    assert setup.closed is True
+
+
+def test_durable_claim_happens_after_five_worker_shared_locks(monkeypatch) -> None:
+    events: list[str] = []
+
+    class SetupConnection(ClaimConnection):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.try_count = 0
+
+        async def fetchval(self, sql: str, *_args: object):
+            normalized = " ".join(sql.lower().split())
+            if "pg_try_advisory_lock" in normalized:
+                self.try_count += 1
+                events.append(f"exclusive_{self.try_count}")
+                return True
+            if "pg_advisory_unlock" in normalized:
+                events.append("exclusive_unlock")
+                return True
+            if normalized == "select 1":
+                return 1
+            raise AssertionError(sql)
+
+        async def fetchrow(self, sql: str, *args: object):
+            if "pg_constraint" in sql.lower():
+                events.append("primary_key")
+                return {
+                    "convalidated": True,
+                    "definition": "PRIMARY KEY (symbol_id, timeframe, ts)",
+                }
+            events.append("durable_claim")
+            return await super().fetchrow(sql, *args)
+
+        async def close(self) -> None:
+            events.append("setup_close")
+
+    class WorkerConnection:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        async def fetchval(self, sql: str, *_args: object) -> bool:
+            normalized = " ".join(sql.lower().split())
+            if "pg_try_advisory_lock_shared" in normalized:
+                events.append(f"shared_{self.index}")
+                return True
+            if "pg_advisory_unlock_shared" in normalized:
+                events.append(f"shared_unlock_{self.index}")
+                return True
+            raise AssertionError(sql)
+
+        async def close(self) -> None:
+            events.append(f"worker_close_{self.index}")
+
+    setup = SetupConnection()
+    workers = [WorkerConnection(index) for index in range(5)]
+    connections: list[object] = [setup, *workers]
+
+    async def connect(_database_url: str):
+        return connections.pop(0)
+
+    async def completed_gate(*_args: object):
+        return "audit-id", {"gate_pass": True}
+
+    monkeypatch.setattr(gate.asyncpg, "connect", connect)
+    monkeypatch.setattr(gate, "_run_with_lock_watchdog", completed_gate)
+
+    asyncio.run(gate.run_gate("postgresql://audit", str(uuid4())))
+
+    claim_index = events.index("durable_claim")
+    assert all(events.index(f"shared_{index}") < claim_index for index in range(5))
+    assert events.index("exclusive_unlock") < events.index("shared_0")
+    assert events.count("exclusive_unlock") == 2
+    for index in range(5):
+        assert f"shared_unlock_{index}" in events
+        assert f"worker_close_{index}" in events
+    assert events[-1] == "setup_close"
+
+
+def test_finalizer_mutation_holds_shared_writer_fence(monkeypatch) -> None:
+    events: list[str] = []
+
+    class Connection:
+        async def fetchval(self, sql: str, *_args: object) -> bool:
+            normalized = " ".join(sql.lower().split())
+            if "pg_try_advisory_lock_shared" in normalized:
+                events.append("shared_lock")
+                return True
+            if "pg_advisory_unlock_shared" in normalized:
+                events.append("shared_unlock")
+                return True
+            raise AssertionError(sql)
+
+        async def close(self) -> None:
+            events.append("close")
+
+    connection = Connection()
+
+    async def connect(_database_url: str) -> Connection:
+        return connection
+
+    async def finalize(_connection: Connection) -> str:
+        events.append("finalize")
+        return "completed"
+
+    monkeypatch.setattr(gate.asyncpg, "connect", connect)
+
+    result = asyncio.run(gate._run_fenced_writer("postgresql://audit", 42, finalize))
+
+    assert result == "completed"
+    assert events == ["shared_lock", "finalize", "shared_unlock", "close"]
+
+
 class RunGateSetupConnection(ClaimConnection):
     def __init__(self, *, heartbeat_error: Exception | None = None, unlock: bool = True):
         super().__init__(None)
@@ -598,15 +748,40 @@ def test_coordinator_connect_failure_marks_claimed_run_failed(monkeypatch) -> No
     class FailureConnection:
         def __init__(self) -> None:
             self.executed: list[tuple[str, tuple[object, ...]]] = []
+            self.events: list[str] = []
+
+        async def fetchval(self, sql: str, *_args: object) -> bool:
+            normalized = " ".join(sql.lower().split())
+            if "pg_try_advisory_lock_shared" in normalized:
+                self.events.append("shared_lock")
+                return True
+            if "pg_advisory_unlock_shared" in normalized:
+                self.events.append("shared_unlock")
+                return True
+            raise AssertionError(sql)
 
         async def execute(self, sql: str, *args: object) -> str:
+            self.events.append("execute")
             self.executed.append((" ".join(sql.lower().split()), args))
             return "UPDATE 1"
+
+        async def close(self) -> None:
+            self.events.append("close")
+
+    class WorkerConnection:
+        async def fetchval(self, sql: str, *_args: object) -> bool:
+            normalized = " ".join(sql.lower().split())
+            if "pg_try_advisory_lock_shared" in normalized:
+                return True
+            if "pg_advisory_unlock_shared" in normalized:
+                return True
+            raise AssertionError(sql)
 
         async def close(self) -> None:
             return None
 
     setup = SetupConnection()
+    workers = [WorkerConnection() for _index in range(5)]
     failure = FailureConnection()
     connections = 0
 
@@ -615,9 +790,11 @@ def test_coordinator_connect_failure_marks_claimed_run_failed(monkeypatch) -> No
         connections += 1
         if connections == 1:
             return setup
-        if connections == 2:
+        if 2 <= connections <= 6:
+            return workers[connections - 2]
+        if connections == 7:
             raise OSError("coordinator unavailable")
-        if connections == 3:
+        if connections == 8:
             return failure
         raise AssertionError("unexpected connection")
 
@@ -626,14 +803,16 @@ def test_coordinator_connect_failure_marks_claimed_run_failed(monkeypatch) -> No
     with pytest.raises(OSError, match="coordinator unavailable"):
         asyncio.run(gate.run_gate("postgresql://audit", str(uuid4())))
 
-    assert connections == 3
+    assert connections == 8
     assert len(failure.executed) == 1
     sql, args = failure.executed[0]
     assert "set status='failed'" in sql
     assert "status='running'" in sql
     assert args[1] == "coordinator unavailable"
-    assert len(setup.lock_calls) == 3
+    assert failure.events == ["shared_lock", "execute", "shared_unlock", "close"]
+    assert len(setup.lock_calls) == 5
     assert "pg_try_advisory_lock" in setup.lock_calls[0]
-    assert setup.lock_calls[1] == "select 1"
-    assert "pg_advisory_unlock" in setup.lock_calls[2]
+    assert "pg_try_advisory_lock" in setup.lock_calls[1]
+    assert any(sql == "select 1" for sql in setup.lock_calls)
+    assert sum("pg_advisory_unlock" in sql for sql in setup.lock_calls) == 2
     assert setup.closed is True

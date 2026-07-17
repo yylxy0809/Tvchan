@@ -21,7 +21,7 @@ import asyncpg
 
 TIMEFRAMES = (5, 30, 1440, 10080, 43200)
 EVIDENCE_CONTRACT_VERSION = "module-c-strict-audit-v2"
-AUDIT_LOCK_PROTOCOL_VERSION = "audit-uuid-advisory-v1"
+AUDIT_LOCK_PROTOCOL_VERSION = "audit-uuid-advisory-v2"
 LOCK_WATCHDOG_INTERVAL_SECONDS = 30.0
 LOCK_WATCHDOG_TIMEOUT_SECONDS = 5.0
 _SNAPSHOT_RE = re.compile(r"^[0-9A-Fa-f]+-[0-9A-Fa-f]+-[0-9]+$")
@@ -112,10 +112,17 @@ def _normalize_timeframes(timeframes: Sequence[int]) -> tuple[int, ...]:
     return TIMEFRAMES
 
 
-def _advisory_lock_key(run_id: uuid.UUID) -> int:
-    """Map an audit UUID to PostgreSQL's signed 64-bit advisory-lock key."""
-    digest = hashlib.sha256(run_id.bytes).digest()
-    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+def _advisory_lock_keys(run_id: uuid.UUID) -> tuple[int, int]:
+    """Derive distinct claim and writer-fence keys for one audit UUID."""
+    def derive(purpose: bytes) -> int:
+        digest = hashlib.sha256(purpose + b":" + run_id.bytes).digest()
+        return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+    claim_key = derive(b"claim")
+    writer_fence_key = derive(b"writer-fence")
+    if claim_key == writer_fence_key:
+        raise RuntimeError("audit advisory-lock key derivation collided")
+    return claim_key, writer_fence_key
 
 
 async def _claim_audit_run(
@@ -609,7 +616,7 @@ async def _finalize_audit_run(
 
 
 async def _worker(
-    database_url: str,
+    connection: Any,
     snapshot: str,
     run_id: str,
     timeframe: int,
@@ -618,31 +625,75 @@ async def _worker(
 ) -> None:
     if not _SNAPSHOT_RE.fullmatch(snapshot):
         raise ValueError("invalid PostgreSQL snapshot identifier")
-    connection = await asyncpg.connect(database_url)
+    transaction = connection.transaction(isolation="repeatable_read")
+    await transaction.start()
     try:
-        transaction = connection.transaction(isolation="repeatable_read")
-        await transaction.start()
-        try:
-            await connection.execute(f"SET TRANSACTION SNAPSHOT '{snapshot}'")
-            await connection.execute("SET LOCAL max_parallel_workers_per_gather = 4")
-            await connection.execute(
-                build_gate_sql(timeframe),
-                uuid.UUID(run_id),
-                observed_at,
-                generation_id,
-                timeout=None,
+        await connection.execute(f"SET TRANSACTION SNAPSHOT '{snapshot}'")
+        await connection.execute("SET LOCAL max_parallel_workers_per_gather = 4")
+        await connection.execute(
+            build_gate_sql(timeframe),
+            uuid.UUID(run_id),
+            observed_at,
+            generation_id,
+            timeout=None,
+        )
+    except BaseException:
+        await transaction.rollback()
+        raise
+    else:
+        await transaction.commit()
+
+
+async def _unlock_advisory(
+    connection: Any,
+    sql: str,
+    lock_key: int,
+    description: str,
+) -> None:
+    try:
+        unlocked = await connection.fetchval(sql, lock_key)
+    except Exception as error:
+        raise AuditLockOwnershipLost(f"{description} unlock failed") from error
+    if unlocked is not True:
+        raise AuditLockOwnershipLost(f"{description} unlock returned false")
+
+
+async def _run_fenced_writer(
+    database_url: str,
+    writer_fence_key: int,
+    operation: Any,
+) -> Any:
+    connection = await asyncpg.connect(database_url)
+    lock_acquired = False
+    try:
+        lock_acquired = bool(
+            await connection.fetchval(
+                "SELECT pg_try_advisory_lock_shared($1::bigint)",
+                writer_fence_key,
             )
-        except BaseException:
-            await transaction.rollback()
-            raise
-        else:
-            await transaction.commit()
+        )
+        if not lock_acquired:
+            raise AuditLockOwnershipLost(
+                "audit durable writer could not acquire the shared writer fence"
+            )
+        return await operation(connection)
     finally:
-        await connection.close()
+        try:
+            if lock_acquired:
+                await _unlock_advisory(
+                    connection,
+                    "SELECT pg_advisory_unlock_shared($1::bigint)",
+                    writer_fence_key,
+                    "audit durable writer shared fence",
+                )
+        finally:
+            await connection.close()
 
 
 async def _run_claimed_gate(
     database_url: str,
+    worker_connections: Sequence[Any],
+    writer_fence_key: int,
     run_id: str,
     run_uuid: uuid.UUID,
     timeframes: Sequence[int],
@@ -661,10 +712,14 @@ async def _run_claimed_gate(
         observed_at = datetime.fromisoformat(str(evidence["observed_at"]))
         generation_id = uuid.UUID(str(evidence["catalog_generation_id"]))
         async with asyncio.TaskGroup() as workers:
-            for timeframe in timeframes:
+            for connection, timeframe in zip(
+                worker_connections,
+                timeframes,
+                strict=True,
+            ):
                 workers.create_task(
                     _worker(
-                        database_url,
+                        connection,
                         snapshot,
                         run_id,
                         timeframe,
@@ -680,8 +735,7 @@ async def _run_claimed_gate(
                 await coordinator_tx.rollback()
             except Exception:
                 pass
-        failure = await asyncpg.connect(database_url)
-        try:
+        async def mark_failure(failure: Any) -> None:
             await failure.execute(
                 "UPDATE kline_audit_runs SET status='failed',completed_at=now(),failure=$2,"
                 "parameters=coalesce($3::jsonb,parameters) "
@@ -690,21 +744,20 @@ async def _run_claimed_gate(
                 str(error),
                 json.dumps(evidence, sort_keys=True) if evidence is not None else None,
             )
-        finally:
-            await failure.close()
+
+        await _run_fenced_writer(database_url, writer_fence_key, mark_failure)
         raise
     finally:
         if coordinator is not None:
             await coordinator.close()
 
-    final = await asyncpg.connect(database_url)
-    try:
+    async def finalize(final: Any) -> tuple[str, dict[str, Any]]:
         if evidence is None:
             raise InvalidAuditEvidence("audit snapshot evidence was not captured")
         _status, summary = await _finalize_audit_run(final, run_uuid, evidence)
         return run_id, summary
-    finally:
-        await final.close()
+
+    return await _run_fenced_writer(database_url, writer_fence_key, finalize)
 
 
 async def _watch_lock_session(setup: Any, stop: asyncio.Event) -> None:
@@ -736,13 +789,22 @@ async def _watch_lock_session(setup: Any, stop: asyncio.Event) -> None:
 async def _run_with_lock_watchdog(
     setup: Any,
     database_url: str,
+    worker_connections: Sequence[Any],
+    writer_fence_key: int,
     run_id: str,
     run_uuid: uuid.UUID,
     timeframes: Sequence[int],
 ) -> tuple[str, dict[str, Any]]:
     stop = asyncio.Event()
     gate_task = asyncio.create_task(
-        _run_claimed_gate(database_url, run_id, run_uuid, timeframes)
+        _run_claimed_gate(
+            database_url,
+            worker_connections,
+            writer_fence_key,
+            run_id,
+            run_uuid,
+            timeframes,
+        )
     )
     watchdog_task = asyncio.create_task(_watch_lock_session(setup, stop))
     try:
@@ -781,18 +843,52 @@ async def run_gate(
     timeframes = _normalize_timeframes(timeframes)
     run_id = run_id or str(uuid.uuid4())
     run_uuid = uuid.UUID(run_id)
-    lock_key = _advisory_lock_key(run_uuid)
+    claim_key, writer_fence_key = _advisory_lock_keys(run_uuid)
     lock_owner_id = str(uuid.uuid4())
     setup = await asyncpg.connect(database_url)
-    lock_acquired = False
+    claim_lock_acquired = False
+    fence_exclusive_acquired = False
+    worker_connections: list[Any] = []
+    worker_shared_locks = 0
     try:
-        lock_acquired = bool(
-            await setup.fetchval("SELECT pg_try_advisory_lock($1::bigint)", lock_key)
+        claim_lock_acquired = bool(
+            await setup.fetchval("SELECT pg_try_advisory_lock($1::bigint)", claim_key)
         )
-        if not lock_acquired:
+        if not claim_lock_acquired:
             raise AuditRunAlreadyClaimed(
                 f"canonical audit {run_id} is already owned by another process"
             )
+        fence_exclusive_acquired = bool(
+            await setup.fetchval(
+                "SELECT pg_try_advisory_lock($1::bigint)",
+                writer_fence_key,
+            )
+        )
+        if not fence_exclusive_acquired:
+            raise AuditLockOwnershipLost(
+                "canonical audit takeover is blocked by an existing writer fence"
+            )
+        for _timeframe in TIMEFRAMES:
+            worker_connections.append(await asyncpg.connect(database_url))
+        await _unlock_advisory(
+            setup,
+            "SELECT pg_advisory_unlock($1::bigint)",
+            writer_fence_key,
+            "audit exclusive writer fence",
+        )
+        fence_exclusive_acquired = False
+        for connection in worker_connections:
+            acquired = bool(
+                await connection.fetchval(
+                    "SELECT pg_try_advisory_lock_shared($1::bigint)",
+                    writer_fence_key,
+                )
+            )
+            if not acquired:
+                raise AuditLockOwnershipLost(
+                    "audit worker could not acquire the shared writer fence"
+                )
+            worker_shared_locks += 1
         primary_key = await setup.fetchrow(PRIMARY_KEY_SQL)
         if not primary_key or not primary_key["convalidated"] or "(symbol_id, timeframe, ts)" not in primary_key["definition"]:
             raise RuntimeError("klines canonical primary key is absent or unvalidated")
@@ -800,28 +896,57 @@ async def run_gate(
         return await _run_with_lock_watchdog(
             setup,
             database_url,
+            worker_connections,
+            writer_fence_key,
             run_id,
             run_uuid,
             timeframes,
         )
     finally:
+        cleanup_errors: list[BaseException] = []
+        for index, connection in reversed(list(enumerate(worker_connections))):
+            try:
+                if index < worker_shared_locks:
+                    await _unlock_advisory(
+                        connection,
+                        "SELECT pg_advisory_unlock_shared($1::bigint)",
+                        writer_fence_key,
+                        "audit worker shared writer fence",
+                    )
+            except BaseException as error:
+                cleanup_errors.append(error)
+            try:
+                await connection.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
         try:
-            if lock_acquired:
+            if fence_exclusive_acquired:
                 try:
-                    unlocked = await setup.fetchval(
+                    await _unlock_advisory(
+                        setup,
                         "SELECT pg_advisory_unlock($1::bigint)",
-                        lock_key,
+                        writer_fence_key,
+                        "audit exclusive writer fence",
                     )
-                except Exception as error:
-                    raise AuditLockOwnershipLost(
-                        "audit advisory unlock failed; ownership was lost"
-                    ) from error
-                if unlocked is not True:
-                    raise AuditLockOwnershipLost(
-                        "audit advisory unlock returned false; ownership was lost"
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if claim_lock_acquired:
+                try:
+                    await _unlock_advisory(
+                        setup,
+                        "SELECT pg_advisory_unlock($1::bigint)",
+                        claim_key,
+                        "audit claim",
                     )
+                except BaseException as error:
+                    cleanup_errors.append(error)
         finally:
-            await setup.close()
+            try:
+                await setup.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
