@@ -309,12 +309,24 @@ class PostgresChanWriter:
                     if full_recompute_task is not None:
                         fenced = await conn.fetchval(
                             """
+                            with executable_batch as materialized (
+                                select batch.batch_id
+                                  from chan_c_full_recompute_batches batch
+                                  join chan_c_batches parent
+                                    on parent.id = batch.batch_id
+                                 where batch.batch_id = $1
+                                   and batch.status in ('pending', 'running')
+                                   and parent.status in ('planned', 'running')
+                                 for share of parent, batch
+                            )
                             select 1
-                              from chan_c_full_recompute_tasks
-                             where batch_id = $1 and symbol_id = $2 and chan_level = $3
-                               and status = 'running' and claim_token = $4
-                               and lease_version = $5 and lease_until > now()
-                             for update
+                              from chan_c_full_recompute_tasks task
+                              join executable_batch batch
+                                on batch.batch_id = task.batch_id
+                             where task.batch_id = $1 and task.symbol_id = $2 and task.chan_level = $3
+                               and task.status = 'running' and task.claim_token = $4
+                               and task.lease_version = $5 and task.lease_until > now()
+                              for update of task
                             """,
                             full_recompute_task["batch_id"],
                             symbol_id,
@@ -324,7 +336,8 @@ class PostgresChanWriter:
                         )
                         if fenced != 1:
                             raise StaleChanHeadError(
-                                f"Full-recompute task fence failed for symbol_id={symbol_id} level={level_code}"
+                                f"Full-recompute task or batch status fence failed "
+                                f"for symbol_id={symbol_id} level={level_code}"
                             )
                         run_id = await insert_run(resumable=True)
                     elif historical_replay_task is not None:

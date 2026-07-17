@@ -366,6 +366,12 @@ def test_full_recompute_write_and_task_completion_share_the_fenced_transaction()
 
         fence_query, fence_args = conn.fetchval_calls[1]
         assert "from chan_c_full_recompute_tasks" in fence_query
+        assert "from chan_c_full_recompute_batches batch" in fence_query
+        assert "join chan_c_batches parent" in fence_query
+        assert "batch.status in ('pending', 'running')" in fence_query
+        assert "parent.status in ('planned', 'running')" in fence_query
+        assert "for share of parent, batch" in fence_query
+        assert "for update of task" in fence_query
         assert fence_args == (7, 1, 5, "claim-1", 2)
         run_query, _run_args = conn.fetchval_calls[2]
         assert "on conflict (batch_id, run_identity)" in run_query
@@ -374,5 +380,45 @@ def test_full_recompute_write_and_task_completion_share_the_fenced_transaction()
             if "set status = 'completed'" in query
         )
         assert completion[1][:5] == (7, 1, 5, "claim-1", 2)
+
+    asyncio.run(scenario())
+
+
+def test_full_recompute_publication_rechecks_batch_status_before_any_write() -> None:
+    async def scenario() -> None:
+        conn = FakeConn()
+        conn._fetchval_results = iter([1, None])
+        writer = PostgresChanWriter(
+            "postgresql://unused", batch_id=7, run_group_id="batch-7",
+            native_base_timeframe=True,
+        )
+        writer._pool = FakePool(conn)
+        task = {
+            "batch_id": 7, "symbol_id": 1, "chan_level": 5,
+            "claim_token": "claim-1", "lease_version": 2,
+            "expected_heads": {},
+        }
+
+        with pytest.raises(StaleChanHeadError, match="batch status fence failed"):
+            await writer.replace_analysis(
+                symbol="000001.SZ", level="5f", modes=["confirmed", "predictive"],
+                bar_from=datetime.fromtimestamp(100, UTC),
+                bar_until=datetime.fromtimestamp(200, UTC), bar_count=20,
+                response={
+                    "snapshot_version": "batch-7-snapshot",
+                    "strokes": [], "segments": [], "centers": [], "signals": [],
+                },
+                full_recompute_task=task,
+            )
+
+        fence_query, _fence_args = conn.fetchval_calls[1]
+        assert "from chan_c_full_recompute_batches batch" in fence_query
+        assert "join chan_c_batches parent" in fence_query
+        assert "batch.status in ('pending', 'running')" in fence_query
+        assert "parent.status in ('planned', 'running')" in fence_query
+        assert "for share of parent, batch" in fence_query
+        assert "for update of task" in fence_query
+        assert conn.execute_calls == []
+        assert conn.copy_calls == []
 
     asyncio.run(scenario())
