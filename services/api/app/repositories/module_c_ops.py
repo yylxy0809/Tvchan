@@ -6,8 +6,12 @@ import re
 import uuid
 from collections import Counter
 from datetime import UTC, datetime
-from fractions import Fraction
 from typing import Any, Mapping
+
+from trading_protocol.module_c_canary_selection import (
+    evaluate_selection_evidence,
+    selection_active_universe_sha256,
+)
 
 
 LEVELS = ((5, "5f"), (30, "30f"), (1440, "1d"), (10080, "1w"), (43200, "1m"))
@@ -36,27 +40,6 @@ STRICT_PROVENANCE_FIELDS = (
     "catalog_manifest_sha256",
     "audit_active_universe_sha256",
 )
-CANARY_SELECTION_CONTRACT_VERSION = "module-c-canary-selection-v2"
-CANARY_SELECTION_ACTIVITY_BASIS = "pinned-audit-5f-rows-per-49-bar-1d-session-v1"
-CANARY_SELECTION_BARS_PER_COMPLETE_5F_SESSION = 49
-CANARY_SELECTION_BOARDS = ("main_board", "chinext", "star", "bj")
-CANARY_SELECTION_BOUNDARIES = ("lower", "middle", "upper")
-CANARY_SELECTION_POLICY = {
-    "symbol_count": 20,
-    "board_quotas": {board: 5 for board in CANARY_SELECTION_BOARDS},
-    "activity_boundary_counts_per_board": {"lower": 2, "middle": 1, "upper": 2},
-    "activity_basis": CANARY_SELECTION_ACTIVITY_BASIS,
-    "bars_per_complete_5f_session": CANARY_SELECTION_BARS_PER_COMPLETE_5F_SESSION,
-    "legacy_free_text_scenario_traits": "not_authoritative_without_frozen_evidence",
-    "tie_break": ["activity_ratio", "symbol_id", "symbol"],
-}
-CANARY_SELECTION_SOURCE_FIELDS = {
-    "eligibility_build_id",
-    "eligibility_manifest_sha256",
-    *STRICT_PROVENANCE_FIELDS,
-}
-
-
 RUNNING_COUNTS_SQL = """
 /* module-c-execution:running-counts */
 select clock_timestamp() as observed_at,
@@ -376,24 +359,18 @@ def _typed_strict_provenance(batch: Mapping[str, Any]) -> tuple[dict[str, Any] |
             parameters.get("audit_active_universe_sha256")
         ),
     }
-    selection = _json_object(parameters.get("canary_selection"))
-    selection_symbols = selection.get("symbols")
     try:
-        canary_identities = sorted(
-            {
-                (int(entry["symbol_id"]), str(entry["symbol"]).strip().upper())
-                for entry in selection_symbols
-                if isinstance(entry, Mapping)
-            }
-        ) if isinstance(selection_symbols, list) else []
-    except (KeyError, TypeError, ValueError):
-        canary_identities = []
+        expected_canary_universe = selection_active_universe_sha256(
+            parameters.get("canary_selection")
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):
+        expected_canary_universe = None
     canary_universe_matches = bool(
         batch.get("batch_kind") == "canary"
         and parameters.get("scope") == "canary"
-        and len(canary_identities) == 20
+        and expected_canary_universe is not None
         and _sha(batch.get("build_active_universe_sha256"))
-        == _stable_selection_universe_hash(canary_identities)
+        == expected_canary_universe
     )
     baseline_universe_matches = bool(
         batch.get("batch_kind") != "canary"
@@ -410,248 +387,6 @@ def _typed_strict_provenance(batch: Mapping[str, Any]) -> tuple[dict[str, Any] |
         and (canary_universe_matches or baseline_universe_matches)
     )
     return (columns if valid else None), valid
-
-
-def _selection_board(symbol: str) -> str | None:
-    code, separator, exchange = symbol.upper().partition(".")
-    if not separator:
-        return None
-    if exchange == "BJ":
-        return "bj"
-    if exchange == "SH" and code.startswith(("688", "689")):
-        return "star"
-    if exchange == "SZ" and code.startswith(("300", "301")):
-        return "chinext"
-    if (
-        exchange == "SH" and code.startswith(("600", "601", "603", "605"))
-    ) or (
-        exchange == "SZ" and code.startswith(("000", "001", "002", "003"))
-    ):
-        return "main_board"
-    return None
-
-
-def _stable_selection_universe_hash(identities: list[tuple[int, str]]) -> str:
-    digest = hashlib.sha256()
-    for _symbol_id, symbol in identities:
-        digest.update(json.dumps(symbol, ensure_ascii=False, sort_keys=True).encode("utf-8"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
-def _selection_integer(value: Any, *, positive: bool = False) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    if value < (1 if positive else 0):
-        return None
-    return value
-
-
-def _selection_provenance(
-    batch: Mapping[str, Any],
-    parameters: Mapping[str, Any],
-    strict_provenance: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    empty_counts = {board: 0 for board in CANARY_SELECTION_BOARDS}
-    empty_boundaries = {
-        board: {boundary: 0 for boundary in CANARY_SELECTION_BOUNDARIES}
-        for board in CANARY_SELECTION_BOARDS
-    }
-    if batch.get("batch_kind") != "canary":
-        return {
-            "status": "not_applicable",
-            "contract_version": None,
-            "manifest_sha256": None,
-            "source_build_id": None,
-            "activity_basis": None,
-            "board_counts": {},
-            "boundary_counts": {},
-            "contract_matches": None,
-            "hash_matches": None,
-            "source_matches": None,
-            "quotas_match": None,
-            "drift_reasons": [],
-        }
-
-    raw_manifest = parameters.get("canary_selection")
-    if not isinstance(raw_manifest, Mapping):
-        return {
-            "status": "unavailable",
-            "contract_version": parameters.get("selection_contract_version"),
-            "manifest_sha256": _sha(parameters.get("selection_manifest_sha256")),
-            "source_build_id": _uuid_text(parameters.get("source_build_id")),
-            "activity_basis": None,
-            "board_counts": empty_counts,
-            "boundary_counts": empty_boundaries,
-            "contract_matches": None,
-            "hash_matches": None,
-            "source_matches": None,
-            "quotas_match": None,
-            "drift_reasons": ["canary_selection_unavailable"],
-        }
-
-    manifest = dict(raw_manifest)
-    source = _json_object(manifest.get("source"))
-    policy = _json_object(manifest.get("policy"))
-    symbols = manifest.get("symbols")
-    contract_version = manifest.get("contract_version")
-    manifest_sha256 = _sha(manifest.get("selection_sha256"))
-    source_build_id = _uuid_text(source.get("eligibility_build_id"))
-    activity_basis = policy.get("activity_basis")
-
-    board_counts = Counter({board: 0 for board in CANARY_SELECTION_BOARDS})
-    boundary_counts = {
-        board: Counter({boundary: 0 for boundary in CANARY_SELECTION_BOUNDARIES})
-        for board in CANARY_SELECTION_BOARDS
-    }
-    quotas_match = isinstance(symbols, list) and len(symbols) == 20
-    identities: set[int] = set()
-    names: set[str] = set()
-    observed_traits: set[str] = set()
-    board_rows: dict[str, list[tuple[Fraction, int, str, str]]] = {
-        board: [] for board in CANARY_SELECTION_BOARDS
-    }
-    if isinstance(symbols, list) and len(symbols) == 20:
-        for entry in symbols:
-            if not isinstance(entry, Mapping) or set(entry) != {
-                "symbol_id", "symbol", "board", "activity_boundary", "traits",
-                "eligible_timeframes", "evidence",
-            }:
-                quotas_match = False
-                continue
-            symbol_id = _selection_integer(entry.get("symbol_id"), positive=True)
-            symbol = str(entry.get("symbol") or "").strip().upper()
-            board = str(entry.get("board") or "")
-            boundary = str(entry.get("activity_boundary") or "")
-            traits = entry.get("traits")
-            eligible_timeframes = entry.get("eligible_timeframes")
-            evidence = entry.get("evidence")
-            if (
-                symbol_id is None
-                or symbol_id in identities
-                or not symbol
-                or symbol in names
-                or board not in CANARY_SELECTION_BOARDS
-                or _selection_board(symbol) != board
-                or boundary not in CANARY_SELECTION_BOUNDARIES
-                or traits != [board, f"{boundary}_activity_boundary"]
-                or not isinstance(eligible_timeframes, list)
-                or not all(isinstance(level, str) for level in eligible_timeframes)
-                or len(eligible_timeframes) != len(set(eligible_timeframes))
-                or any(level not in {name for _code, name in LEVELS} for level in eligible_timeframes)
-                or "5f" not in eligible_timeframes
-                or "1d" not in eligible_timeframes
-                or not isinstance(evidence, Mapping)
-                or set(evidence) != {
-                    "basis", "canonical_audit_run_id", "five_minute_rows", "daily_rows",
-                    "activity_ratio_numerator", "activity_ratio_denominator",
-                }
-            ):
-                quotas_match = False
-                continue
-            numerator = _selection_integer(evidence.get("activity_ratio_numerator"))
-            denominator = _selection_integer(
-                evidence.get("activity_ratio_denominator"), positive=True
-            )
-            five_minute_rows = _selection_integer(evidence.get("five_minute_rows"))
-            daily_rows = _selection_integer(evidence.get("daily_rows"), positive=True)
-            if (
-                numerator is None
-                or denominator is None
-                or five_minute_rows is None
-                or daily_rows is None
-                or evidence.get("basis") != CANARY_SELECTION_ACTIVITY_BASIS
-                or _uuid_text(evidence.get("canonical_audit_run_id"))
-                != _uuid_text(source.get("canonical_audit_run_id"))
-                or Fraction(numerator, denominator)
-                != Fraction(
-                    five_minute_rows,
-                    daily_rows * CANARY_SELECTION_BARS_PER_COMPLETE_5F_SESSION,
-                )
-            ):
-                quotas_match = False
-                continue
-            identities.add(symbol_id)
-            names.add(symbol)
-            observed_traits.update(str(trait) for trait in traits)
-            board_counts[board] += 1
-            boundary_counts[board][boundary] += 1
-            board_rows[board].append(
-                (Fraction(numerator, denominator), symbol_id, symbol, boundary)
-            )
-
-    expected_boundaries = ["lower", "lower", "middle", "upper", "upper"]
-    quotas_match = bool(
-        quotas_match
-        and len(identities) == 20
-        and dict(board_counts) == CANARY_SELECTION_POLICY["board_quotas"]
-        and all(
-            dict(boundary_counts[board])
-            == CANARY_SELECTION_POLICY["activity_boundary_counts_per_board"]
-            and [row[3] for row in board_rows[board]] == expected_boundaries
-            and board_rows[board]
-            == sorted(board_rows[board], key=lambda row: row[:3])
-            for board in CANARY_SELECTION_BOARDS
-        )
-    )
-    contract_matches = bool(
-        set(manifest) == {
-            "contract_version", "source", "policy", "symbols", "selection_sha256"
-        }
-        and contract_version == CANARY_SELECTION_CONTRACT_VERSION
-        and parameters.get("scope") == "canary"
-        and parameters.get("selection_contract_version") == contract_version
-        and policy == CANARY_SELECTION_POLICY
-        and parameters.get("selection_traits") == sorted(observed_traits)
-    )
-    unsigned = {key: manifest[key] for key in manifest if key != "selection_sha256"}
-    hash_matches = bool(
-        manifest_sha256 is not None
-        and _manifest_sha256([unsigned]) == manifest_sha256
-        and _sha(parameters.get("selection_manifest_sha256")) == manifest_sha256
-    )
-    source_matches = bool(
-        set(source) == CANARY_SELECTION_SOURCE_FIELDS
-        and source_build_id is not None
-        and source_build_id == _uuid_text(parameters.get("source_build_id"))
-        and _sha(source.get("eligibility_manifest_sha256")) is not None
-        and strict_provenance is not None
-        and all(
-            (
-                _int(source.get(field)) == strict_provenance[field]
-                if field == "catalog_control_revision"
-                else _uuid_text(source.get(field)) == strict_provenance[field]
-                if field in {"canonical_audit_run_id", "catalog_generation_id"}
-                else source.get(field) == strict_provenance[field]
-            )
-            for field in STRICT_PROVENANCE_FIELDS
-        )
-    )
-    drift_reasons: list[str] = []
-    if not contract_matches:
-        drift_reasons.append("canary_selection_contract_drift")
-    if not hash_matches:
-        drift_reasons.append("canary_selection_hash_drift")
-    if not source_matches:
-        drift_reasons.append("canary_selection_source_drift")
-    if not quotas_match:
-        drift_reasons.append("canary_selection_quota_drift")
-    return {
-        "status": "pass" if not drift_reasons else "failed",
-        "contract_version": contract_version if isinstance(contract_version, str) else None,
-        "manifest_sha256": manifest_sha256,
-        "source_build_id": source_build_id,
-        "activity_basis": activity_basis if isinstance(activity_basis, str) else None,
-        "board_counts": dict(board_counts),
-        "boundary_counts": {
-            board: dict(boundary_counts[board]) for board in CANARY_SELECTION_BOARDS
-        },
-        "contract_matches": contract_matches,
-        "hash_matches": hash_matches,
-        "source_matches": source_matches,
-        "quotas_match": quotas_match,
-        "drift_reasons": drift_reasons,
-    }
 
 
 def _nonnegative_int(value: Any) -> int | None:
@@ -906,7 +641,12 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
     raw_audit_gate_pass = _json_object(batch.get("audit_summary")).get("gate_pass")
     audit_gate_pass = raw_audit_gate_pass if isinstance(raw_audit_gate_pass, bool) else None
     strict_provenance, strict_parameters_match = _typed_strict_provenance(batch)
-    selection = _selection_provenance(batch, build_parameters, strict_provenance)
+    selection = evaluate_selection_evidence(
+        build_parameters,
+        strict_provenance,
+        batch.get("build_active_universe_sha256"),
+        applicable=batch.get("batch_kind") == "canary",
+    )
     checkpoint_rows = (
         await conn.fetch(CHECKPOINT_EVIDENCE_SQL, batch.get("canonical_audit_run_id"))
         if strict_provenance is not None

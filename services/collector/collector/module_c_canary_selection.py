@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import uuid
@@ -15,112 +14,34 @@ import asyncpg
 
 from collector.module_c_eligibility import CODE_TO_TIMEFRAME, Disposition, _stable_hash
 from trading_protocol import MODULE_C_CONFIG_HASH
-
-
-CONTRACT_VERSION = "module-c-canary-selection-v2"
-BARS_PER_COMPLETE_5F_SESSION = 49
-ACTIVITY_BASIS = "pinned-audit-5f-rows-per-49-bar-1d-session-v1"
-BOARD_ORDER = ("main_board", "chinext", "star", "bj")
-BOARD_QUOTAS = {board: 5 for board in BOARD_ORDER}
-BOUNDARY_COUNTS = {"lower": 2, "middle": 1, "upper": 2}
-SOURCE_FIELDS = (
-    "eligibility_build_id",
-    "eligibility_manifest_sha256",
-    "canonical_audit_run_id",
-    "audit_evidence_sha256",
-    "audit_checkpoint_sha256",
-    "freshness_contract_version",
-    "freshness_contract_sha256",
-    "catalog_generation_id",
-    "catalog_control_revision",
-    "catalog_manifest_sha256",
-    "audit_active_universe_sha256",
-)
-SHA_FIELDS = frozenset(
-    {
-        "eligibility_manifest_sha256",
-        "audit_evidence_sha256",
-        "audit_checkpoint_sha256",
-        "freshness_contract_sha256",
-        "catalog_manifest_sha256",
-        "audit_active_universe_sha256",
-    }
+from trading_protocol.module_c_canary_selection import (
+    ACTIVITY_BASIS,
+    BARS_PER_COMPLETE_5F_SESSION,
+    BOARD_ORDER,
+    BOARD_QUOTAS,
+    BOUNDARY_COUNTS,
+    CONTRACT_VERSION,
+    SOURCE_FIELDS,
+    canonical_selection_sha256,
+    classify_board,
+    normalize_selection_source,
+    selection_policy,
+    validate_selection_manifest,
 )
 
 
-def _canonical_sha256(value: Mapping[str, Any]) -> str:
-    payload = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload + b"\n").hexdigest()
-
-
-def _board(symbol: str) -> str | None:
-    code, separator, exchange = symbol.upper().partition(".")
-    if not separator:
-        return None
-    if exchange == "BJ":
-        return "bj"
-    if exchange == "SH" and code.startswith(("688", "689")):
-        return "star"
-    if exchange == "SZ" and code.startswith(("300", "301")):
-        return "chinext"
-    if (
-        exchange == "SH" and code.startswith(("600", "601", "603", "605"))
-    ) or (
-        exchange == "SZ" and code.startswith(("000", "001", "002", "003"))
-    ):
-        return "main_board"
-    return None
+# Compatibility aliases keep the Collector builder API stable while the pure contract
+# has one implementation shared with API/report consumers.
+_canonical_sha256 = canonical_selection_sha256
+_board = classify_board
+_normalized_source = normalize_selection_source
+_policy = selection_policy
 
 
 def _integer(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{label} must be a non-negative integer")
     return value
-
-
-def _normalized_source(source: Mapping[str, Any]) -> dict[str, Any]:
-    if set(source) != set(SOURCE_FIELDS):
-        raise ValueError("selection source must use the exact strict-v2 schema")
-    normalized = {field: str(source[field]) for field in SOURCE_FIELDS}
-    normalized["catalog_control_revision"] = _integer(
-        source["catalog_control_revision"], "catalog_control_revision"
-    )
-    for field in SHA_FIELDS:
-        value = normalized[field]
-        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-            raise ValueError(f"selection source {field} must be lowercase SHA-256")
-    for field in (
-        "eligibility_build_id",
-        "canonical_audit_run_id",
-        "catalog_generation_id",
-    ):
-        try:
-            normalized[field] = str(uuid.UUID(normalized[field]))
-        except ValueError as error:
-            raise ValueError(f"selection source {field} must be a UUID") from error
-    if (
-        normalized["freshness_contract_version"]
-        != "module-c-authoritative-freshness-v1"
-    ):
-        raise ValueError("selection source freshness contract version is unsupported")
-    return normalized
-
-
-def _policy() -> dict[str, Any]:
-    return {
-        "symbol_count": 20,
-        "board_quotas": BOARD_QUOTAS,
-        "activity_boundary_counts_per_board": BOUNDARY_COUNTS,
-        "activity_basis": ACTIVITY_BASIS,
-        "bars_per_complete_5f_session": BARS_PER_COMPLETE_5F_SESSION,
-        "legacy_free_text_scenario_traits": "not_authoritative_without_frozen_evidence",
-        "tie_break": ["activity_ratio", "symbol_id", "symbol"],
-    }
 
 
 def _candidate_rows(
@@ -260,102 +181,6 @@ def build_selection_manifest(
         "symbols": selected,
     }
     return {**unsigned, "selection_sha256": _canonical_sha256(unsigned)}
-
-
-def validate_selection_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
-    if set(payload) != {
-        "contract_version",
-        "source",
-        "policy",
-        "symbols",
-        "selection_sha256",
-    }:
-        raise ValueError("selection-v2 manifest must use the exact schema")
-    if payload["contract_version"] != CONTRACT_VERSION:
-        raise ValueError("Unsupported canary selection contract_version")
-    source = _normalized_source(payload["source"])
-    if payload["policy"] != _policy():
-        raise ValueError("selection-v2 policy does not match the deterministic contract")
-    symbols = payload["symbols"]
-    if not isinstance(symbols, list) or len(symbols) != 20:
-        raise ValueError("Canary selection must contain exactly 20 symbols")
-    if len({int(entry.get("symbol_id", -1)) for entry in symbols}) != 20 or len(
-        {str(entry.get("symbol") or "").upper() for entry in symbols}
-    ) != 20:
-        raise ValueError("Canary selection symbols must be 20 unique identities")
-    board_counts: dict[str, int] = defaultdict(int)
-    boundary_counts: dict[tuple[str, str], int] = defaultdict(int)
-    for entry in symbols:
-        if set(entry) != {
-            "symbol_id",
-            "symbol",
-            "board",
-            "activity_boundary",
-            "traits",
-            "eligible_timeframes",
-            "evidence",
-        }:
-            raise ValueError("selection-v2 symbol entry must use the exact schema")
-        symbol = str(entry.get("symbol") or "").strip().upper()
-        board = str(entry.get("board") or "")
-        boundary = str(entry.get("activity_boundary") or "")
-        evidence = entry.get("evidence")
-        if _board(symbol) != board or board not in BOARD_QUOTAS:
-            raise ValueError("selection-v2 board evidence is inconsistent")
-        if boundary not in BOUNDARY_COUNTS or not isinstance(evidence, Mapping):
-            raise ValueError("selection-v2 activity boundary evidence is incomplete")
-        if evidence.get("basis") != ACTIVITY_BASIS or str(
-            evidence.get("canonical_audit_run_id")
-        ) != source["canonical_audit_run_id"]:
-            raise ValueError("selection-v2 activity evidence is not audit-bound")
-        if set(evidence) != {
-            "basis",
-            "canonical_audit_run_id",
-            "five_minute_rows",
-            "daily_rows",
-            "activity_ratio_numerator",
-            "activity_ratio_denominator",
-        }:
-            raise ValueError("selection-v2 activity evidence must use the exact schema")
-        if entry.get("traits") != [board, f"{boundary}_activity_boundary"]:
-            raise ValueError("selection-v2 traits are inconsistent")
-        eligible_timeframes = entry.get("eligible_timeframes")
-        if (
-            not isinstance(eligible_timeframes, list)
-            or not eligible_timeframes
-            or len(set(eligible_timeframes)) != len(eligible_timeframes)
-            or any(value not in CODE_TO_TIMEFRAME.values() for value in eligible_timeframes)
-            or "5f" not in eligible_timeframes
-            or "1d" not in eligible_timeframes
-        ):
-            raise ValueError("selection-v2 eligible timeframe evidence is incomplete")
-        numerator = _integer(
-            evidence.get("activity_ratio_numerator"), "activity_ratio_numerator"
-        )
-        denominator = _integer(
-            evidence.get("activity_ratio_denominator"), "activity_ratio_denominator"
-        )
-        five_minute_rows = _integer(evidence.get("five_minute_rows"), "five_minute_rows")
-        daily_rows = _integer(evidence.get("daily_rows"), "daily_rows")
-        if denominator == 0 or daily_rows == 0 or Fraction(
-            numerator, denominator
-        ) != Fraction(
-            five_minute_rows,
-            daily_rows * BARS_PER_COMPLETE_5F_SESSION,
-        ):
-            raise ValueError("selection-v2 activity ratio evidence is inconsistent")
-        board_counts[board] += 1
-        boundary_counts[(board, boundary)] += 1
-    if dict(board_counts) != BOARD_QUOTAS or any(
-        boundary_counts[(board, boundary)] != count
-        for board in BOARD_ORDER
-        for boundary, count in BOUNDARY_COUNTS.items()
-    ):
-        raise ValueError("selection-v2 board or activity boundary quotas are incomplete")
-    unsigned = {key: payload[key] for key in payload if key != "selection_sha256"}
-    if payload["selection_sha256"] != _canonical_sha256(unsigned):
-        raise ValueError("selection-v2 canonical SHA-256 is invalid")
-    return dict(payload)
 
 
 def validate_selection_source(

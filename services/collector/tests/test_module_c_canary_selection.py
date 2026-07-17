@@ -11,6 +11,10 @@ from collector.module_c_batch_control import load_selection
 from collector.module_c_canary_selection import (
     BARS_PER_COMPLETE_5F_SESSION,
     BOARD_QUOTAS,
+    _board,
+    _canonical_sha256,
+    _normalized_source,
+    _policy,
     build_selection_manifest,
     select_from_build,
     validate_selection_manifest,
@@ -18,6 +22,13 @@ from collector.module_c_canary_selection import (
 )
 from collector.module_c_eligibility import CODE_TO_TIMEFRAME, Disposition, _stable_hash
 from trading_protocol import MODULE_C_CONFIG_HASH
+from trading_protocol.module_c_canary_selection import (
+    canonical_selection_sha256,
+    classify_board,
+    normalize_selection_source,
+    selection_policy,
+    validate_selection_manifest as validate_shared_selection_manifest,
+)
 
 
 def _source() -> dict[str, object]:
@@ -100,6 +111,26 @@ def test_selection_v2_is_deterministic_and_covers_fixed_board_boundaries() -> No
     } == BOARD_QUOTAS
     assert len(first["selection_sha256"]) == 64
     assert validate_selection_manifest(first) == first
+
+
+def test_collector_pure_contract_adapters_match_shared_contract_exactly() -> None:
+    dispositions, checkpoints = _evidence()
+    manifest = build_selection_manifest(
+        source=_source(), dispositions=dispositions, checkpoints=checkpoints
+    )
+    unsigned = {
+        key: value for key, value in manifest.items() if key != "selection_sha256"
+    }
+
+    assert _canonical_sha256(unsigned) == canonical_selection_sha256(unsigned)
+    assert _normalized_source(_source()) == normalize_selection_source(_source())
+    assert _policy() == selection_policy()
+    assert all(
+        _board(symbol) == classify_board(symbol) for _symbol_id, symbol in _symbols()
+    )
+    assert validate_selection_manifest(manifest) == validate_shared_selection_manifest(
+        manifest
+    )
 
 
 def test_selection_v2_fails_closed_when_one_board_lacks_candidates() -> None:

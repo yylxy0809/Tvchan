@@ -27,6 +27,7 @@ const PASS_SELECTION = {
   hash_matches: true,
   source_matches: true,
   quotas_match: true,
+  active_universe_matches: true,
   drift_reasons: [],
 };
 
@@ -184,6 +185,7 @@ test("canary selection card renders a passing v2 contract and exact quotas read-
   assert.match(html, /hash matches: yes/);
   assert.match(html, /source matches: yes/);
   assert.match(html, /quotas match: yes/);
+  assert.match(html, /active universe matches: yes/);
   assert.doesNotMatch(html, /<button|<form|<input/);
 });
 
@@ -213,6 +215,7 @@ test("canary selection card makes failed and unavailable evidence explicit", () 
         hash_matches: null,
         source_matches: null,
         quotas_match: null,
+        active_universe_matches: null,
         drift_reasons: ["canary_selection_unavailable"],
       }}
     />,

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
+from trading_protocol.module_c_canary_selection import selection_active_universe_sha256
 
 from app.core.config import Settings, get_settings
 from app.main import create_app
@@ -156,18 +157,6 @@ def _canonical_sha256(value: dict) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(payload + b"\n").hexdigest()
-
-
-def _selection_active_universe_sha256(selection: dict) -> str:
-    digest = hashlib.sha256()
-    identities = sorted(
-        (int(entry["symbol_id"]), str(entry["symbol"]).upper())
-        for entry in selection["symbols"]
-    )
-    for _symbol_id, symbol in identities:
-        digest.update(json.dumps(symbol, ensure_ascii=False, sort_keys=True).encode("utf-8"))
-        digest.update(b"\n")
-    return digest.hexdigest()
 
 
 def _canary_selection(provenance: dict) -> dict:
@@ -409,7 +398,7 @@ def _batch(*, audit_active_universe_count: int = 20, **overrides) -> dict:
         "audit_parameters": audit_parameters,
         "audit_summary": audit_summary,
         "build_parameters": build_parameters,
-        "build_active_universe_sha256": _selection_active_universe_sha256(canary_selection),
+        "build_active_universe_sha256": selection_active_universe_sha256(canary_selection),
         "freshness_contract_version": "module-c-authoritative-freshness-v1",
         "freshness_contract_sha256": freshness_sha,
         "catalog_generation_id": "33333333-3333-3333-3333-333333333333",
@@ -483,6 +472,7 @@ def test_repository_returns_structured_bound_provenance_in_one_readonly_snapshot
     assert selection["hash_matches"] is True
     assert selection["source_matches"] is True
     assert selection["quotas_match"] is True
+    assert selection["active_universe_matches"] is True
     assert selection["drift_reasons"] == []
     assert provenance["drift_reasons"] == []
     assert "notes" not in result["batch"]
@@ -494,11 +484,23 @@ def test_repository_returns_structured_bound_provenance_in_one_readonly_snapshot
     [
         (lambda parameters: parameters.pop("canary_selection"), "unavailable", "canary_selection_unavailable"),
         (
+            lambda parameters: parameters.update({"scope": "baseline"}),
+            "failed",
+            "canary_selection_contract_drift",
+        ),
+        (
             lambda parameters: parameters["canary_selection"].update(
                 {"contract_version": "module-c-canary-selection-v1"}
             ),
             "failed",
             "canary_selection_contract_drift",
+        ),
+        (
+            lambda parameters: parameters["canary_selection"]["symbols"][0].update(
+                {"activity_boundary": []}
+            ),
+            "failed",
+            "canary_selection_quota_drift",
         ),
         (
             lambda parameters: parameters.update({"selection_manifest_sha256": "e" * 64}),
@@ -530,6 +532,8 @@ def test_canary_selection_gate_fails_visible(mutate, expected_status, reason) ->
     selection = result["batch"]["provenance"]["selection"]
     assert selection["status"] == expected_status
     assert reason in selection["drift_reasons"]
+    if expected_status == "unavailable":
+        assert selection["active_universe_matches"] is None
     assert reason in result["batch"]["provenance"]["drift_reasons"]
     assert result["batch"]["provenance"]["evidence_complete"] is False
 
@@ -559,6 +563,7 @@ def test_baseline_selection_gate_is_not_applicable() -> None:
         "hash_matches": None,
         "source_matches": None,
         "quotas_match": None,
+        "active_universe_matches": None,
         "drift_reasons": [],
     }
     assert result["batch"]["provenance"]["evidence_complete"] is True
@@ -579,6 +584,10 @@ def test_canary_strict_provenance_binds_subset_and_source_universes() -> None:
         get_module_c_execution_status(FakeConnection(batch=batch), batch_id=42)
     )
     assert drifted["batch"]["provenance"]["evidence_complete"] is False
+    assert drifted["batch"]["provenance"]["selection"]["active_universe_matches"] is False
+    assert "canary_selection_active_universe_drift" in drifted["batch"]["provenance"][
+        "selection"
+    ]["drift_reasons"]
     assert "strict_provenance_parameters_drift" in drifted["batch"]["provenance"]["drift_reasons"]
 
 
@@ -888,6 +897,9 @@ def test_route_uses_one_repeatable_read_readonly_transaction() -> None:
 
     assert response.status_code == 200
     assert response.json()["batch"]["batch_id"] == 42
+    assert response.json()["batch"]["provenance"]["selection"][
+        "active_universe_matches"
+    ] is True
     assert connection.transaction_args == {"isolation": "repeatable_read", "readonly": True}
 
 
