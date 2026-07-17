@@ -2,20 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from argparse import Namespace
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
+import collector.module_c_batch_control as batch_control
 from collector.module_c_batch_control import (
     _strict_v2_provenance,
     activate_batch,
     freeze_canary,
     load_selection,
+    revalidate_strict_v2_build,
     validate_canary_report,
     validate_canary_run_set,
+    validate_activation_identity,
     validate_strict_build,
+    validate_pristine_task_manifest,
     validate_terminal_tasks,
 )
 from collector.module_c_eligibility import _canonical_sha256
@@ -151,6 +157,128 @@ def _strict_v2_source() -> dict[str, object]:
             "freshness_contract": freshness_contract,
         },
     }
+
+
+def _strict_inputs(source: dict[str, object]) -> SimpleNamespace:
+    return SimpleNamespace(
+        audit_evidence_sha256=source["audit_evidence_sha256"],
+        audit_checkpoint_sha256=source["audit_checkpoint_sha256"],
+        audit_active_universe_sha256=source["audit_active_universe_sha256"],
+        catalog_generation_id=uuid.UUID(str(source["catalog_generation_id"])),
+        catalog_control_revision=source["catalog_control_revision"],
+        catalog_manifest_sha256=source["catalog_manifest_sha256"],
+    )
+
+
+@pytest.mark.parametrize(
+    "field,drifted",
+    [
+        ("audit_evidence_sha256", "0" * 64),
+        ("audit_checkpoint_sha256", "0" * 64),
+        ("audit_active_universe_sha256", "0" * 64),
+        ("catalog_generation_id", uuid.UUID(int=9)),
+        ("catalog_control_revision", 8),
+        ("catalog_manifest_sha256", "0" * 64),
+    ],
+)
+def test_revalidate_strict_v2_build_rejects_live_input_drift(
+    monkeypatch, field, drifted
+) -> None:
+    source = _strict_v2_source()
+    strict = _strict_inputs(source)
+    setattr(strict, field, drifted)
+
+    async def fake_load(*_args, **_kwargs):
+        return strict
+
+    async def fake_contract(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(batch_control, "_load_strict_inputs", fake_load)
+    monkeypatch.setattr(batch_control, "validate_strict_build", fake_contract)
+
+    with pytest.raises(RuntimeError, match="provenance drifted"):
+        asyncio.run(
+            revalidate_strict_v2_build(
+                object(), source, build_id="33333333-3333-3333-3333-333333333333"
+            )
+        )
+
+
+def test_revalidate_strict_v2_build_reuses_complete_strict_input_validation(
+    monkeypatch,
+) -> None:
+    source = _strict_v2_source()
+    calls: list[tuple[object, ...]] = []
+
+    async def fake_load(conn, audit_run_id, freshness):
+        calls.append((conn, audit_run_id, freshness.sha256))
+        return _strict_inputs(source)
+
+    async def fake_contract(conn, build, *, build_id, require_v2):
+        calls.append((conn, build, build_id, require_v2))
+
+    connection = object()
+    monkeypatch.setattr(batch_control, "_load_strict_inputs", fake_load)
+    monkeypatch.setattr(batch_control, "validate_strict_build", fake_contract)
+
+    asyncio.run(
+        revalidate_strict_v2_build(
+            connection, source, build_id="33333333-3333-3333-3333-333333333333"
+        )
+    )
+
+    assert calls[0][0] is connection
+    assert calls[0][1] == source["canonical_audit_run_id"]
+    assert calls[1] == (
+        connection,
+        source,
+        "33333333-3333-3333-3333-333333333333",
+        True,
+    )
+
+
+class _TaskManifestConnection:
+    def __init__(self, *, expected=100, tasks=100, mismatches=0) -> None:
+        self.result = {
+            "expected_rows": expected,
+            "task_rows": tasks,
+            "mismatch_rows": mismatches,
+        }
+        self.query = ""
+        self.args = ()
+
+    async def fetchrow(self, sql, *args):
+        self.query = " ".join(sql.lower().split())
+        self.args = args
+        return self.result
+
+
+@pytest.mark.parametrize(
+    "expected,tasks,mismatches",
+    [(99, 100, 0), (100, 99, 0), (100, 100, 1)],
+)
+def test_pristine_task_manifest_rejects_missing_extra_or_drifted_rows(
+    expected, tasks, mismatches
+) -> None:
+    connection = _TaskManifestConnection(
+        expected=expected, tasks=tasks, mismatches=mismatches
+    )
+
+    with pytest.raises(RuntimeError, match="drifted or non-pristine"):
+        asyncio.run(
+            validate_pristine_task_manifest(
+                connection,
+                batch_id=42,
+                build_id="33333333-3333-3333-3333-333333333333",
+                disposition_rows=100,
+            )
+        )
+
+    assert connection.args == (42, "33333333-3333-3333-3333-333333333333")
+    assert "full join actual" in connection.query
+    assert "target_bar_until is distinct from expected.covered_until" in connection.query
+    assert "actual.attempts <> 0" in connection.query
 
 
 def test_canary_strict_v2_provenance_is_copied_exactly() -> None:
@@ -400,6 +528,55 @@ def test_output_failure_rolls_back_frozen_canary(tmp_path, monkeypatch) -> None:
     assert connection.inserted_args is not None
 
 
+class _PrepareDriftConnection:
+    def __init__(self) -> None:
+        self.execute_calls: list[str] = []
+        self.transaction_failed = False
+
+    @asynccontextmanager
+    async def transaction(self, *, isolation=None):
+        assert isolation == "serializable"
+        try:
+            yield
+        except Exception:
+            self.transaction_failed = True
+            raise
+
+    async def execute(self, sql, *_args):
+        self.execute_calls.append(" ".join(sql.lower().split()))
+        return "SELECT 1"
+
+    async def fetchrow(self, sql, *_args):
+        assert "from module_c_eligibility_builds" in sql.lower()
+        return {
+            **_strict_v2_source(),
+            "build_id": "33333333-3333-3333-3333-333333333333",
+            "config_hash": MODULE_C_CONFIG_HASH,
+            "manifest_hash": "9" * 64,
+            "active_symbols": 20,
+            "disposition_rows": 100,
+        }
+
+
+def test_prepare_batch_revalidates_provenance_before_state_writes(monkeypatch) -> None:
+    connection = _PrepareDriftConnection()
+
+    async def reject(*_args, **_kwargs):
+        raise RuntimeError("provenance drift")
+
+    monkeypatch.setattr(batch_control, "revalidate_strict_v2_build", reject)
+    args = Namespace(
+        batch_key="canary-20260718",
+        eligibility_build_id="33333333-3333-3333-3333-333333333333",
+    )
+
+    with pytest.raises(RuntimeError, match="provenance drift"):
+        asyncio.run(batch_control.prepare_batch(connection, args))
+
+    assert all("insert into" not in sql and "update " not in sql for sql in connection.execute_calls)
+    assert connection.transaction_failed is True
+
+
 class _ActivateConnection:
     def __init__(
         self,
@@ -411,11 +588,36 @@ class _ActivateConnection:
         update_results: tuple[str, ...] = ("UPDATE 1", "UPDATE 1"),
     ) -> None:
         self.row = {
+            **_strict_v2_source(),
             "parent_status": parent_status,
             "batch_kind": "canary",
             "child_status": child_status,
+            "child_disposition_rows": disposition_rows,
             "disposition_rows": disposition_rows,
             "task_count": task_count,
+            "build_id": "33333333-3333-3333-3333-333333333333",
+            "config_hash": MODULE_C_CONFIG_HASH,
+            "manifest_hash": "9" * 64,
+            "active_symbols": 20,
+            "parent_config_hash": MODULE_C_CONFIG_HASH,
+            "parent_manifest_hash": "9" * 64,
+            "effective_config": {
+                "contract": "module-c-native-five-level-v1",
+                "levels": ["5f", "30f", "1d", "1w", "1m"],
+                "modes": ["confirmed", "predictive"],
+                "concurrency_per_worker": 1,
+                "shard_count": 4,
+                "eligibility_build_id": "33333333-3333-3333-3333-333333333333",
+            },
+            "parent_run_group_id": "group-1",
+            "parent_publication_namespace": "production",
+            "parent_profile_id": "module-c-native-5lvl",
+            "child_active_symbols": 20,
+            "child_shard_count": 4,
+            "child_config_hash": MODULE_C_CONFIG_HASH,
+            "child_run_group_id": "group-1",
+            "child_publication_namespace": "production",
+            "child_profile_id": "module-c-native-5lvl",
         }
         self.update_results = iter(update_results)
         self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
@@ -441,7 +643,34 @@ class _ActivateConnection:
         return next(self.update_results)
 
 
-def test_activate_batch_atomically_transitions_parent_and_child() -> None:
+def _stub_activation_validations(monkeypatch) -> None:
+    async def valid(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(batch_control, "revalidate_strict_v2_build", valid)
+    monkeypatch.setattr(batch_control, "validate_pristine_task_manifest", valid)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("parent_manifest_hash", "0" * 64),
+        ("child_config_hash", "wrong"),
+        ("child_run_group_id", "wrong"),
+        ("child_active_symbols", 19),
+        ("child_disposition_rows", 99),
+    ],
+)
+def test_activation_identity_rejects_parent_child_manifest_drift(field, value) -> None:
+    connection = _ActivateConnection()
+    connection.row[field] = value
+
+    with pytest.raises(RuntimeError, match="batch identity"):
+        validate_activation_identity(connection.row)
+
+
+def test_activate_batch_atomically_transitions_parent_and_child(monkeypatch) -> None:
+    _stub_activation_validations(monkeypatch)
     connection = _ActivateConnection()
 
     result = asyncio.run(activate_batch(connection, Namespace(batch_id=42)))
@@ -461,7 +690,8 @@ def test_activate_batch_atomically_transitions_parent_and_child() -> None:
     assert connection.transaction_failed is False
 
 
-def test_activate_batch_rejects_second_activation_without_writes() -> None:
+def test_activate_batch_rejects_second_activation_without_writes(monkeypatch) -> None:
+    _stub_activation_validations(monkeypatch)
     connection = _ActivateConnection(parent_status="running", child_status="running")
 
     with pytest.raises(RuntimeError, match="planned/pending"):
@@ -472,10 +702,41 @@ def test_activate_batch_rejects_second_activation_without_writes() -> None:
 
 
 @pytest.mark.parametrize("update_results", [("UPDATE 0",), ("UPDATE 1", "UPDATE 0")])
-def test_activate_batch_rolls_back_when_either_status_cas_misses(update_results) -> None:
+def test_activate_batch_rolls_back_when_either_status_cas_misses(
+    monkeypatch, update_results
+) -> None:
+    _stub_activation_validations(monkeypatch)
     connection = _ActivateConnection(update_results=update_results)
 
     with pytest.raises(RuntimeError, match="atomically activate"):
         asyncio.run(activate_batch(connection, Namespace(batch_id=42)))
 
+    assert connection.transaction_failed is True
+
+
+@pytest.mark.parametrize("gate", ["provenance", "manifest"])
+def test_activate_batch_revalidates_before_status_writes(monkeypatch, gate) -> None:
+    connection = _ActivateConnection()
+
+    async def valid(*_args, **_kwargs):
+        return None
+
+    async def reject(*_args, **_kwargs):
+        raise RuntimeError(f"{gate} drift")
+
+    monkeypatch.setattr(
+        batch_control,
+        "revalidate_strict_v2_build",
+        reject if gate == "provenance" else valid,
+    )
+    monkeypatch.setattr(
+        batch_control,
+        "validate_pristine_task_manifest",
+        reject if gate == "manifest" else valid,
+    )
+
+    with pytest.raises(RuntimeError, match=f"{gate} drift"):
+        asyncio.run(activate_batch(connection, Namespace(batch_id=42)))
+
+    assert connection.execute_calls == []
     assert connection.transaction_failed is True

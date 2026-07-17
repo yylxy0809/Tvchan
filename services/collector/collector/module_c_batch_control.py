@@ -20,6 +20,7 @@ from collector.module_c_eligibility import (
     Disposition,
     FRESHNESS_CONTRACT_VERSION,
     _SHA256_RE,
+    _load_strict_inputs,
     _stable_hash,
     _write_outputs,
     build_summary,
@@ -220,6 +221,125 @@ async def validate_strict_build(
         or int(contract["unresolved_eligible"]) != 0
     ):
         raise RuntimeError("Eligibility build fails the strict five-level contract")
+
+
+async def revalidate_strict_v2_build(
+    conn: asyncpg.Connection,
+    build: Mapping[str, Any],
+    *,
+    build_id: str,
+) -> None:
+    """Revalidate one frozen build against the current strict-v2 input snapshot."""
+    provenance, parameters = _strict_v2_provenance(build)
+    freshness = parse_freshness_contract(parameters["freshness_contract"])
+    strict = await _load_strict_inputs(
+        conn,
+        provenance["canonical_audit_run_id"],
+        freshness,
+    )
+    observed = {
+        "canonical_audit_run_id": provenance["canonical_audit_run_id"],
+        "audit_evidence_sha256": strict.audit_evidence_sha256,
+        "audit_checkpoint_sha256": strict.audit_checkpoint_sha256,
+        "freshness_contract_version": freshness.contract_version,
+        "freshness_contract_sha256": freshness.sha256,
+        "catalog_generation_id": str(strict.catalog_generation_id),
+        "catalog_control_revision": strict.catalog_control_revision,
+        "catalog_manifest_sha256": strict.catalog_manifest_sha256,
+        "audit_active_universe_sha256": strict.audit_active_universe_sha256,
+    }
+    if observed != provenance:
+        raise RuntimeError("Strict-v2 eligibility provenance drifted after freeze")
+    await validate_strict_build(conn, build, build_id=build_id, require_v2=True)
+
+
+async def validate_pristine_task_manifest(
+    conn: asyncpg.Connection,
+    *,
+    batch_id: int,
+    build_id: str,
+    disposition_rows: int,
+) -> None:
+    contract = await conn.fetchrow(
+        """
+        with expected as materialized (
+            select symbol_id, symbol, timeframe, eligible, reasons, covered_until,
+                   case when eligible then 'pending' else 'excluded' end expected_status,
+                   mod((hashtextextended(symbol, 0) & 2147483647)::integer, 1024)::smallint
+                       expected_shard_bucket
+              from module_c_eligibility
+             where build_id=$2::uuid
+        ), actual as materialized (
+            select symbol_id, symbol, chan_level, eligible, exclusion_reasons,
+                   target_bar_until, shard_bucket, status, attempts, lease_version,
+                   worker_id, claim_token, lease_until, lease_heartbeat_at,
+                   run_id, bar_count, stroke_count, segment_count, center_count,
+                   signal_count, last_error, started_at, finished_at
+              from chan_c_full_recompute_tasks
+             where batch_id=$1
+        ), mismatches as (
+            select 1
+              from expected
+              full join actual
+                on actual.symbol_id=expected.symbol_id
+               and actual.chan_level=expected.timeframe
+             where expected.symbol_id is null
+                or actual.symbol_id is null
+                or actual.symbol is distinct from expected.symbol
+                or actual.eligible is distinct from expected.eligible
+                or actual.exclusion_reasons is distinct from expected.reasons
+                or actual.target_bar_until is distinct from expected.covered_until
+                or actual.shard_bucket is distinct from expected.expected_shard_bucket
+                or actual.status is distinct from expected.expected_status
+                or actual.attempts <> 0 or actual.lease_version <> 0
+                or actual.worker_id is not null or actual.claim_token is not null
+                or actual.lease_until is not null or actual.lease_heartbeat_at is not null
+                or actual.run_id is not null or actual.bar_count is not null
+                or actual.stroke_count is not null or actual.segment_count is not null
+                or actual.center_count is not null or actual.signal_count is not null
+                or actual.last_error is not null or actual.started_at is not null
+                or actual.finished_at is not null
+        )
+        select (select count(*) from expected)::integer expected_rows,
+               (select count(*) from actual)::integer task_rows,
+               (select count(*) from mismatches)::integer mismatch_rows
+        """,
+        batch_id,
+        build_id,
+    )
+    if (
+        contract is None
+        or int(contract["expected_rows"]) != disposition_rows
+        or int(contract["task_rows"]) != disposition_rows
+        or int(contract["mismatch_rows"]) != 0
+    ):
+        raise RuntimeError("Cannot activate a drifted or non-pristine task manifest")
+
+
+def validate_activation_identity(batch: Mapping[str, Any]) -> None:
+    effective_config = _json_object(batch["effective_config"])
+    expected_config = {
+        "contract": "module-c-native-five-level-v1",
+        "levels": list(LEVEL_NAMES),
+        "modes": ["confirmed", "predictive"],
+        "concurrency_per_worker": 1,
+        "shard_count": int(batch["child_shard_count"]),
+        "eligibility_build_id": str(batch["build_id"]),
+    }
+    if (
+        batch["batch_kind"] not in {"canary", "baseline"}
+        or effective_config != expected_config
+        or str(batch["parent_config_hash"]) != str(batch["config_hash"])
+        or str(batch["parent_manifest_hash"]) != str(batch["manifest_hash"])
+        or str(batch["child_config_hash"]) != str(batch["config_hash"])
+        or str(batch["child_run_group_id"]) != str(batch["parent_run_group_id"])
+        or str(batch["child_publication_namespace"])
+        != str(batch["parent_publication_namespace"])
+        or str(batch["child_profile_id"]) != str(batch["parent_profile_id"])
+        or int(batch["child_active_symbols"]) != int(batch["active_symbols"])
+        or int(batch["child_disposition_rows"]) != int(batch["disposition_rows"])
+    ):
+        raise RuntimeError("Cannot activate a drifted Module C batch identity")
 
 
 def validate_terminal_tasks(
@@ -495,8 +615,8 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         )
         if build is None or str(build["config_hash"]) != MODULE_C_CONFIG_HASH:
             raise RuntimeError("Eligibility build is missing or has the wrong config_hash")
-        await validate_strict_build(
-            conn, build, build_id=args.eligibility_build_id, require_v2=True
+        await revalidate_strict_v2_build(
+            conn, build, build_id=args.eligibility_build_id
         )
         rows = int(await conn.fetchval(
             "select count(*) from module_c_eligibility where build_id=$1::uuid",
@@ -643,18 +763,50 @@ async def activate_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> 
         row = await conn.fetchrow(
             """
             select parent.status parent_status, parent.batch_kind,
-                   child.status child_status, child.disposition_rows,
+                   parent.config_hash parent_config_hash,
+                   parent.eligible_manifest_sha256 parent_manifest_hash,
+                   parent.effective_config,
+                   parent.run_group_id parent_run_group_id,
+                   parent.publication_namespace parent_publication_namespace,
+                   parent.profile_id parent_profile_id,
+                   child.status child_status,
+                   child.disposition_rows child_disposition_rows,
+                   child.active_symbols child_active_symbols,
+                   child.shard_count child_shard_count,
+                   child.config_hash child_config_hash,
+                   child.run_group_id child_run_group_id,
+                   child.publication_namespace child_publication_namespace,
+                   child.profile_id child_profile_id,
+                   child.eligibility_build_id::text build_id,
+                   build.config_hash, build.manifest_hash, build.active_symbols,
+                   build.disposition_rows, build.parameters,
+                   build.canonical_audit_run_id::text,
+                   build.audit_evidence_sha256, build.audit_checkpoint_sha256,
+                   build.freshness_contract_version, build.freshness_contract_sha256,
+                   build.catalog_generation_id::text, build.catalog_control_revision,
+                   build.catalog_manifest_sha256, build.audit_active_universe_sha256,
                    (select count(*) from chan_c_full_recompute_tasks task where task.batch_id=parent.id) task_count
               from chan_c_batches parent
               join chan_c_full_recompute_batches child on child.batch_id=parent.id
+              join module_c_eligibility_builds build on build.build_id=child.eligibility_build_id
              where parent.id=$1 for update of parent, child
             """,
             args.batch_id,
         )
         if row is None or row["parent_status"] != "planned" or row["child_status"] != "pending":
             raise RuntimeError("Only a complete planned/pending Module C batch can be activated")
-        if int(row["task_count"]) != int(row["disposition_rows"]):
+        validate_activation_identity(row)
+        if int(row["task_count"]) != int(row["child_disposition_rows"]):
             raise RuntimeError("Cannot activate an incomplete task manifest")
+        await revalidate_strict_v2_build(
+            conn, row, build_id=str(row["build_id"])
+        )
+        await validate_pristine_task_manifest(
+            conn,
+            batch_id=args.batch_id,
+            build_id=str(row["build_id"]),
+            disposition_rows=int(row["child_disposition_rows"]),
+        )
         child_result = await conn.execute(
             """
             update chan_c_full_recompute_batches
