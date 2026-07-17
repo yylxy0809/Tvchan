@@ -80,6 +80,13 @@ def test_catalog_scope_is_cross_checked_inside_each_imported_snapshot() -> None:
     assert "c.bounds_complete is distinct from true" in sql
 
 
+def test_catalog_empty_scope_without_rows_is_unresolved() -> None:
+    sql = " ".join(build_gate_sql(5).lower().split())
+
+    assert "case when m.rows_scanned=0 then 1 else 0 end" in sql
+    assert "case when anomaly_total=0 then 'eligible' else 'unresolved' end" in sql
+
+
 def test_worker_binds_captured_generation_to_snapshot_query(monkeypatch) -> None:
     class Transaction:
         async def start(self) -> None:

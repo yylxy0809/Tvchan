@@ -432,6 +432,7 @@ WITH base AS {base_materialization} (
         m.catalog_empty_has_rows + m.catalog_present_missing_rows +
         m.catalog_present_bounds_mismatch + m.catalog_scope_missing +
         m.catalog_scope_unknown + m.catalog_scope_incomplete +
+        CASE WHEN m.rows_scanned=0 THEN 1 ELSE 0 END +
         coalesce(d.duplicate_rows,0))::bigint AS anomaly_total
     FROM catalog_checked m
     LEFT JOIN logical_duplicates d USING (symbol_id)
