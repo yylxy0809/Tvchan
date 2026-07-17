@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[3]
 
 def test_create_generation_serializes_manifest_snapshot_with_catalog_writers() -> None:
     events: list[str] = []
+    active_generation_id = uuid4()
+    generation_inserts: list[tuple[object, ...]] = []
 
     class Connection:
         @asynccontextmanager
@@ -37,10 +39,14 @@ def test_create_generation_serializes_manifest_snapshot_with_catalog_writers() -
             events.append("commit")
 
         async def fetchrow(self, sql: str, *args: object):
-            assert "kline_scope_catalog_control" in sql.lower()
-            assert "for update" in sql.lower()
-            events.append("control-lock")
-            return {"active_generation_id": None}
+            normalized = sql.lower()
+            if "kline_scope_catalog_control" in normalized:
+                assert "for update" in normalized
+                events.append("control-lock")
+                return {"active_generation_id": active_generation_id, "revision": 7}
+            assert "status = 'building'" in normalized
+            events.append("building-check")
+            return None
 
         async def fetchval(self, sql: str, *args: object):
             events.append("symbol-snapshot")
@@ -48,16 +54,55 @@ def test_create_generation_serializes_manifest_snapshot_with_catalog_writers() -
 
         async def execute(self, sql: str, *args: object) -> str:
             events.append("generation" if "catalog_generations" in sql else "manifest")
+            if "catalog_generations" in sql:
+                generation_inserts.append(args)
             return "INSERT 0 1"
 
+    generation_id = uuid4()
     result = asyncio.run(create_generation(
-        Connection(), generation_id=uuid4(), timeframes=[5, 30],
+        Connection(), generation_id=generation_id, timeframes=[5, 30],
     ))
 
     assert result["expected_scope_count"] == 4
     assert events == [
-        "begin", "control-lock", "symbol-snapshot", "generation", "manifest", "commit",
+        "begin", "control-lock", "building-check", "symbol-snapshot",
+        "generation", "manifest", "commit",
     ]
+    assert generation_inserts == [(
+        generation_id, 4, [7, 8], [5, 30], active_generation_id, 7,
+    )]
+
+
+def test_create_generation_rejects_a_second_building_generation() -> None:
+    existing_generation_id = uuid4()
+    events: list[str] = []
+
+    class Connection:
+        @asynccontextmanager
+        async def transaction(self):
+            events.append("begin")
+            yield
+
+        async def fetchrow(self, sql: str, *args: object):
+            normalized = sql.lower()
+            if "kline_scope_catalog_control" in normalized:
+                events.append("control-lock")
+                return {"active_generation_id": None, "revision": 0}
+            events.append("building-check")
+            return {"generation_id": existing_generation_id}
+
+        async def fetchval(self, sql: str, *args: object):
+            raise AssertionError("must not snapshot symbols while another generation is building")
+
+        async def execute(self, sql: str, *args: object) -> str:
+            raise AssertionError("must not insert a second building generation")
+
+    with pytest.raises(InvalidScopeGeneration, match=str(existing_generation_id)):
+        asyncio.run(create_generation(
+            Connection(), generation_id=uuid4(), timeframes=[5, 30],
+        ))
+
+    assert events == ["begin", "control-lock", "building-check"]
 
 
 class BootstrapConnection:
@@ -373,17 +418,28 @@ def test_delete_hook_invalidates_existing_scopes_in_one_statement_without_insert
     assert args == ([7, 8], [5, 30])
 
 
+_UNSET = object()
+
+
 class FinalizeConnection:
     def __init__(
         self, *, status: str, expected: int, scopes: int, unknown: int, incomplete: int,
         active_generation_id: UUID | None = None,
+        control_revision: int = 0,
+        base_active_generation_id: UUID | None = None,
+        base_control_revision: int | None | object = _UNSET,
     ) -> None:
         self.status = status
         self.expected = expected
         self.scopes = scopes
         self.unknown = unknown
         self.incomplete = incomplete
-        self.active_generation_id = active_generation_id or uuid4()
+        self.active_generation_id = active_generation_id
+        self.control_revision = control_revision
+        self.base_active_generation_id = base_active_generation_id
+        self.base_control_revision = (
+            control_revision if base_control_revision is _UNSET else base_control_revision
+        )
         self.executed: list[tuple[str, tuple[object, ...]]] = []
         self.lock_order: list[str] = []
 
@@ -398,6 +454,8 @@ class FinalizeConnection:
             return {
                 "generation_id": args[0], "status": self.status,
                 "expected_scope_count": self.expected,
+                "base_active_generation_id": self.base_active_generation_id,
+                "base_control_revision": self.base_control_revision,
             }
         if "count(*)::bigint as scope_count" in normalized:
             self.lock_order.append("summary")
@@ -408,13 +466,19 @@ class FinalizeConnection:
             }
         if "from kline_scope_catalog_control" in normalized:
             self.lock_order.append("control")
-            return {"active_generation_id": self.active_generation_id}
+            return {
+                "active_generation_id": self.active_generation_id,
+                "revision": self.control_revision,
+            }
         raise AssertionError(sql)
 
     async def execute(self, sql: str, *args: object) -> str:
         if "lock table kline_scope_catalog in share mode" in sql.lower():
             self.lock_order.append("catalog")
         self.executed.append((sql, args))
+        if "update kline_scope_catalog_control" in sql.lower():
+            self.active_generation_id = args[0]  # type: ignore[assignment]
+            self.control_revision += 1
         return "UPDATE 1"
 
 
@@ -437,7 +501,14 @@ def test_failed_generation_never_switches_the_active_pointer() -> None:
 
 
 def test_complete_generation_switches_pointer_and_supersedes_old_active_atomically() -> None:
-    connection = FinalizeConnection(status="building", expected=2, scopes=2, unknown=0, incomplete=0)
+    previous_generation_id = uuid4()
+    connection = FinalizeConnection(
+        status="building", expected=2, scopes=2, unknown=0, incomplete=0,
+        active_generation_id=previous_generation_id,
+        control_revision=7,
+        base_active_generation_id=previous_generation_id,
+        base_control_revision=7,
+    )
     generation_id = uuid4()
 
     result = asyncio.run(finalize_generation(connection, generation_id=generation_id))
@@ -447,8 +518,64 @@ def test_complete_generation_switches_pointer_and_supersedes_old_active_atomical
     statements = [" ".join(sql.lower().split()) for sql, _args in connection.executed]
     assert any("set status = 'complete'" in sql for sql in statements)
     assert any("update kline_scope_catalog_control" in sql for sql in statements)
+    control_sql, control_args = next(
+        (sql, args) for sql, args in connection.executed
+        if "update kline_scope_catalog_control" in sql.lower()
+    )
+    assert "revision = revision + 1" in " ".join(control_sql.lower().split())
+    assert control_args == (generation_id, 7, previous_generation_id)
+    assert connection.control_revision == 8
     assert any("set status = 'superseded'" in sql for sql in statements)
     assert connection.lock_order == ["control", "generation", "summary"]
+
+
+def test_first_generation_with_null_base_activates_at_revision_zero() -> None:
+    connection = FinalizeConnection(
+        status="building", expected=2, scopes=2, unknown=0, incomplete=0,
+        active_generation_id=None, control_revision=0,
+        base_active_generation_id=None, base_control_revision=0,
+    )
+    generation_id = uuid4()
+
+    result = asyncio.run(finalize_generation(connection, generation_id=generation_id))
+
+    assert result["status"] == "complete"
+    control_sql, control_args = next(
+        (sql, args) for sql, args in connection.executed
+        if "update kline_scope_catalog_control" in sql.lower()
+    )
+    assert "active_generation_id is not distinct from $3" in " ".join(control_sql.lower().split())
+    assert control_args == (generation_id, 0, None)
+    assert connection.control_revision == 1
+
+
+def test_pointer_clear_rejects_stale_building_generation() -> None:
+    base_active_generation_id = uuid4()
+    connection = FinalizeConnection(
+        status="building", expected=2, scopes=2, unknown=0, incomplete=0,
+        active_generation_id=None, control_revision=8,
+        base_active_generation_id=base_active_generation_id, base_control_revision=7,
+    )
+
+    with pytest.raises(InvalidScopeGeneration, match="base active generation"):
+        asyncio.run(finalize_generation(connection, generation_id=uuid4()))
+
+    assert connection.lock_order == ["control", "generation"]
+    assert connection.executed == []
+
+
+def test_control_revision_rejects_aba_pointer_reuse() -> None:
+    active_generation_id = uuid4()
+    connection = FinalizeConnection(
+        status="building", expected=2, scopes=2, unknown=0, incomplete=0,
+        active_generation_id=active_generation_id, control_revision=9,
+        base_active_generation_id=active_generation_id, base_control_revision=7,
+    )
+
+    with pytest.raises(InvalidScopeGeneration, match="control revision"):
+        asyncio.run(finalize_generation(connection, generation_id=uuid4()))
+
+    assert connection.executed == []
 
 
 def test_finalize_retry_is_idempotent_only_for_the_active_complete_generation() -> None:
@@ -456,11 +583,25 @@ def test_finalize_retry_is_idempotent_only_for_the_active_complete_generation() 
     connection = FinalizeConnection(
         status="complete", expected=2, scopes=2, unknown=0, incomplete=0,
         active_generation_id=generation_id,
+        base_control_revision=None,
     )
 
     result = asyncio.run(finalize_generation(connection, generation_id=generation_id))
 
     assert result["idempotent"] is True
+    assert connection.executed == []
+
+
+def test_legacy_building_generation_without_base_revision_cannot_finalize() -> None:
+    connection = FinalizeConnection(
+        status="building", expected=2, scopes=2, unknown=0, incomplete=0,
+        active_generation_id=None, control_revision=0,
+        base_active_generation_id=None, base_control_revision=None,
+    )
+
+    with pytest.raises(InvalidScopeGeneration, match="no base control revision"):
+        asyncio.run(finalize_generation(connection, generation_id=uuid4()))
+
     assert connection.executed == []
 
 
@@ -487,6 +628,47 @@ def test_migration_enforces_scope_state_bounds_and_safe_active_view() -> None:
         "kline_scope_catalog_control", "active_kline_scope_catalog",
     ):
         assert f"revoke all on table {relation} from public" in migration
+    forbidden_kline_mutation = (
+        r"(?:insert\s+into|update|delete\s+from|alter\s+table|drop\s+table)\s+klines\b",
+        r"create\s+(?:unique\s+)?index[\s\S]*?\bon\s+klines\b",
+        r"create\s+trigger[\s\S]*?\bon\s+klines\b",
+    )
+    assert not any(re.search(pattern, migration) for pattern in forbidden_kline_mutation)
+
+
+def test_migration_041_rejects_conflicts_and_enforces_one_building_generation() -> None:
+    migration = (
+        ROOT / "db" / "sql" / "041_kline_scope_catalog_generation_fencing.sql"
+    ).read_text(encoding="utf-8").lower()
+
+    assert "exists" in migration and "status = 'building'" in migration
+    assert "base_control_revision is null" in migration
+    assert "raise exception" in migration
+    assert "add column if not exists revision bigint not null default 0" in migration
+    assert "add column if not exists base_active_generation_id uuid" in migration
+    assert "add column if not exists base_control_revision bigint" in migration
+    assert "foreign key (base_active_generation_id)" in migration
+    assert "check (status <> 'building' or base_control_revision is not null)" in migration
+    assert "create or replace function enforce_kline_scope_catalog_control_revision()" in migration
+    assert "new.active_generation_id is distinct from old.active_generation_id" in migration
+    assert "new.revision <> old.revision + 1" in migration
+    assert "new.revision <> old.revision" in migration
+    assert "drop trigger if exists trg_kline_scope_catalog_control_revision" in migration
+    assert "before update of active_generation_id, revision" in migration
+    assert "execute function enforce_kline_scope_catalog_control_revision()" in migration
+    assert (
+        "revoke all on function enforce_kline_scope_catalog_control_revision() from public"
+        in migration
+    )
+    assert re.search(
+        r"create\s+unique\s+index\s+if\s+not\s+exists\s+"
+        r"uq_kline_scope_catalog_one_building_generation\s+"
+        r"on\s+kline_scope_catalog_generations\s*\(\s*status\s*\)\s+"
+        r"where\s+status\s*=\s*'building'",
+        migration,
+    )
+    assert "update kline_scope_catalog_generations" not in migration
+    assert "delete from kline_scope_catalog_generations" not in migration
     forbidden_kline_mutation = (
         r"(?:insert\s+into|update|delete\s+from|alter\s+table|drop\s+table)\s+klines\b",
         r"create\s+(?:unique\s+)?index[\s\S]*?\bon\s+klines\b",
