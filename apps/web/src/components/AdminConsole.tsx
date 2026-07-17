@@ -17,11 +17,13 @@ import {
   listAdminTokens,
 } from "../auth/api";
 import {
+  type AdminOpsStatus,
   type ConnectivityTestResult,
   type LlmProviderConfig,
   type LlmProvidersConfig,
   type LlmTestResult,
   type WencaiAdminConfig,
+  fetchAdminOpsStatus,
   fetchLlmProviders,
   fetchWencaiConfig,
   saveLlmProviders,
@@ -74,6 +76,7 @@ export function AdminConsole({ adminToken }: Props) {
     providers: [],
   });
   const [llmTestResults, setLlmTestResults] = useState<Record<string, LlmTestResult>>({});
+  const [opsStatus, setOpsStatus] = useState<AdminOpsStatus | null>(null);
   const [label, setLabel] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
@@ -86,6 +89,7 @@ export function AdminConsole({ adminToken }: Props) {
     void refreshFeatureConfig();
     void refreshWencaiConfig();
     void refreshLlmProviders();
+    void refreshOpsStatus();
   }, []);
 
   async function refreshTokens() {
@@ -130,6 +134,23 @@ export function AdminConsole({ adminToken }: Props) {
     } catch (nextError) {
       setError(readError(nextError));
       setLlmConfig(withDefaultProvider({ active_provider_id: null, providers: [] }));
+    }
+  }
+
+  async function refreshOpsStatus() {
+    try {
+      setOpsStatus(await fetchAdminOpsStatus(adminToken));
+    } catch (nextError) {
+      setOpsStatus({
+        status: "degraded",
+        lifecycle_observer: {
+          status: "unavailable",
+          deployed: false,
+          expected_observer_name: "unknown",
+          reason: "request_failed",
+          error: readError(nextError),
+        },
+      });
     }
   }
 
@@ -411,6 +432,47 @@ export function AdminConsole({ adminToken }: Props) {
           </div>
         ))}
       </div>
+
+      <section className="admin-feature-panel" aria-label="Lifecycle observer status">
+        <div className="admin-feature-head">
+          <div>
+            <p className="eyebrow">Lifecycle observer</p>
+            <h2>Outbox and watermark</h2>
+          </div>
+          <button className="ghost-button" type="button" onClick={() => void refreshOpsStatus()}>
+            <RefreshCw size={16} />
+            <span>Refresh status</span>
+          </button>
+        </div>
+        <div className="admin-feature-grid">
+          <div className="admin-feature-card">
+            <h3>Health</h3>
+            <strong data-state={opsStatus?.lifecycle_observer.status ?? "unavailable"}>
+              {opsStatus?.lifecycle_observer.status ?? "unavailable"}
+            </strong>
+            <p>{opsStatus?.lifecycle_observer.reason ?? "observer query available"}</p>
+            {opsStatus?.lifecycle_observer.error ? <code>{opsStatus.lifecycle_observer.error}</code> : null}
+          </div>
+          <div className="admin-feature-card">
+            <h3>Outbox backlog</h3>
+            <p>pending: {opsStatus?.lifecycle_observer.counts?.pending ?? "--"}</p>
+            <p>processing: {opsStatus?.lifecycle_observer.counts?.processing ?? "--"}</p>
+            <p>failed: {opsStatus?.lifecycle_observer.counts?.failed ?? "--"}</p>
+            <p>dead_letter: {opsStatus?.lifecycle_observer.counts?.dead_letter ?? "--"}</p>
+            <p>oldest: {formatDate(opsStatus?.lifecycle_observer.oldest_backlog_at)}</p>
+            <p>age: {formatAge(opsStatus?.lifecycle_observer.oldest_backlog_age_seconds)}</p>
+          </div>
+          <div className="admin-feature-card">
+            <h3>Observer watermark</h3>
+            <p>expected observer: {opsStatus?.lifecycle_observer.expected_observer_name ?? "--"}</p>
+            <p>observer: {opsStatus?.lifecycle_observer.observer_watermark?.observer_name ?? "--"}</p>
+            <p>last outbox: {opsStatus?.lifecycle_observer.observer_watermark?.last_outbox_id ?? "--"}</p>
+            <p>max outbox: {opsStatus?.lifecycle_observer.max_outbox_id ?? "--"}</p>
+            <p>lag: {opsStatus?.lifecycle_observer.observer_watermark?.lag ?? "--"}</p>
+            <p>updated: {formatDate(opsStatus?.lifecycle_observer.observer_watermark?.updated_at)}</p>
+          </div>
+        </div>
+      </section>
 
       <section className="admin-feature-panel" aria-label="运行时功能开关">
         <div className="admin-feature-head">
@@ -800,4 +862,11 @@ function formatDate(value?: string | null): string {
     return value;
   }
   return date.toLocaleString();
+}
+
+function formatAge(value?: number | null): string {
+  if (value === undefined || value === null) {
+    return "--";
+  }
+  return `${value}s`;
 }

@@ -24,6 +24,9 @@ class Settings:
         "postgresql://trader:change-me-before-long-running@127.0.0.1:5432/tradingview_local",
     )
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    chan_lifecycle_observer: str = field(
+        default_factory=lambda: os.getenv("CHAN_LIFECYCLE_OBSERVER", "chan-lifecycle-v1")
+    )
     use_seed_data: bool = os.getenv("USE_SEED_DATA", "true").lower() in {
         "1",
         "true",

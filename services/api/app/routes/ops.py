@@ -28,6 +28,18 @@ async def ops_status(
         redis = await asyncio.wait_for(_redis_status(settings.redis_url), timeout=2.0)
     except TimeoutError:
         redis = {"ok": False, "error": "redis_status_timeout"}
+    try:
+        lifecycle_observer = await asyncio.wait_for(
+            _lifecycle_observer_status(pool, settings.chan_lifecycle_observer),
+            timeout=2.0,
+        )
+    except TimeoutError:
+        lifecycle_observer = {
+            "status": "degraded",
+            "deployed": True,
+            "expected_observer_name": settings.chan_lifecycle_observer,
+            "reason": "query_timeout",
+        }
     if pool is None:
         module_c = {"ready": False, "reason": "db_pool_not_ready"}
     else:
@@ -38,11 +50,14 @@ async def ops_status(
         except Exception:
             module_c = {"ready": False, "reason": "coverage_query_failed"}
     return {
-        "status": "ok" if db.get("ok") and redis.get("ok") else "degraded",
+        "status": "ok"
+        if db.get("ok") and redis.get("ok") and lifecycle_observer.get("status") == "healthy"
+        else "degraded",
         "server_time": datetime.utcnow().isoformat() + "Z",
         "db": db,
         "redis": redis,
         "module_c_published_heads": module_c,
+        "lifecycle_observer": lifecycle_observer,
     }
 
 
@@ -92,6 +107,92 @@ async def _db_status(pool) -> dict[str, Any]:
             }
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:500]}
+
+
+async def _lifecycle_observer_status(pool, expected_observer_name: str) -> dict[str, Any]:
+    if pool is None:
+        return {
+            "status": "unavailable",
+            "deployed": False,
+            "expected_observer_name": expected_observer_name,
+            "reason": "db_pool_not_ready",
+        }
+    try:
+        async with pool.acquire() as conn:
+            stats_row = await conn.fetchrow(
+                """
+                select
+                    count(*) filter (where status = 'pending') as pending,
+                    count(*) filter (where status = 'processing') as processing,
+                    count(*) filter (where status = 'failed') as failed,
+                    count(*) filter (where status = 'dead_letter') as dead_letter,
+                    min(created_at) filter (
+                        where status in ('pending', 'processing', 'failed', 'dead_letter')
+                    ) as oldest_backlog_at,
+                    extract(epoch from (
+                        clock_timestamp() - min(created_at) filter (
+                            where status in ('pending', 'processing', 'failed', 'dead_letter')
+                        )
+                    ))::bigint as oldest_backlog_age_seconds,
+                    coalesce(max(id), 0) as max_outbox_id
+                from chan_c_head_outbox
+                """
+            )
+            watermark_row = await conn.fetchrow(
+                """
+                select observer_name, last_outbox_id, updated_at
+                from chan_lifecycle_observer_watermarks
+                where observer_name = $1
+                """,
+                expected_observer_name,
+            )
+    except Exception as exc:
+        if getattr(exc, "sqlstate", None) == "42P01":
+            return {
+                "status": "unavailable",
+                "deployed": False,
+                "expected_observer_name": expected_observer_name,
+                "reason": "schema_not_deployed",
+            }
+        return {
+            "status": "degraded",
+            "deployed": True,
+            "expected_observer_name": expected_observer_name,
+            "reason": "query_failed",
+            "error": str(exc)[:500],
+        }
+
+    stats = dict(stats_row)
+    counts = {
+        "pending": int(stats["pending"]),
+        "processing": int(stats["processing"]),
+        "failed": int(stats["failed"]),
+        "dead_letter": int(stats["dead_letter"]),
+    }
+    max_outbox_id = int(stats["max_outbox_id"])
+    observer_watermark = None
+    watermark_lag = 0
+    if watermark_row is not None:
+        watermark = dict(watermark_row)
+        watermark_lag = max(0, max_outbox_id - int(watermark["last_outbox_id"]))
+        observer_watermark = {
+            "observer_name": watermark["observer_name"],
+            "last_outbox_id": int(watermark["last_outbox_id"]),
+            "updated_at": watermark["updated_at"],
+            "lag": watermark_lag,
+        }
+    has_backlog = any(counts.values())
+    watermark_missing = max_outbox_id > 0 and observer_watermark is None
+    return {
+        "status": "degraded" if has_backlog or watermark_missing or watermark_lag > 0 else "healthy",
+        "deployed": True,
+        "expected_observer_name": expected_observer_name,
+        "counts": counts,
+        "oldest_backlog_at": stats["oldest_backlog_at"],
+        "oldest_backlog_age_seconds": stats["oldest_backlog_age_seconds"],
+        "max_outbox_id": max_outbox_id,
+        "observer_watermark": observer_watermark,
+    }
 
 
 async def _queue_status(conn, table: str) -> dict[str, Any]:

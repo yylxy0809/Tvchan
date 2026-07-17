@@ -66,3 +66,9 @@ def test_create_app_fails_fast_for_production_placeholder_admin_token(monkeypatc
             create_app()
     finally:
         get_settings.cache_clear()
+
+
+def test_lifecycle_observer_name_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("CHAN_LIFECYCLE_OBSERVER", "canonical-observer")
+
+    assert Settings().chan_lifecycle_observer == "canonical-observer"
