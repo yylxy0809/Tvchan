@@ -288,6 +288,7 @@ class ModuleCFreshnessActualResponse(ModuleCFreshnessExpectedResponse):
     actual_max: datetime | None = None
     empty_scopes: int
     stale_scopes: int
+    future_scopes: int
 
 
 class ModuleCFreshnessResponse(BaseModel):
@@ -321,6 +322,9 @@ class ModuleCExecutionProvenanceResponse(BaseModel):
     catalog_revision_matches: bool
     eligibility_manifest_matches: bool
     config_hash_matches: bool
+    frozen_config_matches: bool
+    live_universe_matches: bool
+    catalog_manifest_matches: bool
     evidence_complete: bool
     drift_reasons: list[str] = Field(default_factory=list)
 
