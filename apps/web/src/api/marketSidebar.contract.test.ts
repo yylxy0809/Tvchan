@@ -131,21 +131,29 @@ test("local chan_strategy_delta applies without an iWencai profile update", asyn
   assert.equal(profile.strategySignals[0].label, "weekly_daily_b2");
 });
 
-test("parser failures clear all external snapshots while retaining context", async () => {
+test("parser failures clear external snapshots without removing local projections or context", async () => {
   const transport = new FixtureTransport();
   const store = new MarketSidebarStore(transport, "000001.SZ");
   const started = store.start();
   store.confirmChartSymbol("000001.SZ");
   await started;
   await Promise.resolve();
-  assert.ok(store.getSnapshot().profileBySymbol["000001.SZ"]);
+  const trustedProfile = store.getSnapshot().profileBySymbol["000001.SZ"];
+  assert.ok(trustedProfile);
   transport.push({ type: "active_profile_delta", ...wireEventContext("000001.SZ", 0, 1), profile: { symbol: "000001.SZ" } });
   const snapshot = store.getSnapshot();
   assert.deepEqual(snapshot.context, { chartSymbol: "000001.SZ", chartEpoch: 0, watchlistId: "default", watchlistSymbols: [], watchlistRevision: 7 });
   assert.deepEqual(snapshot.quotesBySymbol, {});
-  assert.deepEqual(snapshot.profileBySymbol, {});
   assert.deepEqual(snapshot.newsBySymbol, {});
   assert.equal(snapshot.strength, undefined);
+  const isolatedProfile = snapshot.profileBySymbol["000001.SZ"];
+  assert.ok(isolatedProfile);
+  assert.equal(isolatedProfile.name, "000001.SZ");
+  assert.equal(isolatedProfile.latestPrice, null);
+  assert.equal(isolatedProfile.sector, null);
+  assert.equal(isolatedProfile.freshness, "unavailable");
+  assert.deepEqual(isolatedProfile.chanStrokeStates, trustedProfile.chanStrokeStates);
+  assert.deepEqual(isolatedProfile.strategySignals, trustedProfile.strategySignals);
   assert.equal(snapshot.status.state, "error");
   assert.match(snapshot.status.message ?? "", /quote must be an object/);
 });
