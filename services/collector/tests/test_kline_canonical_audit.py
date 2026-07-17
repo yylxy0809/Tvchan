@@ -356,9 +356,13 @@ def test_apply_batches_501_groups_and_uses_connection_inside_real_transaction_sh
     events: list[str] = []
 
     class Connection:
+        async def fetchrow(self, sql: str, *args: object):
+            assert "from kline_scope_catalog_control" in sql
+            return {"control_key": "active"}
+
         async def execute(self, sql: str, *args: object) -> str:
             events.append("q" if "kline_audit_quarantine" in sql else "d" if "delete from klines" in sql.lower() else "set")
-            return "DELETE 1" if "update klines" in sql.lower() else "OK"
+            return "UPDATE 1" if "update kline_scope_catalog" in sql.lower() else "OK"
 
         def transaction(self):
             class Context:
@@ -375,6 +379,51 @@ def test_apply_batches_501_groups_and_uses_connection_inside_real_transaction_sh
     assert events.count("begin") == 2
     assert events.count("commit") == 2
     assert events.index("q") < events.index("d")
+
+
+def test_apply_batch_invalidates_deduplicated_mutated_scopes_after_all_writes(monkeypatch) -> None:
+    events: list[str] = []
+    invalidated: list[tuple[int, int]] = []
+
+    class Connection:
+        async def execute(self, sql: str, *args: object) -> str:
+            if "set_config" not in sql:
+                events.append("mutation")
+            return "DELETE 1"
+
+        def transaction(self):
+            class Context:
+                async def __aenter__(self):
+                    events.append("begin")
+                    return object()
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    events.append("rollback" if exc_type else "commit")
+                    return False
+
+            return Context()
+
+    async def invalidate_scopes(_connection, *, scopes):
+        events.append("catalog-invalidate")
+        invalidated.extend(scopes)
+        return len(scopes)
+
+    monkeypatch.setattr(audit_module, "invalidate_scopes", invalidate_scopes)
+    groups = [
+        PlannedActions(delete=[row(), row(source=4)]),
+        PlannedActions(delete=[row(symbol_id=2, timeframe="1w")]),
+    ]
+
+    asyncio.run(apply_action_batches(
+        Connection(),
+        "00000000-0000-0000-0000-000000000001",
+        groups,
+        group_cap=500,
+        lock_timeout_seconds=1,
+    ))
+
+    assert invalidated == [(1, 1440), (2, 10080)]
+    assert events == ["begin", "mutation", "mutation", "mutation", "catalog-invalidate", "commit"]
 
 
 def test_apply_batch_rolls_back_when_a_later_delete_fails() -> None:
@@ -405,6 +454,10 @@ def test_normalization_moves_timestamp_by_delete_then_insert() -> None:
     target = datetime(2026, 1, 3, 7, tzinfo=UTC)
 
     class Connection:
+        async def fetchrow(self, sql: str, *args: object):
+            assert "from kline_scope_catalog_control" in sql
+            return {"control_key": "active"}
+
         async def execute(self, sql: str, *args: object) -> str:
             if "set_config" in sql:
                 return "OK"
@@ -418,6 +471,10 @@ def test_normalization_moves_timestamp_by_delete_then_insert() -> None:
                 assert args[3:12] == (1000, 1200, 900, 1100, 10, 100, True, 1, 9)
                 assert args[12] == source.updated_at
                 return "INSERT 1"
+            if sql.lstrip().lower().startswith("update kline_scope_catalog"):
+                events.append("catalog-invalidate")
+                assert args == ([1], [1440])
+                return "UPDATE 1"
             raise AssertionError(sql)
 
         def transaction(self):
@@ -427,7 +484,7 @@ def test_normalization_moves_timestamp_by_delete_then_insert() -> None:
             return Context()
 
     asyncio.run(apply_actions(Connection(), "run-1", [], [], normalize=(source, target)))
-    assert events == ["begin", "delete-source", "insert-target", "commit"]
+    assert events == ["begin", "delete-source", "insert-target", "catalog-invalidate", "commit"]
 
 
 def test_normalization_target_collision_rolls_back_original_delete() -> None:
@@ -649,11 +706,17 @@ def test_lunch_reopen_apply_quarantines_before_delete() -> None:
     actions = plan_lunch_reopen_duplicate(lunch, comparator_row())
 
     class Connection:
+        async def fetchrow(self, sql: str, *args: object):
+            assert "from kline_scope_catalog_control" in sql
+            return {"control_key": "active"}
+
         async def execute(self, sql: str, *args: object) -> str:
             if "kline_audit_quarantine" in sql:
                 events.append(("quarantine", args[1]))
             elif "delete from klines" in sql.lower():
                 events.append(("delete", None))
+            if "update kline_scope_catalog" in sql.lower():
+                return "UPDATE 1"
             return "OK"
         def transaction(self):
             class Context:

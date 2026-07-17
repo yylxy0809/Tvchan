@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from collector.storage import postgres as postgres_storage
+from collector.storage import scheme2_postgres as scheme2_storage
 from collector.storage.postgres import (
     PostgresKlineWriter,
     _rows_to_canonical_bars,
@@ -21,6 +23,7 @@ from collector.storage.scheme2_postgres import (
     _bar_rows,
 )
 from collector.native_parquet_import import NativeParquetWriter
+import collector.native_parquet_import as native_import
 from trading_protocol import Bar, SymbolInfo
 
 
@@ -167,6 +170,114 @@ def test_writer_uses_persisted_coverage_not_physical_parquet_rows_for_priority()
     assert "from klines covered" not in sql
 
 
+def test_writer_records_distinct_scope_bounds_in_the_kline_transaction(monkeypatch) -> None:
+    first = datetime(2026, 7, 10, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai"))
+    last = datetime(2026, 7, 10, 9, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
+    conn = FakeConnection(symbol_rows=[{"symbol_id": 7, "symbol": "000001.SZ"}])
+    writer = PostgresKlineWriter("postgresql://example")
+    writer._pool = FakePool(conn)
+    recorded: list[tuple[int, int, datetime, datetime]] = []
+
+    async def record_present_scopes(_conn, *, scopes):
+        conn.events.append("catalog-present")
+        recorded.extend(scopes)
+        return len(scopes)
+
+    monkeypatch.setattr(postgres_storage, "record_present_scopes", record_present_scopes)
+
+    result = asyncio.run(writer.upsert_bars([
+        Bar("000001.SZ", "5f", last, 10, 11, 9, 10.5, 100),
+        Bar("000001.SZ", "5f", first, 10, 11, 9, 10.5, 100),
+    ]))
+
+    assert result == 2
+    assert recorded == [(7, 5, first, last)]
+    assert conn.events.index("klines-upsert") < conn.events.index("catalog-present")
+    assert conn.events[0] == "begin"
+    assert conn.events[-1] == "commit"
+
+
+def test_market_claim_rejection_writes_neither_klines_nor_catalog(monkeypatch) -> None:
+    conn = FakeConnection(fetchval_result=False)
+    writer = PostgresKlineWriter("postgresql://example")
+    writer._pool = FakePool(conn)
+
+    async def unexpected_hook(*_args, **_kwargs):
+        raise AssertionError("catalog hook must not run for an invalid claim")
+
+    monkeypatch.setattr(postgres_storage, "record_present_scopes", unexpected_hook)
+
+    result = asyncio.run(writer.upsert_bars_for_market_claim(
+        task_id=3,
+        claim_token="stale",
+        bars=[Bar("000001.SZ", "5f", datetime(2026, 7, 10, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai")), 10, 11, 9, 10.5, 100)],
+    ))
+
+    assert result == (0, False)
+    assert "klines-upsert" not in conn.events
+    assert conn.events == ["begin", "claim-check", "commit"]
+
+
+def test_delete_bars_refreshes_every_resolved_whole_scope_in_one_transaction(monkeypatch) -> None:
+    conn = FakeConnection(
+        execute_result="DELETE 3",
+        symbol_rows=[
+            {"symbol_id": 7, "symbol": "000001.SZ"},
+            {"symbol_id": 8, "symbol": "000002.SZ"},
+        ],
+    )
+    writer = PostgresKlineWriter("postgresql://example")
+    writer._pool = FakePool(conn)
+    refreshed: list[tuple[int, int]] = []
+
+    async def refresh_scopes_exact(_conn, *, scopes):
+        conn.events.append("catalog-refresh")
+        refreshed.extend(scopes)
+        return {"catalog_rows": len(scopes), "updated": len(scopes), "cas_skipped": 0}
+
+    monkeypatch.setattr(postgres_storage, "refresh_scopes_exact", refresh_scopes_exact)
+
+    result = asyncio.run(writer.delete_bars(["000001.SZ", "000002.SZ"], ["5f", "1d"]))
+
+    assert result == 3
+    assert refreshed == [(7, 5), (7, 1440), (8, 5), (8, 1440)]
+    assert conn.events == [
+        "begin",
+        "resolve-symbols",
+        "klines-delete",
+        "catalog-refresh",
+        "commit",
+    ]
+
+
+def test_delete_bars_rolls_back_when_catalog_refresh_fails(monkeypatch) -> None:
+    conn = FakeConnection(
+        execute_result="DELETE 1",
+        symbol_rows=[{"symbol_id": 7, "symbol": "000001.SZ"}],
+    )
+    writer = PostgresKlineWriter("postgresql://example")
+    writer._pool = FakePool(conn)
+
+    async def refresh_scopes_exact(_conn, *, scopes):
+        conn.events.append("catalog-refresh")
+        recorded.extend(scopes)
+        raise RuntimeError("catalog update failed")
+
+    recorded: list[tuple[int, int]] = []
+    monkeypatch.setattr(postgres_storage, "refresh_scopes_exact", refresh_scopes_exact)
+
+    with pytest.raises(RuntimeError, match="catalog update failed"):
+        asyncio.run(writer.delete_bars(["000001.SZ"], ["5f"]))
+
+    assert conn.events == [
+        "begin",
+        "resolve-symbols",
+        "klines-delete",
+        "catalog-refresh",
+        "rollback",
+    ]
+
+
 def test_collector_reader_dedupes_legacy_daily_logical_period() -> None:
     midnight = datetime(2026, 7, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
     close = midnight.replace(hour=15)
@@ -299,6 +410,41 @@ def test_scheme2_registers_coverage_before_staged_kline_upsert_in_one_transactio
     assert coverage_index < kline_index
 
 
+def test_scheme2_records_staged_scope_bounds_between_klines_and_watermark(monkeypatch) -> None:
+    first = datetime(2026, 7, 10, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai"))
+    last = datetime(2026, 7, 10, 9, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
+    conn = FakeConnection(scope_rows=[{
+        "symbol_id": 7,
+        "timeframe": 5,
+        "min_ts": first,
+        "max_ts": last,
+    }])
+    writer = PostgresScheme2KlineWriter("postgresql://example")
+    writer._pool = FakePool(conn)
+    recorded: list[tuple[int, int, datetime, datetime]] = []
+
+    async def record_present_scopes(_conn, *, scopes):
+        conn.events.append("catalog-present")
+        recorded.extend(scopes)
+        return len(scopes)
+
+    monkeypatch.setattr(scheme2_storage, "record_present_scopes", record_present_scopes)
+
+    asyncio.run(writer.upsert_5f_bars(
+        symbols=[],
+        bars=[
+            Bar("000001.SZ", "5f", last, 10, 11, 9, 10.5, 100),
+            Bar("000001.SZ", "5f", first, 10, 11, 9, 10.5, 100),
+        ],
+    ))
+
+    assert recorded == [(7, 5, first, last)]
+    assert conn.events.index("klines-upsert") < conn.events.index("catalog-present")
+    assert conn.events.index("catalog-present") < conn.events.index("watermark-upsert")
+    assert conn.events[0] == "begin"
+    assert conn.events[-1] == "commit"
+
+
 def test_native_parquet_registers_coverage_before_staged_kline_upsert_in_one_transaction() -> None:
     conn = FakeConnection()
     writer = NativeParquetWriter("postgresql://example")
@@ -311,6 +457,38 @@ def test_native_parquet_registers_coverage_before_staged_kline_upsert_in_one_tra
     coverage_index = next(index for index, sql in enumerate(statements) if "kline_source_coverage" in sql)
     kline_index = next(index for index, sql in enumerate(statements) if "insert into klines" in sql)
     assert coverage_index < kline_index
+
+
+def test_native_parquet_records_staged_scope_bounds_between_klines_and_watermark(monkeypatch) -> None:
+    first = datetime(2026, 7, 10, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai"))
+    last = datetime(2026, 7, 10, 9, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
+    conn = FakeConnection(scope_rows=[{
+        "symbol_id": 7,
+        "timeframe": 5,
+        "min_ts": first,
+        "max_ts": last,
+    }])
+    writer = NativeParquetWriter("postgresql://example")
+    writer.pool = FakePool(conn)
+    recorded: list[tuple[int, int, datetime, datetime]] = []
+
+    async def record_present_scopes(_conn, *, scopes):
+        conn.events.append("catalog-present")
+        recorded.extend(scopes)
+        return len(scopes)
+
+    monkeypatch.setattr(native_import, "record_present_scopes", record_present_scopes)
+
+    asyncio.run(writer.upsert(symbols=[], bars=[
+        ("000001", "SZ", 5, last, 10000, 11000, 9000, 10500, 100, None, True, 0, 9),
+        ("000001", "SZ", 5, first, 10000, 11000, 9000, 10500, 100, None, True, 0, 9),
+    ]))
+
+    assert recorded == [(7, 5, first, last)]
+    assert conn.events.index("klines-upsert") < conn.events.index("catalog-present")
+    assert conn.events.index("catalog-present") < conn.events.index("watermark-upsert")
+    assert conn.events[0] == "begin"
+    assert conn.events[-1] == "commit"
 
 
 def test_checkpoint_store_resets_running_members() -> None:
@@ -380,34 +558,75 @@ class FakeAcquire:
 
 
 class FakeTransaction:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+
     async def __aenter__(self):
+        self.connection.events.append("begin")
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.connection.events.append("rollback" if exc_type else "commit")
         return None
 
 
 class FakeConnection:
-    def __init__(self, *, execute_result: str = "UPDATE 1") -> None:
+    def __init__(
+        self,
+        *,
+        execute_result: str = "UPDATE 1",
+        fetchval_result=True,
+        symbol_rows=None,
+        scope_rows=None,
+    ) -> None:
         self.execute_result = execute_result
+        self.fetchval_result = fetchval_result
+        self.symbol_rows = list(symbol_rows or [])
+        self.scope_rows = list(scope_rows or [])
         self.executes = []
         self.copies = []
         self.executemany_calls = []
         self.fetch_calls = []
+        self.events = []
 
     def transaction(self):
-        return FakeTransaction()
+        return FakeTransaction(self)
 
     async def execute(self, sql, *args):
         self.executes.append((sql, args))
+        normalized = " ".join(sql.lower().split())
+        if "insert into klines" in normalized:
+            self.events.append("klines-upsert")
+        elif "delete from klines" in normalized:
+            self.events.append("klines-delete")
+        elif "scheme2_ingest_watermarks" in normalized:
+            self.events.append("watermark-upsert")
         return self.execute_result
 
     async def executemany(self, sql, rows):
         self.executemany_calls.append((sql, rows))
+        if "insert into klines" in sql.lower():
+            self.events.append("klines-upsert")
 
     async def fetch(self, sql, *args):
         self.fetch_calls.append((sql, args))
+        normalized = " ".join(sql.lower().split())
+        if "from _scheme2_kline_stage" in normalized or "from _native_parquet_kline_stage" in normalized:
+            self.events.append("resolve-scopes")
+            return self.scope_rows
+        if "from symbols" in normalized:
+            self.events.append("resolve-symbols")
+            return self.symbol_rows
         return []
+
+    async def fetchrow(self, sql, *args):
+        assert "kline_scope_catalog_control" in sql.lower()
+        assert "for share" in sql.lower()
+        return {"control_key": "active"}
+
+    async def fetchval(self, sql, *args):
+        self.events.append("claim-check")
+        return self.fetchval_result
 
     async def copy_records_to_table(self, table, *, records, columns):
         self.copies.append(
