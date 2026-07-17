@@ -41,7 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--symbol-limit",
         type=int,
-        default=int(os.getenv("CHAN_MODULE_C_SYMBOL_LIMIT", "10")),
+        default=(
+            int(os.environ["CHAN_MODULE_C_SYMBOL_LIMIT"])
+            if "CHAN_MODULE_C_SYMBOL_LIMIT" in os.environ
+            else None
+        ),
         help="Maximum database symbols when --symbols is omitted. Use 0 for all symbols with native bars.",
     )
     parser.add_argument("--chan-levels", default=os.getenv("CHAN_MODULE_C_LEVELS", DEFAULT_MODULE_C_CHAN_LEVELS))
@@ -112,6 +116,10 @@ async def main() -> None:
         raise ValueError("--batch-id is required for a non-dry Module C recompute")
     if not args.dry_run and not args.eligibility_build_id:
         raise ValueError("--eligibility-build-id is required for a non-dry Module C recompute")
+    if not args.dry_run and (args.symbols or args.symbol_limit not in (None, 0)):
+        raise ValueError(
+            "--symbols and positive --symbol-limit are dry-run only; production scope must come from the frozen eligibility build"
+        )
     if not args.dry_run and set(levels) != set(parse_timeframes(DEFAULT_MODULE_C_CHAN_LEVELS)):
         raise ValueError("A production Module C batch must use the native five-level contract")
     if not args.dry_run and args.prepare_native_bars:
@@ -136,7 +144,7 @@ async def main() -> None:
                 kline_writer=kline_writer,
                 symbols_arg=args.symbols,
                 levels=levels,
-                symbol_limit=args.symbol_limit,
+                symbol_limit=10 if args.symbol_limit is None else args.symbol_limit,
             )
             if shard_count > 1:
                 symbols = [symbol for index, symbol in enumerate(symbols) if index % shard_count == shard_index]
@@ -349,135 +357,179 @@ async def ensure_recompute_batch(
 ) -> None:
     """Create one immutable batch manifest and its level-specific tasks."""
     assert kline_writer._pool is not None
-    level_codes = [timeframe_to_db_code(level) for level in levels]
     async with kline_writer._pool.acquire() as conn:
         async with conn.transaction():
-            parent = await conn.fetchrow(
-                "select status from chan_c_batches where id = $1 for update",
-                batch_id,
+            await ensure_recompute_batch_on_connection(
+                conn=conn,
+                batch_id=batch_id,
+                eligibility_build_id=eligibility_build_id,
+                run_group_id=run_group_id,
+                config_hash=config_hash,
+                publication_namespace=publication_namespace,
+                profile_id=profile_id,
+                shard_count=shard_count,
+                levels=levels,
+                allow_create=False,
             )
-            if parent is None:
-                raise InactiveRecomputeBatchError(f"Unknown parent batch: {batch_id}")
-            parent_status = str(parent["status"])
-            if parent_status not in EXECUTABLE_PARENT_BATCH_STATUSES:
-                raise InactiveRecomputeBatchError(
-                    f"Parent batch {batch_id} is not executable: {parent_status}"
-                )
 
-            batch = await conn.fetchrow(
-                """
-                select eligibility_build_id::text as eligibility_build_id,
-                       run_group_id, config_hash, publication_namespace,
-                       profile_id, shard_count, status
-                  from chan_c_full_recompute_batches
-                 where batch_id = $1
-                 for update
-                """,
-                batch_id,
-            )
-            if batch is not None and str(batch["status"]) not in EXECUTABLE_RECOMPUTE_BATCH_STATUSES:
-                raise InactiveRecomputeBatchError(
-                    f"Full-recompute batch {batch_id} is not executable: {batch['status']}"
-                )
 
-            await conn.execute(
-                """
-                insert into chan_c_full_recompute_batches (
-                    batch_id, eligibility_build_id, run_group_id, config_hash,
-                    publication_namespace, profile_id, shard_count,
-                    active_symbols, disposition_rows
-                )
-                select $1, build_id, $3, $4::varchar, $5, $6, $7,
-                       active_symbols, count(*)
-                  from module_c_eligibility_builds build
-                  join module_c_eligibility eligibility using (build_id)
-                 where build.build_id = $2::uuid
-                   and build.config_hash = $4::text
-                   and eligibility.timeframe = any($8::int[])
-                 group by build_id, active_symbols
-                on conflict (batch_id) do nothing
-                """,
-                batch_id,
-                eligibility_build_id,
-                run_group_id,
-                config_hash,
-                publication_namespace,
-                profile_id,
-                shard_count,
-                level_codes,
-            )
-            if batch is None:
-                batch = await conn.fetchrow(
-                    """
-                    select eligibility_build_id::text as eligibility_build_id,
-                           run_group_id, config_hash, publication_namespace,
-                           profile_id, shard_count, status
-                      from chan_c_full_recompute_batches
-                     where batch_id = $1
-                     for update
-                    """,
-                    batch_id,
-                )
-            if batch is None:
-                raise RuntimeError(f"Unknown eligibility build: {eligibility_build_id}")
-            if str(batch["status"]) not in EXECUTABLE_RECOMPUTE_BATCH_STATUSES:
-                raise InactiveRecomputeBatchError(
-                    f"Full-recompute batch {batch_id} is not executable: {batch['status']}"
-                )
-            expected = {
-                "eligibility_build_id": str(eligibility_build_id),
-                "run_group_id": run_group_id,
-                "config_hash": config_hash,
-                "publication_namespace": publication_namespace,
-                "profile_id": profile_id,
-                "shard_count": shard_count,
-            }
-            actual = {key: batch[key] for key in expected}
-            if actual != expected:
-                raise RuntimeError(f"Batch {batch_id} manifest mismatch: {actual!r}")
+async def ensure_recompute_batch_on_connection(
+    *,
+    conn: Any,
+    batch_id: int,
+    eligibility_build_id: str,
+    run_group_id: str,
+    config_hash: str,
+    publication_namespace: str,
+    profile_id: str,
+    shard_count: int,
+    levels: list[str],
+    allow_create: bool,
+) -> None:
+    """Create a recompute child and tasks inside the caller's transaction."""
+    level_codes = [timeframe_to_db_code(level) for level in levels]
+    parent = await conn.fetchrow(
+        """
+        select parent.status, parent.batch_kind, parent.run_group_id,
+               parent.config_hash, parent.publication_namespace, parent.profile_id,
+               parent.eligible_manifest_sha256, build.manifest_hash
+          from chan_c_batches parent
+          join module_c_eligibility_builds build on build.build_id=$2::uuid
+         where parent.id=$1
+         for update of parent
+        """,
+        batch_id,
+        eligibility_build_id,
+    )
+    if parent is None:
+        raise InactiveRecomputeBatchError(f"Unknown parent batch: {batch_id}")
+    parent_status = str(parent["status"])
+    if parent_status not in EXECUTABLE_PARENT_BATCH_STATUSES:
+        raise InactiveRecomputeBatchError(
+            f"Parent batch {batch_id} is not executable: {parent_status}"
+        )
+    expected_parent = {
+        "run_group_id": run_group_id,
+        "config_hash": config_hash,
+        "publication_namespace": publication_namespace,
+        "profile_id": profile_id,
+        "eligible_manifest_sha256": parent["manifest_hash"],
+    }
+    actual_parent = {key: parent[key] for key in expected_parent}
+    if parent["batch_kind"] not in {"canary", "baseline"} or actual_parent != expected_parent:
+        raise RuntimeError(f"Parent batch {batch_id} identity mismatch: {actual_parent!r}")
 
-            await conn.execute(
-                """
-                insert into chan_c_full_recompute_tasks (
-                    batch_id, symbol_id, symbol, chan_level, eligible,
-                    exclusion_reasons, target_bar_until, shard_bucket, status,
-                    expected_heads
-                )
-                select $1, eligibility.symbol_id, eligibility.symbol,
-                       eligibility.timeframe, eligibility.eligible,
-                       eligibility.reasons, eligibility.covered_until,
-                       mod((hashtextextended(eligibility.symbol, 0) & 2147483647)::integer, 1024)::smallint,
-                       case when eligibility.eligible then 'pending' else 'excluded' end,
-                       coalesce((
-                           select jsonb_object_agg(head.mode, head.run_id)
-                             from scheme2_chan_c_published_heads head
-                            where head.symbol_id = eligibility.symbol_id
-                              and head.chan_level = eligibility.timeframe
-                              and head.base_timeframe = eligibility.timeframe
-                              and head.status = 'published'
-                       ), '{}'::jsonb)
-                  from module_c_eligibility eligibility
-                 where eligibility.build_id = $2::uuid
-                   and eligibility.timeframe = any($3::int[])
-                on conflict (batch_id, symbol_id, chan_level) do nothing
-                """,
-                batch_id,
-                eligibility_build_id,
-                level_codes,
-            )
-            task_count = await conn.fetchval(
-                "select count(*) from chan_c_full_recompute_tasks where batch_id = $1",
-                batch_id,
-            )
-            disposition_rows = await conn.fetchval(
-                "select disposition_rows from chan_c_full_recompute_batches where batch_id = $1",
-                batch_id,
-            )
-            if int(task_count or 0) != int(disposition_rows or 0):
-                raise RuntimeError(
-                    f"Batch {batch_id} task manifest is incomplete: "
-                    f"tasks={task_count} expected={disposition_rows}"
-                )
+    batch = await conn.fetchrow(
+        """
+        select eligibility_build_id::text as eligibility_build_id,
+               run_group_id, config_hash, publication_namespace,
+               profile_id, shard_count, status
+          from chan_c_full_recompute_batches
+         where batch_id = $1
+         for update
+        """,
+        batch_id,
+    )
+    if batch is not None and str(batch["status"]) not in EXECUTABLE_RECOMPUTE_BATCH_STATUSES:
+        raise InactiveRecomputeBatchError(
+            f"Full-recompute batch {batch_id} is not executable: {batch['status']}"
+        )
+
+    if batch is None and not allow_create:
+        raise RuntimeError(
+            f"Full-recompute batch {batch_id} was not prepared by module-c-batch-control"
+        )
+    if allow_create:
+        await conn.execute(
+        """
+        insert into chan_c_full_recompute_batches (
+            batch_id, eligibility_build_id, run_group_id, config_hash,
+            publication_namespace, profile_id, shard_count,
+            active_symbols, disposition_rows
+        )
+        select $1, build_id, $3, $4::varchar, $5, $6, $7,
+               active_symbols, count(*)
+          from module_c_eligibility_builds build
+          join module_c_eligibility eligibility using (build_id)
+         where build.build_id = $2::uuid
+           and build.config_hash = $4::text
+           and eligibility.timeframe = any($8::int[])
+         group by build_id, active_symbols
+        on conflict (batch_id) do nothing
+        """,
+            batch_id, eligibility_build_id, run_group_id, config_hash,
+            publication_namespace, profile_id, shard_count, level_codes,
+        )
+    if batch is None:
+        batch = await conn.fetchrow(
+            """
+            select eligibility_build_id::text as eligibility_build_id,
+                   run_group_id, config_hash, publication_namespace,
+                   profile_id, shard_count, status
+              from chan_c_full_recompute_batches
+             where batch_id = $1
+             for update
+            """,
+            batch_id,
+        )
+    if batch is None:
+        raise RuntimeError(f"Unknown eligibility build: {eligibility_build_id}")
+    if str(batch["status"]) not in EXECUTABLE_RECOMPUTE_BATCH_STATUSES:
+        raise InactiveRecomputeBatchError(
+            f"Full-recompute batch {batch_id} is not executable: {batch['status']}"
+        )
+    expected = {
+        "eligibility_build_id": str(eligibility_build_id),
+        "run_group_id": run_group_id,
+        "config_hash": config_hash,
+        "publication_namespace": publication_namespace,
+        "profile_id": profile_id,
+        "shard_count": shard_count,
+    }
+    actual = {key: batch[key] for key in expected}
+    if actual != expected:
+        raise RuntimeError(f"Batch {batch_id} manifest mismatch: {actual!r}")
+
+    if allow_create:
+        await conn.execute(
+        """
+        insert into chan_c_full_recompute_tasks (
+            batch_id, symbol_id, symbol, chan_level, eligible,
+            exclusion_reasons, target_bar_until, shard_bucket, status,
+            expected_heads
+        )
+        select $1, eligibility.symbol_id, eligibility.symbol,
+               eligibility.timeframe, eligibility.eligible,
+               eligibility.reasons, eligibility.covered_until,
+               mod((hashtextextended(eligibility.symbol, 0) & 2147483647)::integer, 1024)::smallint,
+               case when eligibility.eligible then 'pending' else 'excluded' end,
+               coalesce((
+                   select jsonb_object_agg(head.mode, head.run_id)
+                     from scheme2_chan_c_published_heads head
+                    where head.symbol_id = eligibility.symbol_id
+                      and head.chan_level = eligibility.timeframe
+                      and head.base_timeframe = eligibility.timeframe
+                      and head.status = 'published'
+               ), '{}'::jsonb)
+          from module_c_eligibility eligibility
+         where eligibility.build_id = $2::uuid
+           and eligibility.timeframe = any($3::int[])
+        on conflict (batch_id, symbol_id, chan_level) do nothing
+        """,
+            batch_id, eligibility_build_id, level_codes,
+        )
+    task_count = await conn.fetchval(
+        "select count(*) from chan_c_full_recompute_tasks where batch_id = $1", batch_id
+    )
+    disposition_rows = await conn.fetchval(
+        "select disposition_rows from chan_c_full_recompute_batches where batch_id = $1",
+        batch_id,
+    )
+    if int(task_count or 0) != int(disposition_rows or 0):
+        raise RuntimeError(
+            f"Batch {batch_id} task manifest is incomplete: "
+            f"tasks={task_count} expected={disposition_rows}"
+        )
 
 
 async def claim_recompute_task(

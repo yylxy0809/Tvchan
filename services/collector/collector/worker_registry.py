@@ -35,6 +35,11 @@ _WORKERS: dict[str, WorkerSpec] = {
         module="collector.chan_module_c_recompute",
         description="Module C native-timeframe full-history Chan recompute worker.",
     ),
+    "module-c-batch-control": WorkerSpec(
+        name="module-c-batch-control",
+        module="collector.module_c_batch_control",
+        description="Create, activate, inspect and seal frozen Module C batches.",
+    ),
     "chan-c-stream": WorkerSpec(
         name="chan-c-stream",
         module="collector.chan_c_stream",

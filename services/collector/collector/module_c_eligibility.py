@@ -272,7 +272,10 @@ async def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                     "(build_id, manifest_version, config_hash, active_universe_hash, manifest_hash, active_symbols, disposition_rows, parameters, summary) "
                     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb)",
                     build_id, args.manifest_version, args.config_hash, active_hash, manifest_hash,
-                    len(symbols), len(rows), json.dumps({"policy": "strict-v1"}), json.dumps(summary),
+                    len(symbols), len(rows), json.dumps({
+                        "policy": "strict-v1",
+                        "canonical_audit_run_id": audit_run_id,
+                    }), json.dumps(summary),
                 )
                 await connection.copy_records_to_table(
                     "module_c_eligibility",
