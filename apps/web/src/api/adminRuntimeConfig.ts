@@ -113,6 +113,31 @@ export type ModuleCExecutionSummary = {
   expired_leases: number;
 };
 
+export type ModuleCSelectionStatus = "pass" | "failed" | "unavailable" | "not_applicable";
+
+export type ModuleCSelectionBoard = "main_board" | "chinext" | "star" | "bj";
+
+export type ModuleCSelectionBoundaryCounts = {
+  lower: number;
+  middle: number;
+  upper: number;
+};
+
+export type ModuleCSelectionEvidence = {
+  status: ModuleCSelectionStatus;
+  contract_version: string | null;
+  manifest_sha256: string | null;
+  source_build_id: string | null;
+  activity_basis: string | null;
+  board_counts: Partial<Record<ModuleCSelectionBoard, number>>;
+  boundary_counts: Partial<Record<ModuleCSelectionBoard, ModuleCSelectionBoundaryCounts>>;
+  contract_matches: boolean | null;
+  hash_matches: boolean | null;
+  source_matches: boolean | null;
+  quotas_match: boolean | null;
+  drift_reasons: string[];
+};
+
 export type ModuleCExecutionProvenance = {
   policy: string | null;
   eligibility_build_id: string | null;
@@ -143,6 +168,7 @@ export type ModuleCExecutionProvenance = {
   catalog_manifest_matches: boolean;
   evidence_complete: boolean;
   drift_reasons: string[];
+  selection: ModuleCSelectionEvidence;
 };
 
 export type ModuleCFreshnessExpectedWatermark = {

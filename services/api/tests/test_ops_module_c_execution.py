@@ -151,6 +151,78 @@ def _manifest_sha256(records: list[dict]) -> str:
     return digest.hexdigest()
 
 
+def _canonical_sha256(value: dict) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload + b"\n").hexdigest()
+
+
+def _selection_active_universe_sha256(selection: dict) -> str:
+    digest = hashlib.sha256()
+    identities = sorted(
+        (int(entry["symbol_id"]), str(entry["symbol"]).upper())
+        for entry in selection["symbols"]
+    )
+    for _symbol_id, symbol in identities:
+        digest.update(json.dumps(symbol, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _canary_selection(provenance: dict) -> dict:
+    source_build_id = "44444444-4444-4444-4444-444444444444"
+    source = {
+        "eligibility_build_id": source_build_id,
+        "eligibility_manifest_sha256": "d" * 64,
+        **provenance,
+    }
+    policy = {
+        "symbol_count": 20,
+        "board_quotas": {board: 5 for board in ("main_board", "chinext", "star", "bj")},
+        "activity_boundary_counts_per_board": {"lower": 2, "middle": 1, "upper": 2},
+        "activity_basis": "pinned-audit-5f-rows-per-49-bar-1d-session-v1",
+        "bars_per_complete_5f_session": 49,
+        "legacy_free_text_scenario_traits": "not_authoritative_without_frozen_evidence",
+        "tie_break": ["activity_ratio", "symbol_id", "symbol"],
+    }
+    symbols = []
+    symbol_id = 1
+    for board, prefix, exchange in (
+        ("main_board", "600", "SH"),
+        ("chinext", "300", "SZ"),
+        ("star", "688", "SH"),
+        ("bj", "920", "BJ"),
+    ):
+        for offset, boundary in enumerate(("lower", "lower", "middle", "upper", "upper")):
+            five_minute_rows = 4800 + offset
+            daily_rows = 100
+            symbols.append({
+                "symbol_id": symbol_id,
+                "symbol": f"{prefix}{offset:03d}.{exchange}",
+                "board": board,
+                "activity_boundary": boundary,
+                "traits": [board, f"{boundary}_activity_boundary"],
+                "eligible_timeframes": ["5f", "30f", "1d", "1w", "1m"],
+                "evidence": {
+                    "basis": policy["activity_basis"],
+                    "canonical_audit_run_id": provenance["canonical_audit_run_id"],
+                    "five_minute_rows": five_minute_rows,
+                    "daily_rows": daily_rows,
+                    "activity_ratio_numerator": five_minute_rows,
+                    "activity_ratio_denominator": daily_rows * 49,
+                },
+            })
+            symbol_id += 1
+    unsigned = {
+        "contract_version": "module-c-canary-selection-v2",
+        "source": source,
+        "policy": policy,
+        "symbols": symbols,
+    }
+    return {**unsigned, "selection_sha256": _canonical_sha256(unsigned)}
+
+
 def _batch(*, audit_active_universe_count: int = 20, **overrides) -> dict:
     live_universe_rows = [
         {"symbol_id": symbol_id, "code": f"{symbol_id:06d}", "exchange": "SH"}
@@ -264,6 +336,17 @@ def _batch(*, audit_active_universe_count: int = 20, **overrides) -> dict:
         "freshness_contract": freshness_contract,
         **provenance,
     }
+    canary_selection = _canary_selection(provenance)
+    build_parameters.update({
+        "scope": "canary",
+        "source_build_id": canary_selection["source"]["eligibility_build_id"],
+        "selection_contract_version": canary_selection["contract_version"],
+        "selection_manifest_sha256": canary_selection["selection_sha256"],
+        "selection_traits": sorted({
+            trait for entry in canary_selection["symbols"] for trait in entry["traits"]
+        }),
+        "canary_selection": canary_selection,
+    })
     value = {
         "batch_id": 42,
         "batch_key": "canary-42",
@@ -326,7 +409,7 @@ def _batch(*, audit_active_universe_count: int = 20, **overrides) -> dict:
         "audit_parameters": audit_parameters,
         "audit_summary": audit_summary,
         "build_parameters": build_parameters,
-        "build_active_universe_sha256": active_universe_sha,
+        "build_active_universe_sha256": _selection_active_universe_sha256(canary_selection),
         "freshness_contract_version": "module-c-authoritative-freshness-v1",
         "freshness_contract_sha256": freshness_sha,
         "catalog_generation_id": "33333333-3333-3333-3333-333333333333",
@@ -382,9 +465,130 @@ def test_repository_returns_structured_bound_provenance_in_one_readonly_snapshot
     assert provenance["config_hash_matches"] is True
     assert provenance["execution_identity_matches"] is True
     assert provenance["audit_gate_pass"] is True
+    selection = provenance["selection"]
+    assert selection["status"] == "pass"
+    assert selection["contract_version"] == "module-c-canary-selection-v2"
+    assert selection["manifest_sha256"] == _batch()["build_parameters"][
+        "selection_manifest_sha256"
+    ]
+    assert selection["source_build_id"] == "44444444-4444-4444-4444-444444444444"
+    assert selection["activity_basis"] == "pinned-audit-5f-rows-per-49-bar-1d-session-v1"
+    assert selection["board_counts"] == {
+        "main_board": 5, "chinext": 5, "star": 5, "bj": 5,
+    }
+    assert selection["boundary_counts"]["main_board"] == {
+        "lower": 2, "middle": 1, "upper": 2,
+    }
+    assert selection["contract_matches"] is True
+    assert selection["hash_matches"] is True
+    assert selection["source_matches"] is True
+    assert selection["quotas_match"] is True
+    assert selection["drift_reasons"] == []
     assert provenance["drift_reasons"] == []
     assert "notes" not in result["batch"]
     assert "last_error" not in result["batch"]["execution"]["tasks"][0]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_status", "reason"),
+    [
+        (lambda parameters: parameters.pop("canary_selection"), "unavailable", "canary_selection_unavailable"),
+        (
+            lambda parameters: parameters["canary_selection"].update(
+                {"contract_version": "module-c-canary-selection-v1"}
+            ),
+            "failed",
+            "canary_selection_contract_drift",
+        ),
+        (
+            lambda parameters: parameters.update({"selection_manifest_sha256": "e" * 64}),
+            "failed",
+            "canary_selection_hash_drift",
+        ),
+        (
+            lambda parameters: parameters.update(
+                {"source_build_id": "55555555-5555-5555-5555-555555555555"}
+            ),
+            "failed",
+            "canary_selection_source_drift",
+        ),
+        (
+            lambda parameters: parameters["canary_selection"]["symbols"][0].update(
+                {"board": "bj"}
+            ),
+            "failed",
+            "canary_selection_quota_drift",
+        ),
+    ],
+)
+def test_canary_selection_gate_fails_visible(mutate, expected_status, reason) -> None:
+    batch = _batch()
+    mutate(batch["build_parameters"])
+
+    result = asyncio.run(get_module_c_execution_status(FakeConnection(batch=batch), batch_id=42))
+
+    selection = result["batch"]["provenance"]["selection"]
+    assert selection["status"] == expected_status
+    assert reason in selection["drift_reasons"]
+    assert reason in result["batch"]["provenance"]["drift_reasons"]
+    assert result["batch"]["provenance"]["evidence_complete"] is False
+
+
+def test_baseline_selection_gate_is_not_applicable() -> None:
+    batch = _batch(batch_kind="baseline")
+    batch["build_parameters"].pop("canary_selection")
+    batch["build_parameters"].pop("scope")
+    batch["build_parameters"].pop("source_build_id")
+    batch["build_parameters"].pop("selection_contract_version")
+    batch["build_parameters"].pop("selection_manifest_sha256")
+    batch["build_parameters"].pop("selection_traits")
+    batch["build_active_universe_sha256"] = batch["audit_active_universe_sha256"]
+
+    result = asyncio.run(get_module_c_execution_status(FakeConnection(batch=batch), batch_id=42))
+
+    selection = result["batch"]["provenance"]["selection"]
+    assert selection == {
+        "status": "not_applicable",
+        "contract_version": None,
+        "manifest_sha256": None,
+        "source_build_id": None,
+        "activity_basis": None,
+        "board_counts": {},
+        "boundary_counts": {},
+        "contract_matches": None,
+        "hash_matches": None,
+        "source_matches": None,
+        "quotas_match": None,
+        "drift_reasons": [],
+    }
+    assert result["batch"]["provenance"]["evidence_complete"] is True
+
+
+def test_canary_strict_provenance_binds_subset_and_source_universes() -> None:
+    batch = _batch()
+
+    result = asyncio.run(get_module_c_execution_status(FakeConnection(batch=batch), batch_id=42))
+
+    provenance = result["batch"]["provenance"]
+    assert provenance["selection"]["source_matches"] is True
+    assert provenance["selection"]["status"] == "pass"
+    assert provenance["evidence_complete"] is True
+
+    batch["build_active_universe_sha256"] = "e" * 64
+    drifted = asyncio.run(
+        get_module_c_execution_status(FakeConnection(batch=batch), batch_id=42)
+    )
+    assert drifted["batch"]["provenance"]["evidence_complete"] is False
+    assert "strict_provenance_parameters_drift" in drifted["batch"]["provenance"]["drift_reasons"]
+
+
+def test_baseline_cannot_use_canary_scope_to_bypass_full_universe_binding() -> None:
+    batch = _batch(batch_kind="baseline", build_active_universe_sha256="e" * 64)
+
+    result = asyncio.run(get_module_c_execution_status(FakeConnection(batch=batch), batch_id=42))
+
+    assert result["batch"]["provenance"]["evidence_complete"] is False
+    assert "strict_provenance_parameters_drift" in result["batch"]["provenance"]["drift_reasons"]
 
 
 def test_repository_sql_is_read_only_and_freshness_uses_only_pinned_checkpoints() -> None:

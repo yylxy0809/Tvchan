@@ -537,6 +537,7 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
             "source_build_id": args.source_build_id,
             "selection_contract_version": selection["contract_version"],
             "selection_manifest_sha256": selection_sha,
+            "canary_selection": selection,
             "selection_traits": sorted(
                 {str(trait) for entry in selection["symbols"] for trait in entry.get("traits", [])}
             ),

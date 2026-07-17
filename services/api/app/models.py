@@ -299,6 +299,21 @@ class ModuleCFreshnessResponse(BaseModel):
     actual_checkpoint_watermarks: list[ModuleCFreshnessActualResponse]
 
 
+class ModuleCCanarySelectionProvenanceResponse(BaseModel):
+    status: Literal["pass", "failed", "unavailable", "not_applicable"]
+    contract_version: str | None = None
+    manifest_sha256: str | None = None
+    source_build_id: str | None = None
+    activity_basis: str | None = None
+    board_counts: dict[str, int] = Field(default_factory=dict)
+    boundary_counts: dict[str, dict[str, int]] = Field(default_factory=dict)
+    contract_matches: bool | None = None
+    hash_matches: bool | None = None
+    source_matches: bool | None = None
+    quotas_match: bool | None = None
+    drift_reasons: list[str] = Field(default_factory=list)
+
+
 class ModuleCExecutionProvenanceResponse(BaseModel):
     policy: str | None = None
     eligibility_build_id: str | None = None
@@ -327,6 +342,7 @@ class ModuleCExecutionProvenanceResponse(BaseModel):
     frozen_config_matches: bool
     live_universe_matches: bool
     catalog_manifest_matches: bool
+    selection: ModuleCCanarySelectionProvenanceResponse
     evidence_complete: bool
     drift_reasons: list[str] = Field(default_factory=list)
 

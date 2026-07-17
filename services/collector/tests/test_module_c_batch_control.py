@@ -593,6 +593,7 @@ def test_output_failure_rolls_back_frozen_canary(tmp_path, monkeypatch) -> None:
         asyncio.run(freeze_canary(connection, args))
     assert connection.transaction_failed is True
     assert connection.inserted_args is not None
+    assert json.loads(connection.inserted_args[5])["canary_selection"] == v2_selection
 
 
 @pytest.mark.parametrize(
