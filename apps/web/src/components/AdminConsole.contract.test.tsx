@@ -1,12 +1,34 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
   AdminRequestError,
   fetchAdminOpsStatus,
   fetchModuleCExecution,
   isAdminAuthFailure,
 } from "../api/adminRuntimeConfig";
+import { ModuleCSelectionEvidenceCard } from "./AdminConsole";
+
+const PASS_SELECTION = {
+  status: "pass" as const,
+  contract_version: "module-c-canary-selection-v2",
+  manifest_sha256: "a".repeat(64),
+  source_build_id: "11111111-1111-1111-1111-111111111111",
+  activity_basis: "pinned-audit-5f-rows-per-1d-session-v1",
+  board_counts: { main_board: 5, chinext: 5, star: 5, bj: 5 },
+  boundary_counts: {
+    main_board: { lower: 2, middle: 1, upper: 2 },
+    chinext: { lower: 2, middle: 1, upper: 2 },
+    star: { lower: 2, middle: 1, upper: 2 },
+    bj: { lower: 2, middle: 1, upper: 2 },
+  },
+  contract_matches: true,
+  hash_matches: true,
+  source_matches: true,
+  quotas_match: true,
+  drift_reasons: [],
+};
 
 test("admin console includes editable iWencai key metadata", () => {
   const source = readFileSync(new URL("./AdminConsole.tsx", import.meta.url), "utf8");
@@ -140,6 +162,70 @@ test("admin console renders read-only Module C execution evidence without contro
   }
   assert.match(source, /title=\{value\}/);
   assert.doesNotMatch(source, /handle(?:Start|Retry|Activate)ModuleC/);
+});
+
+test("canary selection card renders a passing v2 contract and exact quotas read-only", () => {
+  const html = renderToStaticMarkup(
+    <ModuleCSelectionEvidenceCard selection={PASS_SELECTION} />,
+  );
+
+  assert.match(html, /Canary selection v2/);
+  assert.match(html, /role="status"/);
+  assert.match(html, /selection gate: pass/);
+  assert.match(html, /module-c-canary-selection-v2/);
+  assert.match(html, new RegExp(`title="${"a".repeat(64)}"`));
+  assert.match(html, /11111111-1111-1111-1111-111111111111/);
+  assert.match(html, /main board: 5 \/ 5/);
+  assert.match(html, /ChiNext: 5 \/ 5/);
+  assert.match(html, /STAR: 5 \/ 5/);
+  assert.match(html, /Beijing: 5 \/ 5/);
+  assert.match(html, /lower 2 \/ 2, middle 1 \/ 1, upper 2 \/ 2/);
+  assert.match(html, /contract matches: yes/);
+  assert.match(html, /hash matches: yes/);
+  assert.match(html, /source matches: yes/);
+  assert.match(html, /quotas match: yes/);
+  assert.doesNotMatch(html, /<button|<form|<input/);
+});
+
+test("canary selection card makes failed and unavailable evidence explicit", () => {
+  const failed = renderToStaticMarkup(
+    <ModuleCSelectionEvidenceCard
+      selection={{
+        ...PASS_SELECTION,
+        status: "failed",
+        quotas_match: false,
+        drift_reasons: ["selection_board_quota_drift"],
+      }}
+    />,
+  );
+  const unavailable = renderToStaticMarkup(
+    <ModuleCSelectionEvidenceCard
+      selection={{
+        ...PASS_SELECTION,
+        status: "unavailable",
+        contract_version: null,
+        manifest_sha256: null,
+        source_build_id: null,
+        activity_basis: null,
+        board_counts: {},
+        boundary_counts: {},
+        contract_matches: null,
+        hash_matches: null,
+        source_matches: null,
+        quotas_match: null,
+        drift_reasons: ["canary_selection_unavailable"],
+      }}
+    />,
+  );
+
+  assert.match(failed, /role="alert"/);
+  assert.match(failed, /selection gate: failed/);
+  assert.match(failed, /quotas match: no/);
+  assert.match(failed, /selection_board_quota_drift/);
+  assert.match(unavailable, /role="alert"/);
+  assert.match(unavailable, /selection gate: unavailable/);
+  assert.match(unavailable, /canary_selection_unavailable/);
+  assert.doesNotMatch(unavailable, /selection gate: pass/);
 });
 
 test("Module C request failure preserves the last snapshot and auth failure returns first", () => {

@@ -19,6 +19,16 @@ from collector.module_c_eligibility import (
     _SHA256_RE,
     _load_strict_inputs,
     parse_freshness_contract,
+    _stable_hash,
+)
+from collector.module_c_canary_selection import (
+    BOARD_ORDER,
+    BOARD_QUOTAS,
+    BOUNDARY_COUNTS,
+    CONTRACT_VERSION as SELECTION_CONTRACT_VERSION,
+    _canonical_sha256 as _selection_sha256,
+    _policy as _selection_policy,
+    validate_selection_manifest,
 )
 
 
@@ -308,6 +318,141 @@ def _failed_provenance(
     }
 
 
+_SELECTION_SOURCE_PROVENANCE_FIELDS = (
+    "canonical_audit_run_id",
+    "audit_evidence_sha256",
+    "audit_checkpoint_sha256",
+    "freshness_contract_version",
+    "freshness_contract_sha256",
+    "catalog_generation_id",
+    "catalog_control_revision",
+    "catalog_manifest_sha256",
+    "audit_active_universe_sha256",
+)
+
+
+def build_selection_evidence(
+    batch: Mapping[str, Any],
+    strict_v2_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    parameters = _json_object(batch.get("eligibility_parameters"))
+    empty_counts = {board: 0 for board in BOARD_ORDER}
+    empty_boundaries = {
+        board: {boundary: 0 for boundary in BOUNDARY_COUNTS}
+        for board in BOARD_ORDER
+    }
+    result: dict[str, Any] = {
+        "status": "not_applicable",
+        "contract_version": None,
+        "manifest_sha256": None,
+        "source_build_id": None,
+        "activity_basis": None,
+        "board_counts": empty_counts,
+        "boundary_counts": empty_boundaries,
+        "contract_matches": None,
+        "hash_matches": None,
+        "source_matches": None,
+        "quotas_match": None,
+        "drift_reasons": [],
+    }
+    if batch.get("batch_kind") != "canary":
+        return result
+
+    result["source_build_id"] = parameters.get("source_build_id")
+    selection = parameters.get("canary_selection")
+    if not isinstance(selection, Mapping):
+        result.update(
+            status="unavailable",
+            contract_version=parameters.get("selection_contract_version"),
+            manifest_sha256=parameters.get("selection_manifest_sha256"),
+            contract_matches=False,
+            hash_matches=False,
+            source_matches=False,
+            quotas_match=False,
+            drift_reasons=["canary_selection_missing"],
+        )
+        return result
+
+    payload = dict(selection)
+    policy = _json_object(payload.get("policy"))
+    source = _json_object(payload.get("source"))
+    symbols = payload.get("symbols")
+    result["contract_version"] = payload.get("contract_version")
+    result["manifest_sha256"] = payload.get("selection_sha256")
+    result["activity_basis"] = policy.get("activity_basis")
+    reasons: list[str] = []
+
+    observed_traits: set[str] = set()
+    if isinstance(symbols, list):
+        for entry in symbols:
+            if not isinstance(entry, Mapping):
+                continue
+            board = entry.get("board")
+            boundary = entry.get("activity_boundary")
+            traits = entry.get("traits")
+            if isinstance(traits, list):
+                observed_traits.update(str(trait) for trait in traits)
+            if isinstance(board, str) and board in result["board_counts"]:
+                result["board_counts"][board] += 1
+                if (
+                    isinstance(boundary, str)
+                    and boundary in result["boundary_counts"][board]
+                ):
+                    result["boundary_counts"][board][boundary] += 1
+
+    result["contract_matches"] = (
+        payload.get("contract_version") == SELECTION_CONTRACT_VERSION
+        and parameters.get("selection_contract_version")
+        == SELECTION_CONTRACT_VERSION
+        and parameters.get("selection_traits") == sorted(observed_traits)
+    )
+    if not result["contract_matches"]:
+        reasons.append("contract_mismatch")
+
+    unsigned = {key: value for key, value in payload.items() if key != "selection_sha256"}
+    embedded_sha = payload.get("selection_sha256")
+    result["hash_matches"] = (
+        isinstance(embedded_sha, str)
+        and embedded_sha == _selection_sha256(unsigned)
+        and parameters.get("selection_manifest_sha256") == embedded_sha
+    )
+    if not result["hash_matches"]:
+        reasons.append("manifest_hash_mismatch")
+
+    frozen = _json_object(strict_v2_provenance.get("frozen"))
+    source_provenance_matches = all(
+        source.get(field) == frozen.get(field)
+        for field in _SELECTION_SOURCE_PROVENANCE_FIELDS
+    )
+    result["source_matches"] = (
+        strict_v2_provenance.get("decision") == "PASS"
+        and source.get("eligibility_build_id") == parameters.get("source_build_id")
+        and source_provenance_matches
+    )
+    if not result["source_matches"]:
+        reasons.append("source_provenance_mismatch")
+
+    result["quotas_match"] = (
+        policy == _selection_policy()
+        and result["board_counts"] == BOARD_QUOTAS
+        and all(
+            result["boundary_counts"][board] == BOUNDARY_COUNTS
+            for board in BOARD_ORDER
+        )
+    )
+    if not result["quotas_match"]:
+        reasons.append("selection_policy_or_quota_mismatch")
+
+    try:
+        validate_selection_manifest(payload)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        reasons.append("manifest_validation_failed")
+
+    result["drift_reasons"] = list(dict.fromkeys(reasons))
+    result["status"] = "pass" if not result["drift_reasons"] else "failed"
+    return result
+
+
 async def build_strict_v2_provenance(
     conn: Any,
     batch: Mapping[str, Any],
@@ -545,12 +690,35 @@ async def build_strict_v2_provenance(
             f"Strict-v2 freshness contract is unavailable: {error}",
             frozen=frozen,
         )
+    selection = _json_object(parameters.get("canary_selection"))
+    selection_symbols = selection.get("symbols")
+    try:
+        canary_identities = sorted(
+            {
+                (int(entry["symbol_id"]), str(entry["symbol"]).strip().upper())
+                for entry in selection_symbols
+                if isinstance(entry, Mapping)
+            }
+        ) if isinstance(selection_symbols, list) else []
+    except (KeyError, TypeError, ValueError):
+        canary_identities = []
+    canary_universe_matches = bool(
+        batch.get("batch_kind") == "canary"
+        and parameters.get("scope") == "canary"
+        and len(canary_identities) == 20
+        and str(batch.get("active_universe_hash"))
+        == _stable_hash(name for _symbol_id, name in canary_identities)
+    )
+    baseline_universe_matches = bool(
+        batch.get("batch_kind") != "canary"
+        and str(batch.get("active_universe_hash"))
+        == frozen["audit_active_universe_sha256"]
+    )
     if (
         parameter_provenance != frozen
         or freshness.contract_version != frozen["freshness_contract_version"]
         or freshness.sha256 != frozen["freshness_contract_sha256"]
-        or str(batch.get("active_universe_hash"))
-        != frozen["audit_active_universe_sha256"]
+        or not (canary_universe_matches or baseline_universe_matches)
     ):
         return _failed_provenance(
             "drift",
@@ -628,6 +796,7 @@ async def build_report(
     if not batch:
         raise ValueError(f"Module C recompute batch does not exist: {batch_id}")
     strict_v2_provenance = await build_strict_v2_provenance(conn, batch)
+    selection = build_selection_evidence(batch, strict_v2_provenance)
 
     task_rows = [_dict(row) for row in await conn.fetch(TASK_PROGRESS_SQL, batch_id)]
     head_rows = [_dict(row) for row in await conn.fetch(HEAD_COVERAGE_SQL, batch_id)]
@@ -685,6 +854,7 @@ async def build_report(
             "decision": strict_v2_provenance["decision"],
             "failure_code": strict_v2_provenance["failure_code"],
         },
+        "selection": selection,
     }
 
     blockers: list[dict[str, Any]] = []
@@ -722,6 +892,12 @@ async def build_report(
                 else "Resolve the pinned audit, universe, catalog, or freshness drift before continuing."
             ),
         )
+    if selection["status"] in {"failed", "unavailable"}:
+        block(
+            f"canary_selection_{selection['status']}",
+            selection,
+            "Restore the exact frozen selection-v2 manifest and its source provenance before continuing.",
+        )
 
     canonical_summary = _json_object(canonical.get("summary"))
     canonical_ready = (
@@ -745,6 +921,7 @@ async def build_report(
         "batch": batch,
         "report_code_commit": _local_commit(),
         "strict_v2_provenance": strict_v2_provenance,
+        "selection": selection,
     }
     canonical_report = {
         "generated_at": generated_at,
@@ -782,6 +959,7 @@ async def build_report(
         "resource_metrics": [resource_row],
         "failure_samples": failure_rows,
         "strict_v2_provenance": strict_v2_provenance,
+        "selection": selection,
         "next_phase_decision": decision,
     }
 
@@ -802,6 +980,7 @@ def write_artifacts(output_dir: Path, report: Mapping[str, Any]) -> None:
         "resource_metrics.jsonl": _jsonl(report["resource_metrics"]),
         "failure_samples.jsonl": _jsonl(report["failure_samples"]),
         "strict_v2_provenance.json": _json_text(report["strict_v2_provenance"]),
+        "selection.json": _json_text(report["selection"]),
         "next_phase_decision.json": _json_text(report["next_phase_decision"]),
     }
     for name, content in files.items():

@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 import collector.module_c_execution_report as report_module
-from collector.module_c_eligibility import _canonical_sha256
+from collector.module_c_eligibility import _canonical_sha256, _stable_hash
+from collector.module_c_canary_selection import build_selection_manifest
 
 from collector.module_c_execution_report import (
     BATCH_SQL,
@@ -59,6 +60,78 @@ def _strict_parameters(*, policy: str = "strict-v2") -> dict[str, object]:
     }
 
 
+def _selection_manifest() -> dict[str, object]:
+    source = {
+        "eligibility_build_id": BUILD_ID,
+        "eligibility_manifest_sha256": MANIFEST_SHA,
+        "canonical_audit_run_id": AUDIT_ID,
+        "audit_evidence_sha256": EVIDENCE_SHA,
+        "audit_checkpoint_sha256": CHECKPOINT_SHA,
+        "freshness_contract_version": "module-c-authoritative-freshness-v1",
+        "freshness_contract_sha256": FRESHNESS_SHA,
+        "catalog_generation_id": CATALOG_ID,
+        "catalog_control_revision": 7,
+        "catalog_manifest_sha256": CATALOG_SHA,
+        "audit_active_universe_sha256": UNIVERSE_SHA,
+    }
+    names = [
+        f"{prefix}{index:03d}.{exchange}"
+        for prefix, exchange in (("600", "SH"), ("300", "SZ"), ("688", "SH"), ("920", "BJ"))
+        for index in range(6)
+    ]
+    symbols = list(enumerate(names, start=1))
+    dispositions = [
+        {
+            "symbol_id": symbol_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "eligible": not (symbol.endswith(".BJ") and timeframe == 30),
+            "reasons": ["bj_30f_excluded"] if symbol.endswith(".BJ") and timeframe == 30 else [],
+            "covered_until": None,
+            "unresolved_rows": 0,
+        }
+        for symbol_id, symbol in symbols
+        for timeframe in (5, 30, 1440, 10080, 43200)
+    ]
+    checkpoints = [
+        {
+            "symbol_id": symbol_id,
+            "timeframe": timeframe,
+            "status": "completed",
+            "rows_scanned": 1000 + symbol_id if timeframe == 5 else 100,
+        }
+        for symbol_id, _symbol in symbols
+        for timeframe in (5, 30, 1440, 10080, 43200)
+    ]
+    return build_selection_manifest(
+        source=source, dispositions=dispositions, checkpoints=checkpoints
+    )
+
+
+def _canary_parameters() -> dict[str, object]:
+    selection = _selection_manifest()
+    return {
+        **_strict_parameters(),
+        "scope": "canary",
+        "source_build_id": BUILD_ID,
+        "selection_contract_version": selection["contract_version"],
+        "selection_manifest_sha256": selection["selection_sha256"],
+        "canary_selection": selection,
+        "selection_traits": sorted({
+            trait for entry in selection["symbols"] for trait in entry["traits"]
+        }),
+    }
+
+
+def _selection_active_universe_hash(parameters: dict[str, object]) -> str:
+    selection = parameters["canary_selection"]
+    identities = sorted(
+        (int(entry["symbol_id"]), str(entry["symbol"]).upper())
+        for entry in selection["symbols"]
+    )
+    return _stable_hash(symbol for _symbol_id, symbol in identities)
+
+
 @pytest.fixture(autouse=True)
 def _strict_loader(monkeypatch):
     async def load(_conn, audit_run_id, freshness, *, for_share):
@@ -96,6 +169,8 @@ class Conn:
         strict_policy="strict-v2",
         provenance_overrides=None,
         canonical_gate_pass=True,
+        batch_kind="baseline",
+        eligibility_parameters=None,
     ):
         self.batch_status = batch_status
         self.task_status = task_status
@@ -108,10 +183,21 @@ class Conn:
         self.strict_policy = strict_policy
         self.provenance_overrides = provenance_overrides or {}
         self.canonical_gate_pass = canonical_gate_pass
+        self.batch_kind = batch_kind
+        self.eligibility_parameters = eligibility_parameters
         self.canonical_args = None
 
     async def fetchrow(self, sql, *args):
         if "report:batch" in sql:
+            eligibility_parameters = self.eligibility_parameters or _strict_parameters(
+                policy=self.strict_policy
+            )
+            active_universe_hash = (
+                _selection_active_universe_hash(eligibility_parameters)
+                if self.batch_kind == "canary"
+                and "canary_selection" in eligibility_parameters
+                else UNIVERSE_SHA
+            )
             batch = {
                 "batch_id": args[0],
                 "eligibility_build_id": BUILD_ID,
@@ -140,7 +226,7 @@ class Conn:
                 "finished_at": datetime.now(UTC),
                 "updated_at": datetime.now(UTC),
                 "batch_key": "batch",
-                "batch_kind": "baseline",
+                "batch_kind": self.batch_kind,
                 "parent_effective_config": {
                     "contract": "module-c-native-five-level-v1",
                     "levels": ["5f", "30f", "1d", "1w", "1m"],
@@ -158,9 +244,9 @@ class Conn:
                 "input_watermark": {},
                 "audit_references": [],
                 "manifest_version": "strict-v2",
-                "active_universe_hash": "d" * 64,
+                "active_universe_hash": active_universe_hash,
                 "manifest_hash": MANIFEST_SHA,
-                "eligibility_parameters": _strict_parameters(policy=self.strict_policy),
+                "eligibility_parameters": eligibility_parameters,
                 "eligibility_summary": {},
                 "canonical_audit_run_id": AUDIT_ID,
                 "audit_evidence_sha256": EVIDENCE_SHA,
@@ -262,6 +348,65 @@ def test_report_go_requires_all_contract_evidence() -> None:
     assert report["recompute_summary"]["tasks"]["statuses"] == {"completed": 1}
     assert report["published_head_coverage"]["summary"]["missing"] == 0
     assert report["resource_metrics"][0]["cpu_percent"] == 25.0
+    assert report["selection"]["status"] == "not_applicable"
+
+
+def test_canary_report_validates_first_class_selection_v2_evidence() -> None:
+    report = asyncio.run(build_report(
+        Conn(batch_kind="canary", eligibility_parameters=_canary_parameters()), 7
+    ))
+
+    selection = report["selection"]
+    assert selection["status"] == "pass"
+    assert selection["contract_matches"] is True
+    assert selection["hash_matches"] is True
+    assert selection["source_matches"] is True
+    assert selection["quotas_match"] is True
+    assert selection["board_counts"] == {
+        "main_board": 5, "chinext": 5, "star": 5, "bj": 5
+    }
+    assert all(counts == {"lower": 2, "middle": 1, "upper": 2}
+               for counts in selection["boundary_counts"].values())
+    assert report["next_phase_decision"]["decision"] == "GO"
+
+
+def test_canary_report_fails_closed_for_missing_or_tampered_selection() -> None:
+    missing = asyncio.run(build_report(
+        Conn(batch_kind="canary", eligibility_parameters=_strict_parameters()), 7
+    ))
+    assert missing["selection"]["status"] == "unavailable"
+    assert "canary_selection_missing" in missing["selection"]["drift_reasons"]
+
+    parameters = _canary_parameters()
+    parameters["canary_selection"]["symbols"][0]["symbol"] = "600999.SH"
+    tampered = asyncio.run(build_report(
+        Conn(batch_kind="canary", eligibility_parameters=parameters), 7
+    ))
+    assert tampered["selection"]["status"] == "failed"
+    assert tampered["selection"]["hash_matches"] is False
+    assert {blocker["code"] for blocker in tampered["next_phase_decision"]["blockers"]} >= {
+        "canary_selection_failed"
+    }
+
+
+def test_canary_report_fails_closed_when_subset_universe_or_traits_drift() -> None:
+    wrong_universe = asyncio.run(build_report(
+        Conn(
+            batch_kind="canary",
+            eligibility_parameters=_canary_parameters(),
+            provenance_overrides={"active_universe_hash": "f" * 64},
+        ),
+        7,
+    ))
+    assert wrong_universe["strict_v2_provenance"]["decision"] == "FAIL"
+
+    parameters = _canary_parameters()
+    parameters["selection_traits"] = ["bj"]
+    wrong_traits = asyncio.run(build_report(
+        Conn(batch_kind="canary", eligibility_parameters=parameters), 7
+    ))
+    assert wrong_traits["selection"]["status"] == "failed"
+    assert "contract_mismatch" in wrong_traits["selection"]["drift_reasons"]
 
 
 def test_report_no_go_lists_each_required_blocking_class() -> None:
@@ -510,9 +655,11 @@ def test_write_artifacts_replaces_all_required_report_files(tmp_path) -> None:
         "failure_samples.jsonl",
         "next_phase_decision.json",
         "strict_v2_provenance.json",
+        "selection.json",
     }
     assert {path.name for path in tmp_path.iterdir()} == expected
     assert json.loads((tmp_path / "next_phase_decision.json").read_text(encoding="utf-8"))["decision"] == "GO"
+    assert json.loads((tmp_path / "selection.json").read_text(encoding="utf-8")) == report["selection"]
     assert not list(tmp_path.glob("*.tmp"))
 
 

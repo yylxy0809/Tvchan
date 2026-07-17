@@ -25,6 +25,8 @@ import {
   type ModuleCFreshnessActualWatermark,
   type ModuleCFreshnessExpectedWatermark,
   type ModuleCExecutionStatus,
+  type ModuleCSelectionBoard,
+  type ModuleCSelectionEvidence,
   type WencaiAdminConfig,
   fetchAdminOpsStatus,
   fetchLlmProviders,
@@ -631,6 +633,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
             <h4>actual_checkpoint_watermarks</h4>
             <WatermarkList values={moduleCBatch?.freshness.actual_checkpoint_watermarks} />
           </div>
+          <ModuleCSelectionEvidenceCard selection={moduleCBatch?.provenance.selection} />
         </div>
       </section>
 
@@ -890,6 +893,70 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
         </div>
       </section>
     </section>
+  );
+}
+
+const MODULE_C_SELECTION_BOARDS: ReadonlyArray<{
+  key: ModuleCSelectionBoard;
+  label: string;
+}> = [
+  { key: "main_board", label: "main board" },
+  { key: "chinext", label: "ChiNext" },
+  { key: "star", label: "STAR" },
+  { key: "bj", label: "Beijing" },
+];
+
+const EXPECTED_SELECTION_BOUNDARIES = { lower: 2, middle: 1, upper: 2 } as const;
+
+export function ModuleCSelectionEvidenceCard({
+  selection,
+}: {
+  selection?: ModuleCSelectionEvidence | null;
+}) {
+  const status = selection?.status ?? "unavailable";
+  const role = status === "failed" || status === "unavailable" ? "alert" : "status";
+
+  return (
+    <div className="admin-feature-card" aria-label="Canary selection v2 evidence">
+      <h3>Canary selection v2</h3>
+      <p className="admin-test-result" data-state={status} role={role}>
+        selection gate: {status}
+      </p>
+      <p>contract: {selection?.contract_version ?? "--"}</p>
+      <p>selection manifest: <HashValue value={selection?.manifest_sha256} /></p>
+      <p>
+        source build: {selection?.source_build_id
+          ? <code title={selection.source_build_id}>{selection.source_build_id}</code>
+          : <code>--</code>}
+      </p>
+      <p>activity basis: {selection?.activity_basis ?? "--"}</p>
+      <h4>board quotas</h4>
+      {MODULE_C_SELECTION_BOARDS.map(({ key, label }) => (
+        <p key={`board-${key}`}>
+          {label}: {selection?.board_counts[key] ?? "--"} / 5
+        </p>
+      ))}
+      <h4>activity boundaries</h4>
+      {MODULE_C_SELECTION_BOARDS.map(({ key, label }) => {
+        const counts = selection?.boundary_counts[key];
+        return (
+          <p key={`boundary-${key}`}>
+            {label}: lower {counts?.lower ?? "--"} / {EXPECTED_SELECTION_BOUNDARIES.lower}, middle{" "}
+            {counts?.middle ?? "--"} / {EXPECTED_SELECTION_BOUNDARIES.middle}, upper{" "}
+            {counts?.upper ?? "--"} / {EXPECTED_SELECTION_BOUNDARIES.upper}
+          </p>
+        );
+      })}
+      <p>contract matches: {formatBoolean(selection?.contract_matches ?? undefined)}</p>
+      <p>hash matches: {formatBoolean(selection?.hash_matches ?? undefined)}</p>
+      <p>source matches: {formatBoolean(selection?.source_matches ?? undefined)}</p>
+      <p>quotas match: {formatBoolean(selection?.quotas_match ?? undefined)}</p>
+      <p>
+        selection drift_reasons: {selection
+          ? formatReasons(selection.drift_reasons)
+          : "selection evidence unavailable"}
+      </p>
+    </div>
   );
 }
 
