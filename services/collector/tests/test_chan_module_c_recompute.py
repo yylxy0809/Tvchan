@@ -257,12 +257,18 @@ def test_full_recompute_claim_is_sharded_leased_and_attempt_bounded() -> None:
 
     assert result == row
     query, args = pool.conn.calls[0]
-    assert "for share of batch, parent" in query.lower()
-    assert "for update of task skip locked" in query.lower()
-    assert "from chan_c_full_recompute_batches batch" in query.lower()
-    assert "join chan_c_batches parent" in query.lower()
-    assert "batch.status = 'running'" in query.lower()
-    assert "parent.status = 'running'" in query.lower()
+    lowered = query.lower()
+    assert "with executable_parent as materialized" in lowered
+    assert "from chan_c_batches" in lowered
+    assert "for share" in lowered
+    assert "executable_batch as materialized" in lowered
+    assert "join executable_parent parent" in lowered
+    assert lowered.index("executable_parent as materialized") < lowered.index(
+        "executable_batch as materialized"
+    ) < lowered.index("candidate as")
+    assert "for update of task skip locked" in lowered
+    assert "batch.status = 'running'" in lowered
+    assert "parent.status = 'running'" in lowered
     assert "lease_version = task.lease_version + 1" in query
     assert args == (11, "worker-2", 900, 2, 4, 3)
     assert len(pool.conn.calls) == 1
@@ -325,8 +331,12 @@ def test_worker_task_state_mutations_require_running_parent_and_child() -> None:
         )
     )
     heartbeat_sql = heartbeat_pool.conn.calls[0][0].lower()
+    assert heartbeat_sql.index("executable_parent as materialized") < heartbeat_sql.index(
+        "executable_batch as materialized"
+    )
+    assert "from chan_c_batches" in heartbeat_sql
     assert "from chan_c_full_recompute_batches batch" in heartbeat_sql
-    assert "join chan_c_batches parent" in heartbeat_sql
+    assert "join executable_parent parent" in heartbeat_sql
     assert "batch.status = 'running'" in heartbeat_sql
     assert "parent.status = 'running'" in heartbeat_sql
 
@@ -340,10 +350,15 @@ def test_worker_task_state_mutations_require_running_parent_and_child() -> None:
         )
     )
     fail_sql = fail_pool.conn.calls[0][0].lower()
+    assert fail_sql.index("executable_parent as materialized") < fail_sql.index(
+        "executable_batch as materialized"
+    )
+    assert "from chan_c_batches" in fail_sql
     assert "from chan_c_full_recompute_batches batch" in fail_sql
-    assert "join chan_c_batches parent" in fail_sql
+    assert "join executable_parent parent" in fail_sql
     assert "batch.status = 'running'" in fail_sql
     assert "parent.status = 'running'" in fail_sql
+    assert "task.lease_until > now()" in fail_sql
 
 
 def test_worker_child_finalizer_requires_running_parent_and_child() -> None:
@@ -365,13 +380,20 @@ def test_worker_child_finalizer_requires_running_parent_and_child() -> None:
     )
 
     assert result == {"runs": 0, "failed": 0, "failures_observed": 0}
-    finalizer_sql = next(
-        query.lower()
-        for query, _args in pool.conn.calls
+    finalizer_sql, finalizer_args = next(
+        (query.lower(), args)
+        for query, args in pool.conn.calls
         if "update chan_c_full_recompute_batches batch" in query.lower()
     )
+    assert finalizer_sql.index("executable_parent as materialized") < finalizer_sql.index(
+        "executable_batch as materialized"
+    )
+    assert "join executable_parent parent" in finalizer_sql
     assert "parent.status = 'running'" in finalizer_sql
     assert "batch.status = 'running'" in finalizer_sql
+    assert "task.status = 'failed' and task.attempts < $2" in finalizer_sql
+    assert "task.status = 'failed' and task.attempts >= $2" in finalizer_sql
+    assert finalizer_args == (11, 3)
 
 
 @pytest.mark.parametrize("status", ["pending", "completed", "stopped", "failed"])

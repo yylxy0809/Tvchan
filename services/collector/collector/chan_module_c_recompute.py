@@ -546,15 +546,20 @@ async def claim_recompute_task(
     async with kline_writer._pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            with executable_batch as materialized (
+            with executable_parent as materialized (
+                select parent.id
+                  from chan_c_batches parent
+                 where parent.id = $1
+                   and parent.status = 'running'
+                 for share of parent
+            ), executable_batch as materialized (
                 select batch.batch_id
                   from chan_c_full_recompute_batches batch
-                  join chan_c_batches parent
+                  join executable_parent parent
                     on parent.id = batch.batch_id
                  where batch.batch_id = $1
                    and batch.status = 'running'
-                   and parent.status = 'running'
-                 for share of batch, parent
+                 for share of batch
             ), candidate as (
                 select task.batch_id, task.symbol_id, task.chan_level
                   from chan_c_full_recompute_tasks task
@@ -611,14 +616,19 @@ async def heartbeat_recompute_task(
     async with kline_writer._pool.acquire() as conn:
         result = await conn.execute(
             """
-            with executable_batch as materialized (
+            with executable_parent as materialized (
+                select parent.id
+                  from chan_c_batches parent
+                 where parent.id = $1
+                   and parent.status = 'running'
+                 for share of parent
+            ), executable_batch as materialized (
                 select batch.batch_id
                   from chan_c_full_recompute_batches batch
-                  join chan_c_batches parent on parent.id = batch.batch_id
+                  join executable_parent parent on parent.id = batch.batch_id
                  where batch.batch_id = $1
                    and batch.status = 'running'
-                   and parent.status = 'running'
-                 for share of batch, parent
+                 for share of batch
             )
             update chan_c_full_recompute_tasks task
                set lease_until = now() + ($6::integer * interval '1 second'),
@@ -649,14 +659,19 @@ async def fail_recompute_task(
     async with kline_writer._pool.acquire() as conn:
         result = await conn.execute(
             """
-            with executable_batch as materialized (
+            with executable_parent as materialized (
+                select parent.id
+                  from chan_c_batches parent
+                 where parent.id = $1
+                   and parent.status = 'running'
+                 for share of parent
+            ), executable_batch as materialized (
                 select batch.batch_id
                   from chan_c_full_recompute_batches batch
-                  join chan_c_batches parent on parent.id = batch.batch_id
+                  join executable_parent parent on parent.id = batch.batch_id
                  where batch.batch_id = $1
                    and batch.status = 'running'
-                   and parent.status = 'running'
-                 for share of batch, parent
+                 for share of batch
             )
             update chan_c_full_recompute_tasks task
                set status = 'failed', last_error = $6,
@@ -667,6 +682,7 @@ async def fail_recompute_task(
                and task.symbol_id = $2 and task.chan_level = $3
                and task.status = 'running' and task.claim_token = $4
                and task.lease_version = $5
+               and task.lease_until > now()
             """,
             task["batch_id"],
             task["symbol_id"],
@@ -733,20 +749,26 @@ async def process_claimed_tasks(
     async with kline_writer._pool.acquire() as conn:
         await conn.execute(
             """
-            with executable_batch as materialized (
+            with executable_parent as materialized (
+                select parent.id
+                  from chan_c_batches parent
+                 where parent.id = $1
+                   and parent.status = 'running'
+                 for share of parent
+            ), executable_batch as materialized (
                 select batch.batch_id
                   from chan_c_full_recompute_batches batch
-                  join chan_c_batches parent on parent.id = batch.batch_id
+                  join executable_parent parent on parent.id = batch.batch_id
                  where batch.batch_id = $1
                    and batch.status = 'running'
-                   and parent.status = 'running'
-                 for share of batch, parent
+                 for share of batch
             )
             update chan_c_full_recompute_batches batch
                set status = case
                        when exists (
                            select 1 from chan_c_full_recompute_tasks task
-                            where task.batch_id = batch.batch_id and task.status = 'failed'
+                            where task.batch_id = batch.batch_id
+                              and task.status = 'failed' and task.attempts >= $2
                        ) then 'failed'
                        else 'completed'
                    end,
@@ -757,10 +779,14 @@ async def process_claimed_tasks(
                and not exists (
                    select 1 from chan_c_full_recompute_tasks task
                     where task.batch_id = batch.batch_id
-                      and task.status in ('pending', 'running')
+                      and (
+                          task.status in ('pending', 'running')
+                          or (task.status = 'failed' and task.attempts < $2)
+                      )
                )
             """,
             batch_id,
+            max_attempts,
         )
         failed = await conn.fetchval(
             """
