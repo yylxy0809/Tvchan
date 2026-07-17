@@ -30,7 +30,11 @@ async def ops_status(
         redis = {"ok": False, "error": "redis_status_timeout"}
     try:
         lifecycle_observer = await asyncio.wait_for(
-            _lifecycle_observer_status(pool, settings.chan_lifecycle_observer),
+            _lifecycle_observer_status(
+                pool,
+                settings.chan_lifecycle_observer,
+                stale_after_seconds=settings.chan_lifecycle_observer_stale_seconds,
+            ),
             timeout=2.0,
         )
     except TimeoutError:
@@ -38,6 +42,8 @@ async def ops_status(
             "status": "degraded",
             "deployed": True,
             "expected_observer_name": settings.chan_lifecycle_observer,
+            "heartbeat_age_seconds": None,
+            "heartbeat_stale_after_seconds": settings.chan_lifecycle_observer_stale_seconds,
             "reason": "query_timeout",
         }
     if pool is None:
@@ -109,7 +115,12 @@ async def _db_status(pool) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)[:500]}
 
 
-async def _lifecycle_observer_status(pool, expected_observer_name: str) -> dict[str, Any]:
+async def _lifecycle_observer_status(
+    pool,
+    expected_observer_name: str,
+    *,
+    stale_after_seconds: int = 120,
+) -> dict[str, Any]:
     if pool is None:
         return {
             "status": "unavailable",
@@ -140,7 +151,11 @@ async def _lifecycle_observer_status(pool, expected_observer_name: str) -> dict[
             )
             watermark_row = await conn.fetchrow(
                 """
-                select observer_name, last_outbox_id, updated_at
+                select observer_name, last_outbox_id, updated_at,
+                       greatest(
+                           0,
+                           extract(epoch from (clock_timestamp() - updated_at))
+                       )::bigint as heartbeat_age_seconds
                 from chan_lifecycle_observer_watermarks
                 where observer_name = $1
                 """,
@@ -172,9 +187,11 @@ async def _lifecycle_observer_status(pool, expected_observer_name: str) -> dict[
     max_outbox_id = int(stats["max_outbox_id"])
     observer_watermark = None
     watermark_lag = 0
+    heartbeat_age_seconds = None
     if watermark_row is not None:
         watermark = dict(watermark_row)
         watermark_lag = max(0, max_outbox_id - int(watermark["last_outbox_id"]))
+        heartbeat_age_seconds = int(watermark["heartbeat_age_seconds"])
         observer_watermark = {
             "observer_name": watermark["observer_name"],
             "last_outbox_id": int(watermark["last_outbox_id"]),
@@ -182,11 +199,27 @@ async def _lifecycle_observer_status(pool, expected_observer_name: str) -> dict[
             "lag": watermark_lag,
         }
     has_backlog = any(counts.values())
-    watermark_missing = max_outbox_id > 0 and observer_watermark is None
+    watermark_missing = observer_watermark is None
+    heartbeat_stale = (
+        heartbeat_age_seconds is not None and heartbeat_age_seconds > stale_after_seconds
+    )
+    reason = None
+    if has_backlog:
+        reason = "backlog"
+    elif watermark_lag > 0:
+        reason = "watermark_lag"
+    elif watermark_missing:
+        reason = "heartbeat_missing"
+    elif heartbeat_stale:
+        reason = "heartbeat_stale"
+    status = "degraded" if reason is not None else "healthy"
     return {
-        "status": "degraded" if has_backlog or watermark_missing or watermark_lag > 0 else "healthy",
+        "status": status,
+        **({"reason": reason} if reason is not None else {}),
         "deployed": True,
         "expected_observer_name": expected_observer_name,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
+        "heartbeat_stale_after_seconds": stale_after_seconds,
         "counts": counts,
         "oldest_backlog_at": stats["oldest_backlog_at"],
         "oldest_backlog_age_seconds": stats["oldest_backlog_age_seconds"],

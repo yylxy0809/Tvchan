@@ -21,11 +21,15 @@ test("admin console exposes lifecycle observer health, backlog, and watermark", 
   assert.match(source, /dead_letter/);
   assert.match(source, /oldest_backlog_at/);
   assert.match(source, /observer_watermark/);
+  assert.match(source, /heartbeat_age_seconds/);
+  assert.match(source, /heartbeat_stale_after_seconds/);
   assert.match(source, /expected_observer_name/);
   assert.match(source, /unavailable/);
   assert.match(source, /degraded/);
   assert.match(apiSource, /"unavailable" \| "degraded" \| "healthy"/);
   assert.match(apiSource, /expected_observer_name/);
+  assert.match(apiSource, /heartbeat_age_seconds/);
+  assert.match(apiSource, /heartbeat_stale_after_seconds/);
 });
 
 test("admin console passes its authenticated admin token to durable token CRUD", () => {

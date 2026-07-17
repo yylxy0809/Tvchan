@@ -72,3 +72,16 @@ def test_lifecycle_observer_name_can_be_overridden(monkeypatch) -> None:
     monkeypatch.setenv("CHAN_LIFECYCLE_OBSERVER", "canonical-observer")
 
     assert Settings().chan_lifecycle_observer == "canonical-observer"
+
+
+def test_lifecycle_observer_stale_threshold_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS", "180")
+
+    assert Settings().chan_lifecycle_observer_stale_seconds == 180
+
+
+def test_lifecycle_observer_stale_threshold_must_be_positive(monkeypatch) -> None:
+    monkeypatch.setenv("CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS", "0")
+
+    with pytest.raises(RuntimeError, match="must be greater than zero"):
+        Settings()

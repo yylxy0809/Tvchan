@@ -10,6 +10,7 @@ from collector.lifecycle_observer import (
     FAIL_OUTBOX_SQL,
     REBUILD_CURRENT_PROJECTION_SQL,
     RENEW_OUTBOX_SQL,
+    UPSERT_WATERMARK_SQL,
     LifecycleObserver,
     LostLifecycleLease,
     Observation,
@@ -115,6 +116,25 @@ def test_ack_is_guarded_and_watermark_only_moves_after_success() -> None:
         assert accepted.executed[0][1] == ("chan-lifecycle-v1",)
 
     asyncio.run(exercise())
+
+
+def test_idle_pulse_refreshes_the_existing_durable_watermark_without_skipping_work() -> None:
+    class Conn:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, tuple[object, ...]]] = []
+
+        async def execute(self, sql: str, *args: object) -> None:
+            self.executed.append((sql, args))
+
+    async def exercise() -> None:
+        conn = Conn()
+        await LifecycleObserver(observer_name="canonical-observer").pulse(conn)
+        assert conn.executed == [(UPSERT_WATERMARK_SQL, ("canonical-observer",))]
+
+    asyncio.run(exercise())
+    normalized = " ".join(UPSERT_WATERMARK_SQL.lower().split())
+    assert "min(id) - 1 from chan_c_head_outbox where status <> 'completed'" in normalized
+    assert "select max(id) from chan_c_head_outbox" in normalized
 
 
 def test_failed_claim_is_fenced_and_can_be_dead_lettered() -> None:

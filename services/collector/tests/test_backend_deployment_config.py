@@ -86,6 +86,9 @@ def test_lifecycle_observer_is_a_single_standard_realtime_worker() -> None:
     compose = (ROOT / "deploy" / "docker-compose.backend.yml").read_text(encoding="utf-8")
     example = (ROOT / "deploy" / "backend.env.example").read_text(encoding="utf-8")
 
+    api = compose[compose.index("  api:"):compose.index("  web-gateway:")]
+    assert "CHAN_LIFECYCLE_OBSERVER:" in api
+    assert "CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS:" in api
     assert compose.count("  lifecycle-observer-worker:") == 1
     worker = compose[compose.index("  lifecycle-observer-worker:"):compose.index("  chan-module-c-recompute-worker:")]
     assert 'profiles: ["workers", "realtime-pipeline", "realtime-chan-c"]' in worker
@@ -97,6 +100,7 @@ def test_lifecycle_observer_is_a_single_standard_realtime_worker() -> None:
     assert "restart: unless-stopped" in worker
     assert "replicas:" not in worker
     assert "CHAN_LIFECYCLE_OBSERVER=chan-lifecycle-v1" in example
+    assert "CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS=120" in example
     assert "LIFECYCLE_LEASE_SECONDS=300" in example
     assert "LIFECYCLE_MAX_ATTEMPTS=5" in example
 
