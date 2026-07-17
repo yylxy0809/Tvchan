@@ -57,8 +57,12 @@ BATCH_SQL = """
 select parent.id as batch_id, parent.batch_key, parent.batch_kind,
        parent.status as parent_status, child.status as child_status,
        parent.publication_namespace, parent.profile_id, parent.run_group_id,
+       child.publication_namespace as child_publication_namespace,
+       child.profile_id as child_profile_id,
+       child.run_group_id as child_run_group_id,
        parent.code_commit, parent.image_digest, parent.vendor_manifest_sha256,
-       parent.config_hash, parent.created_at, child.started_at, child.finished_at,
+       parent.config_hash, child.config_hash as child_config_hash,
+       parent.created_at, child.started_at, child.finished_at,
        child.updated_at, child.shard_count, child.active_symbols,
        child.disposition_rows,
        (select max(task.updated_at) from chan_c_full_recompute_tasks task
@@ -697,7 +701,29 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
     )
     config_hash_matches = (
         batch.get("config_hash") is not None
+        and batch.get("config_hash") == batch.get("child_config_hash")
         and batch.get("config_hash") == batch.get("build_config_hash")
+    )
+    execution_identity_matches = bool(
+        batch.get("batch_kind") in {"canary", "baseline"}
+        and all(
+            isinstance(batch.get(field), str) and bool(str(batch.get(field)).strip())
+            for field in (
+                "config_hash",
+                "child_config_hash",
+                "run_group_id",
+                "child_run_group_id",
+                "publication_namespace",
+                "child_publication_namespace",
+                "profile_id",
+                "child_profile_id",
+            )
+        )
+        and batch.get("config_hash") == batch.get("child_config_hash")
+        and batch.get("run_group_id") == batch.get("child_run_group_id")
+        and batch.get("publication_namespace")
+        == batch.get("child_publication_namespace")
+        and batch.get("profile_id") == batch.get("child_profile_id")
     )
     expected_frozen_config = {
         "contract": FROZEN_CONTRACT,
@@ -732,6 +758,8 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
         drift_reasons.append("eligibility_manifest_drift")
     if not config_hash_matches:
         drift_reasons.append("config_hash_drift")
+    if not execution_identity_matches:
+        drift_reasons.append("execution_identity_drift")
     if not frozen_config_matches:
         drift_reasons.append("frozen_execution_contract_drift")
     if not strict_parameters_match:
@@ -766,6 +794,7 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
         and catalog_revision_matches
         and eligibility_manifest_matches
         and config_hash_matches
+        and execution_identity_matches
         and freshness_status == "current"
         and durable_max_attempts is not None
         and durable_max_attempts > 0
@@ -844,6 +873,7 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
             "catalog_revision_matches": catalog_revision_matches,
             "eligibility_manifest_matches": eligibility_manifest_matches,
             "config_hash_matches": config_hash_matches,
+            "execution_identity_matches": execution_identity_matches,
             "frozen_config_matches": frozen_config_matches,
             "live_universe_matches": live_universe_matches,
             "catalog_manifest_matches": catalog_manifest_matches,

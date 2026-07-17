@@ -322,6 +322,7 @@ class ModuleCExecutionProvenanceResponse(BaseModel):
     catalog_revision_matches: bool
     eligibility_manifest_matches: bool
     config_hash_matches: bool
+    execution_identity_matches: bool
     frozen_config_matches: bool
     live_universe_matches: bool
     catalog_manifest_matches: bool

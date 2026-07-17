@@ -271,12 +271,16 @@ def _batch(*, audit_active_universe_count: int = 20, **overrides) -> dict:
         "parent_status": "running",
         "child_status": "running",
         "publication_namespace": "production",
+        "child_publication_namespace": "production",
         "profile_id": "module-c-native-5lvl",
+        "child_profile_id": "module-c-native-5lvl",
         "run_group_id": "run-42",
+        "child_run_group_id": "run-42",
         "code_commit": "a" * 40,
         "image_digest": "sha256:image",
         "vendor_manifest_sha256": "b" * 64,
         "config_hash": "config",
+        "child_config_hash": "config",
         "created_at": NOW,
         "started_at": NOW,
         "finished_at": None,
@@ -376,6 +380,7 @@ def test_repository_returns_structured_bound_provenance_in_one_readonly_snapshot
     assert provenance["catalog_revision_matches"] is True
     assert provenance["eligibility_manifest_matches"] is True
     assert provenance["config_hash_matches"] is True
+    assert provenance["execution_identity_matches"] is True
     assert provenance["drift_reasons"] == []
     assert "notes" not in result["batch"]
     assert "last_error" not in result["batch"]["execution"]["tasks"][0]
@@ -439,6 +444,32 @@ def test_repository_reports_drift_as_facts_without_claiming_freshness() -> None:
         "freshness_evidence_unavailable",
     }
     assert "fresh" not in provenance
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("child_config_hash", "other"),
+        ("child_run_group_id", "other"),
+        ("child_publication_namespace", "other"),
+        ("child_profile_id", "other"),
+        ("batch_kind", "historical"),
+    ],
+)
+def test_execution_identity_drift_is_fail_visible(field, value) -> None:
+    result = asyncio.run(
+        get_module_c_execution_status(
+            FakeConnection(batch=_batch(**{field: value})), batch_id=42
+        )
+    )
+
+    provenance = result["batch"]["provenance"]
+    assert provenance["execution_identity_matches"] is False
+    assert provenance["evidence_complete"] is False
+    assert "execution_identity_drift" in provenance["drift_reasons"]
+    if field == "child_config_hash":
+        assert provenance["config_hash_matches"] is False
+        assert "config_hash_drift" in provenance["drift_reasons"]
 
 
 def test_freshness_uses_pinned_audit_universe_not_canary_subset() -> None:
