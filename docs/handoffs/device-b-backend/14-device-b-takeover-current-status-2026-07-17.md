@@ -11,8 +11,8 @@
 当前已验收的主干基线：
 
 ```text
-origin/master = 1c790e359e663d20fe72c3747be6d087c047f814
-short SHA     = 1c790e3
+origin/master = 4e0f459afb11ab7a0bb433625795591eaf5ed861
+short SHA     = 4e0f459
 ```
 
 | PR | 交付层 | 状态 |
@@ -35,6 +35,13 @@ short SHA     = 1c790e3
 | #24 | 通用 Strategy backtest runner diagnostic-only 防火墙 | 已合入；official/default/未知策略在连接数据库前 fail-closed |
 | #25 | Admin Console durable token CRUD | 已合入；显式 admin token，无本地伪令牌或网络降级 |
 | #26 | scope catalog generation fencing 加固 | 已合入；migration 041、单 building、revision/ABA 防护 |
+| #27-#41 | 接管状态、observer 新鲜度、Strategy fail-closed、管理认证、scope catalog 管理与 bulk bootstrap | 已合入；正式策略保持 `NO_GO` |
+| #42 | strict-v2 canonical audit producer | 已合入；exact 五级快照、catalog/Kline 同快照交叉核验与双键 advisory fence |
+| #43 | strict-v2 eligibility consumer A | 已合入；migration 043 与 audit/freshness/catalog/universe provenance 冻结 |
+| #44 | strict-v2 execution consumer B | 已合入；prepare/activate drift 重验、原子激活与 running/running worker/publication fence |
+| #45 | strict-v2 Module C 只读可观测性 | 已合入；Collector report、管理 API 与 Admin Console 全链路 fail-visible |
+| #46 | deterministic Module C canary selection-v2 | 已合入；四板块各 5 标、每板块活动边界 2/1/2、稳定排序与 canonical hash |
+| #47 | selection-v2 冻结证据与管理可观测性 | 已合入；完整 manifest、subset universe/source/配额 gate、旧证据缺失 fail-visible |
 
 三层 rebased 代码、合入后验收、v4/lifecycle 防火墙与 scope catalog 两阶段实现均已进入主干。旧 PR 和旧分支仅用于审计，不应再次合并、rebase 或强推。
 
@@ -98,9 +105,11 @@ short SHA     = 1c790e3
 5. **管理令牌认证边界**：PR #25 使 Admin Console 的 token GET/POST/disable/DELETE 显式携带当前 admin token 调用 durable 后端 API；网络失败和 404 不再降级到 `localStorage` 或生成本地伪令牌。
 6. **catalog generation 并发防护**：PR #26 的 migration 041 增加全局单一 building generation、base active pointer 与 control revision；writer/finalizer 对旧 revision、ABA 和 pointer-clear 变更均由数据库 fail-closed。
 
-组合验证基线：Web contract `107/107` 且 production build 通过；Strategy `200/200`；PR #26 focused Collector `24/24`，Collector 全套 `369 passed`，另有一个仅因本机缺少可选 `notte_core` 依赖的环境失败。Disposable TimescaleDB 已验证 migration 001..041 与 041 幂等、legacy building 显式恢复、并发 create、旧 writer/finalizer fail-closed、新 finalizer、revision/ABA/pointer-clear 规则、active generation 原子切换和 exact-empty 零 K-line probe；canonical K-line 指纹不变。没有连接或写入生产数据库。
+组合验证基线：Web contract `115/115` 且 production build 通过；API `233 passed / 8 skipped`；Collector `651 passed / 2 skipped`，另有一个仅因本机缺少可选 `notte_core` 依赖的既有环境失败。strict-v2 producer/consumer 已通过 focused、全套及 disposable PostgreSQL/TimescaleDB 的迁移、并发、回滚和 fencing 验证。PR #47 的三路独立 P0/P1 复审已确认 selection contract、49-bar 活跃度基准、20 标 subset universe、full source audit universe、四板块与 2/1/2 配额一致；未连接或写入生产库。
 
-当前没有仓库任务单授权扩大为全市场重算、historical replay 或正式策略回测；official 仍为 `NO_GO`。
+生产 `kline_scope_catalog` generation `2188f14c-0b35-416d-9671-fd3d227d1f75` 已 complete/active，control revision 为 `1`，`scope_count=expected_scope_count=38738`，unknown/incomplete 为零；bootstrap worker 已移除。canonical K-line 指纹保持不变，outbox blocking 为零，observer 健康。
+
+当前硬阻塞是权威交易日历下的 canonical freshness：`5f/30f/1d/1w` 实际最大水位仍为 `2026-07-03T07:00:00Z`，`1m` 为 `2026-06-30T07:00:00Z`，已不满足当前 expected closed watermark。未经新的明确授权，不刷新或修改 canonical K 线，不生成生产 eligibility/canary，也不启动全市场 Module C 重算、historical replay 或正式策略回测；official 仍为 `NO_GO`。
 
 ## 7. 后续开发方法
 
@@ -117,7 +126,7 @@ short SHA     = 1c790e3
 ## 8. 下一次接管冷启动
 
 ```text
-1. git fetch origin --prune，记录最新 origin/master；不要把 1c790e3 当作永久固定 SHA。
+1. git fetch origin --prune，记录最新 origin/master；不要把 4e0f459 当作永久固定 SHA。
 2. 阅读 AGENTS.md、本文及新增任务单/审查意见。
 3. 确认工作树干净，确认禁止项和 official NO_GO 未变化。
 4. 从最新 master 建立单一范围分支；不得重跑 13 中已经完成的三层重建。
