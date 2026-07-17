@@ -1,4 +1,5 @@
 import { apiUrl, isFrontendAdminToken } from "../config";
+import { requestAdmin } from "../api/adminRequest";
 
 export type UserRole = "user" | "admin";
 
@@ -147,28 +148,6 @@ async function loginViaHealthFallback(token: string): Promise<AuthSession> {
     displayName: "Legacy API token",
     label: "legacy",
   };
-}
-
-async function requestAdmin<T = unknown>(
-  adminToken: string,
-  path: string,
-  init: RequestInit = {},
-): Promise<T> {
-  const response = await fetch(apiUrl(path), {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${adminToken.trim()}`,
-      ...init.headers,
-    },
-  });
-  if (!response.ok) {
-    throw new Error(await readResponseError(response));
-  }
-  if (response.status === 204) {
-    return undefined as T;
-  }
-  return response.json() as Promise<T>;
 }
 
 function readLocalTokens(): AdminToken[] {

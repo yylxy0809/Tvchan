@@ -32,7 +32,7 @@ import {
   fetchLlmProviders,
   fetchModuleCExecution,
   fetchWencaiConfig,
-  isAdminAuthFailure,
+  handleAdminAuthenticationFailure,
   saveLlmProviders,
   saveWencaiConfig,
   testLlmProvider,
@@ -120,6 +120,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
     try {
       setTokens(await listAdminTokens(adminToken));
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setError(readError(nextError));
     } finally {
       setLoading(false);
@@ -209,6 +210,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
       setFeatureConfig(savedConfig);
       publishRuntimeFeatureConfig(savedConfig);
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setFeatureConfig(featureConfig);
       setError(readError(nextError));
     } finally {
@@ -235,6 +237,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
       setLabel("");
       setDisplayName("");
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setError(readError(nextError));
     } finally {
       setMutating(false);
@@ -250,6 +253,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
         current.map((item) => (item.id === id ? updated : item)),
       );
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setError(readError(nextError));
     } finally {
       setMutating(false);
@@ -263,6 +267,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
       await deleteAdminToken(adminToken, id);
       setTokens((current) => current.filter((item) => item.id !== id));
     } catch (nextError) {
+      if (handleAuthenticationFailure(nextError)) return;
       setError(readError(nextError));
     } finally {
       setMutating(false);
@@ -382,11 +387,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
   }
 
   function handleAuthenticationFailure(error: unknown): boolean {
-    if (!isAdminAuthFailure(error)) {
-      return false;
-    }
-    onAuthenticationFailure();
-    return true;
+    return handleAdminAuthenticationFailure(error, onAuthenticationFailure);
   }
 
   const moduleCExecution = moduleCExecutionState.snapshot;

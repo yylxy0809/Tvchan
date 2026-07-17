@@ -6,6 +6,7 @@ import {
   AdminRequestError,
   fetchAdminOpsStatus,
   fetchModuleCExecution,
+  handleAdminAuthenticationFailure,
   isAdminAuthFailure,
 } from "../api/adminRuntimeConfig";
 import { ModuleCSelectionEvidenceCard } from "./AdminConsole";
@@ -96,13 +97,62 @@ test("admin auth failures logout instead of fabricating observer health", () => 
 
   assert.match(source, /onAuthenticationFailure/);
   assert.match(source, /handleAuthenticationFailure\(nextError\)/);
-  assert.match(source, /isAdminAuthFailure\(error\)/);
-  assert.match(source, /onAuthenticationFailure\(\);\s*return true;/);
+  assert.match(source, /handleAdminAuthenticationFailure\(error, onAuthenticationFailure\)/);
   assert.match(appSource, /onAuthenticationFailure=\{handleLogout\}/);
   assert.match(appSource, /clearSavedSessionMeta\(\)/);
   assert.equal(isAdminAuthFailure(new AdminRequestError(401, "expired")), true);
   assert.equal(isAdminAuthFailure(new AdminRequestError(403, "forbidden")), true);
   assert.equal(isAdminAuthFailure(new AdminRequestError(500, "server error")), false);
+});
+
+test("admin authentication routing invokes only the correct failure path", () => {
+  for (const status of [401, 403]) {
+    let authenticationFailures = 0;
+    assert.equal(
+      handleAdminAuthenticationFailure(
+        new AdminRequestError(status, "expired"),
+        () => { authenticationFailures += 1; },
+      ),
+      true,
+    );
+    assert.equal(authenticationFailures, 1);
+  }
+
+  let authenticationFailures = 0;
+  assert.equal(
+    handleAdminAuthenticationFailure(
+      new AdminRequestError(500, "server error"),
+      () => { authenticationFailures += 1; },
+    ),
+    false,
+  );
+  assert.equal(authenticationFailures, 0);
+});
+
+test("token CRUD and feature mutations route auth failures through logout", () => {
+  const source = readFileSync(new URL("./AdminConsole.tsx", import.meta.url), "utf8");
+  for (const call of [
+    "listAdminTokens(adminToken)",
+    "saveRuntimeFeatureConfig(adminToken, next)",
+    "createAdminToken(adminToken,",
+    "disableAdminToken(adminToken, id)",
+    "deleteAdminToken(adminToken, id)",
+  ]) {
+    const callIndex = source.indexOf(call);
+    assert.ok(callIndex >= 0, `${call} must remain wired to the durable backend`);
+    const catchIndex = source.indexOf("catch (nextError)", callIndex);
+    const nextFunctionIndex = source.indexOf("\n  async function ", callIndex + call.length);
+    const authFailureIndex = source.indexOf(
+      "if (handleAuthenticationFailure(nextError)) return;",
+      catchIndex,
+    );
+    assert.ok(catchIndex > callIndex, `${call} must handle request failures`);
+    assert.ok(
+      authFailureIndex > catchIndex &&
+        (nextFunctionIndex < 0 || authFailureIndex < nextFunctionIndex),
+      `${call} must clear the session on 401/403`,
+    );
+  }
 });
 
 test("non-auth ops failures remain locally degraded", () => {
@@ -119,7 +169,7 @@ test("module C execution fetch uses the authenticated read-only endpoint", async
   let authorization = "";
   globalThis.fetch = async (input, init) => {
     requestedUrl = String(input);
-    authorization = String((init?.headers as Record<string, string>)?.Authorization ?? "");
+    authorization = new Headers(init?.headers).get("Authorization") ?? "";
     return new Response(JSON.stringify({
       observed_at: "2026-07-18T00:00:00Z",
       readonly: true,

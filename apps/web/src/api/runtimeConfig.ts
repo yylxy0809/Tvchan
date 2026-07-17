@@ -1,4 +1,5 @@
 import { apiUrl } from "../config";
+import { requestAdmin } from "./adminRequest";
 
 export type RuntimeFeatureArea = "rightSidebar" | "screenerDock";
 
@@ -24,21 +25,14 @@ export async function saveRuntimeFeatureConfig(
   token: string,
   config: RuntimeFeatureConfig,
 ): Promise<RuntimeFeatureConfig> {
-  const response = await fetch(
-    apiUrl("/api/v1/admin/runtime-config/frontend.features"),
+  return normalizeRuntimeFeatureConfig(await requestAdmin(
+    token,
+    "/api/v1/admin/runtime-config/frontend.features",
     {
       method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token.trim()}`,
-      },
       body: JSON.stringify({ value: { features: config } }),
     },
-  );
-  if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
-  }
-  return normalizeRuntimeFeatureConfig(await response.json());
+  ));
 }
 
 export function normalizeRuntimeFeatureConfig(payload: unknown): RuntimeFeatureConfig {
