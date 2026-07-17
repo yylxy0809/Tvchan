@@ -359,28 +359,30 @@ class LifecycleObserver:
             profile=profile, previous=previous,
             current=current, states=states,
         )
-        visible_fingerprints: set[str] = set()
-        visible_heads = await conn.fetch(
-            """
-            select h.run_id, h.mode, r.config_hash
-            from scheme2_chan_c_published_heads h
-            join chan_c_runs r on r.id = h.run_id
-            where h.symbol_id = $1 and h.chan_level = $2
-              and h.status = 'published' and h.run_id is not null
-            """,
-            history["symbol_id"], history["chan_level"],
-        )
-        for head in visible_heads:
-            observations = await self.load_observations(
-                conn, run_id=head["run_id"], symbol_id=int(history["symbol_id"]),
-                chan_level=int(history["chan_level"]), mode=str(head["mode"]),
-                config_hash=str(head["config_hash"]),
+        if profile != "historical_replay":
+            visible_fingerprints: set[str] = set()
+            visible_heads = await conn.fetch(
+                """
+                select h.run_id, h.mode, r.config_hash
+                from scheme2_chan_c_published_heads h
+                join chan_c_runs r on r.id = h.run_id
+                where h.symbol_id = $1 and h.chan_level = $2
+                  and h.status = 'published' and h.run_id is not null
+                """,
+                history["symbol_id"], history["chan_level"],
             )
-            visible_fingerprints.update(item.fingerprint for item in observations)
-        events = [
-            event for event in events
-            if event.event_type != "disappeared" or event.observation.fingerprint not in visible_fingerprints
-        ]
+            for head in visible_heads:
+                observations = await self.load_observations(
+                    conn, run_id=head["run_id"], symbol_id=int(history["symbol_id"]),
+                    chan_level=int(history["chan_level"]), mode=str(head["mode"]),
+                    config_hash=str(head["config_hash"]),
+                )
+                visible_fingerprints.update(item.fingerprint for item in observations)
+            events = [
+                event for event in events
+                if event.event_type != "disappeared"
+                or event.observation.fingerprint not in visible_fingerprints
+            ]
         effective_time = history["published_at"]
         if profile == "historical_replay":
             effective_time = await conn.fetchval(

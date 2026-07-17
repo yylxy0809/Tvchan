@@ -225,12 +225,113 @@ def test_lost_lease_aborts_atomic_persist() -> None:
     asyncio.run(exercise())
 
 
-def test_historical_replay_uses_isolated_state_and_cutoff_event_time() -> None:
-    source = Path(__file__).resolve().parents[1] / "collector" / "lifecycle_observer.py"
-    text = source.read_text(encoding="utf-8")
-    assert 'profile != "historical_replay"' in text
-    assert "select cutoff_time" in text
-    assert "observed_time=history[\"published_at\"]" in text
+class CapturingProcessObserver(LifecycleObserver):
+    def __init__(self, observations_by_run: dict[int, list[Observation]]) -> None:
+        super().__init__()
+        self.observations_by_run = observations_by_run
+        self.persisted: dict[str, object] | None = None
+
+    async def renew(self, *_args, **_kwargs) -> bool:
+        return True
+
+    async def load_observations(self, _conn, *, run_id: int | None, **_kwargs):
+        return list(self.observations_by_run.get(int(run_id or 0), []))
+
+    async def persist_and_acknowledge(self, _conn, **kwargs) -> None:
+        self.persisted = {**kwargs, "events": list(kwargs["events"])}
+
+
+class ProcessClaimedConnection:
+    def __init__(
+        self, *, profile: str, published_at: datetime, cutoff: datetime | None,
+        visible_heads: list[dict[str, object]] | None = None,
+        reject_live_heads: bool = False,
+    ) -> None:
+        self.profile = profile
+        self.published_at = published_at
+        self.cutoff = cutoff
+        self.visible_heads = visible_heads or []
+        self.reject_live_heads = reject_live_heads
+        self.live_head_queries = 0
+
+    async def fetchrow(self, sql: str, *_args):
+        assert "chan_c_head_history" in sql
+        return {
+            "symbol_id": 1,
+            "chan_level": 5,
+            "mode": "predictive",
+            "old_run_id": 1,
+            "new_run_id": 2,
+            "publication_profile": self.profile,
+            "published_at": self.published_at,
+        }
+
+    async def fetchval(self, sql: str, *_args):
+        if "select config_hash" in sql:
+            return "cfg"
+        if "select cutoff_time" in sql:
+            return self.cutoff
+        raise AssertionError(sql)
+
+    async def fetch(self, sql: str, *_args):
+        if "chan_structure_lifecycle_current" in sql:
+            return []
+        if "scheme2_chan_c_published_heads" in sql:
+            self.live_head_queries += 1
+            if self.reject_live_heads:
+                raise AssertionError("historical replay must not query current published heads")
+            return self.visible_heads
+        raise AssertionError(sql)
+
+
+def test_historical_disappearance_uses_only_causal_replay_heads() -> None:
+    published_at = datetime(2026, 7, 17, 1, tzinfo=UTC)
+    cutoff = datetime(2026, 7, 3, 7, tzinfo=UTC)
+    item = observation()
+    observer = CapturingProcessObserver({1: [item], 2: []})
+    connection = ProcessClaimedConnection(
+        profile="historical_replay",
+        published_at=published_at,
+        cutoff=cutoff,
+        reject_live_heads=True,
+    )
+
+    count = asyncio.run(observer.process_claimed(
+        connection,
+        {"id": 7, "head_history_id": 11, "payload": {"publication_profile": "historical_replay"}},
+    ))
+
+    assert count == 1
+    assert connection.live_head_queries == 0
+    assert observer.persisted is not None
+    assert [event.event_type for event in observer.persisted["events"]] == ["disappeared"]
+    assert observer.persisted["effective_time"] == cutoff
+    assert observer.persisted["observed_time"] == published_at
+
+
+def test_online_disappearance_is_suppressed_when_another_current_mode_still_exposes_it() -> None:
+    published_at = datetime(2026, 7, 17, 1, tzinfo=UTC)
+    predictive = observation()
+    confirmed = Observation(**{**predictive.__dict__, "mode": "confirmed"})
+    observer = CapturingProcessObserver({1: [predictive], 2: [], 3: [confirmed]})
+    connection = ProcessClaimedConnection(
+        profile="online",
+        published_at=published_at,
+        cutoff=None,
+        visible_heads=[{"run_id": 3, "mode": "confirmed", "config_hash": "cfg"}],
+    )
+
+    count = asyncio.run(observer.process_claimed(
+        connection,
+        {"id": 8, "head_history_id": 12, "payload": {"publication_profile": "online"}},
+    ))
+
+    assert count == 0
+    assert connection.live_head_queries == 1
+    assert observer.persisted is not None
+    assert observer.persisted["events"] == []
+    assert observer.persisted["effective_time"] == published_at
+    assert observer.persisted["observed_time"] == published_at
 
 
 def test_migration_039_separates_observed_and_effective_time() -> None:
