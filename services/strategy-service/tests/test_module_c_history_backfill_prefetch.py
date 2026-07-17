@@ -4,14 +4,22 @@ import asyncio
 from datetime import UTC, datetime
 
 from app.engine.module_c_history_backfill import HistoricalBackfillWriter
+from trading_protocol import MODULE_C_CONFIG_HASH
 
 
 class _FakeConn:
     def __init__(self, rows):
         self._rows = rows
+        self.fetch_args = None
+        self.fetchval_args = None
 
-    async def fetch(self, *_args, **_kwargs):
+    async def fetch(self, _query, *args, **_kwargs):
+        self.fetch_args = args
         return self._rows
+
+    async def fetchval(self, _query, *args):
+        self.fetchval_args = args
+        return None
 
 
 class _AcquireCtx:
@@ -51,3 +59,19 @@ def test_prefetch_existing_cutoffs_maps_db_levels_back_to_level_names():
 
     assert payload["5f"] == {datetime(2025, 9, 18, 7, 0, tzinfo=UTC)}
     assert payload["30f"] == {datetime(2025, 9, 18, 7, 0, tzinfo=UTC)}
+    assert writer.pool._conn.fetch_args[-1] == MODULE_C_CONFIG_HASH
+
+
+def test_run_exists_does_not_treat_an_older_semantic_run_as_resumable():
+    writer = HistoricalBackfillWriter(_FakePool([]))
+
+    exists = asyncio.run(writer.run_exists(
+        symbol_id=1,
+        level="5f",
+        mode="predictive",
+        cutoff_time=datetime(2025, 9, 18, 7, 0, tzinfo=UTC),
+        run_group_id="research_daily_close",
+    ))
+
+    assert exists is False
+    assert writer.pool._conn.fetchval_args[-1] == MODULE_C_CONFIG_HASH
