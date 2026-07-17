@@ -235,6 +235,13 @@ class PostgresChanWriter:
     ) -> dict[str, int]:
         if full_recompute_task is not None and historical_replay_task is not None:
             raise ValueError("Only one fenced task type may publish a run")
+        if self.run_kind == "full_recompute" and full_recompute_task is None:
+            raise ValueError("A full-recompute writer requires a fenced task")
+        if full_recompute_task is not None and (
+            self.batch_id is None
+            or int(full_recompute_task.get("batch_id", -1)) != int(self.batch_id)
+        ):
+            raise ValueError("Full-recompute task batch does not match writer batch")
         assert self._pool is not None
         async with self._pool.acquire() as conn:
             symbol_id = await conn.fetchval(
@@ -305,41 +312,109 @@ class PostgresChanWriter:
 
             fenced_task = full_recompute_task or historical_replay_task
             run_id = None if fenced_task is not None else await insert_run(resumable=False)
+            locked_full_recompute_expected_heads: dict[str, Any] | None = None
             try:
                 async with conn.transaction():
                     if full_recompute_task is not None:
-                        fenced = await conn.fetchval(
+                        parent = await conn.fetchrow(
                             """
-                            with executable_batch as materialized (
-                                select batch.batch_id
-                                  from chan_c_full_recompute_batches batch
-                                  join chan_c_batches parent
-                                    on parent.id = batch.batch_id
-                                 where batch.batch_id = $1
-                                   and batch.status in ('pending', 'running')
-                                   and parent.status in ('planned', 'running')
-                                 for share of parent, batch
-                            )
-                            select 1
-                              from chan_c_full_recompute_tasks task
-                              join executable_batch batch
-                                on batch.batch_id = task.batch_id
-                             where task.batch_id = $1 and task.symbol_id = $2 and task.chan_level = $3
-                               and task.status = 'running' and task.claim_token = $4
-                               and task.lease_version = $5 and task.lease_until > now()
-                              for update of task
+                            select id, status, batch_kind, run_group_id, config_hash,
+                                   publication_namespace, profile_id
+                              from chan_c_batches
+                             where id = $1 and status = 'running'
+                              for share
                             """,
-                            full_recompute_task["batch_id"],
+                            self.batch_id,
+                        )
+                        if parent is None or parent["status"] != "running":
+                            raise StaleChanHeadError(
+                                f"Full-recompute parent batch status fence failed for batch_id={self.batch_id}"
+                            )
+                        parent_identity = {
+                            "id": int(parent["id"]),
+                            "run_group_id": parent["run_group_id"],
+                            "config_hash": parent["config_hash"],
+                            "publication_namespace": parent["publication_namespace"],
+                            "profile_id": parent["profile_id"],
+                        }
+                        expected_identity = {
+                            "id": int(self.batch_id),
+                            "run_group_id": self.run_group_id,
+                            "config_hash": self.run_config_hash,
+                            "publication_namespace": self.publication_namespace,
+                            "profile_id": self.profile_id,
+                        }
+                        if (
+                            parent["batch_kind"] not in {"canary", "baseline"}
+                            or parent_identity != expected_identity
+                        ):
+                            raise StaleChanHeadError("Full-recompute parent identity mismatch")
+
+                        child = await conn.fetchrow(
+                            """
+                            select batch_id, status, run_group_id, config_hash,
+                                   publication_namespace, profile_id
+                              from chan_c_full_recompute_batches
+                             where batch_id = $1 and status = 'running'
+                              for share
+                            """,
+                            self.batch_id,
+                        )
+                        if child is None or child["status"] != "running":
+                            raise StaleChanHeadError(
+                                f"Full-recompute child batch status fence failed for batch_id={self.batch_id}"
+                            )
+                        child_identity = {
+                            "batch_id": int(child["batch_id"]),
+                            "run_group_id": child["run_group_id"],
+                            "config_hash": child["config_hash"],
+                            "publication_namespace": child["publication_namespace"],
+                            "profile_id": child["profile_id"],
+                        }
+                        expected_child_identity = {
+                            "batch_id": int(self.batch_id),
+                            "run_group_id": self.run_group_id,
+                            "config_hash": self.run_config_hash,
+                            "publication_namespace": self.publication_namespace,
+                            "profile_id": self.profile_id,
+                        }
+                        if child_identity != expected_child_identity:
+                            raise StaleChanHeadError("Full-recompute child identity mismatch")
+
+                        locked_task = await conn.fetchrow(
+                            """
+                            select batch_id, symbol_id, chan_level, status, claim_token,
+                                   lease_version, target_bar_until, expected_heads
+                              from chan_c_full_recompute_tasks
+                             where batch_id = $1 and symbol_id = $2 and chan_level = $3
+                               and status = 'running' and claim_token = $4
+                               and lease_version = $5 and lease_until > now()
+                              for update
+                            """,
+                            self.batch_id,
                             symbol_id,
                             level_code,
                             full_recompute_task["claim_token"],
                             full_recompute_task["lease_version"],
                         )
-                        if fenced != 1:
+                        if locked_task is None:
                             raise StaleChanHeadError(
-                                f"Full-recompute task or batch status fence failed "
-                                f"for symbol_id={symbol_id} level={level_code}"
+                                f"Full-recompute task lease fence failed for symbol_id={symbol_id} level={level_code}"
                             )
+                        if (
+                            int(full_recompute_task.get("symbol_id", -1)) != int(symbol_id)
+                            or int(full_recompute_task.get("chan_level", -1)) != int(level_code)
+                        ):
+                            raise StaleChanHeadError("Full-recompute claimed task scope mismatch")
+                        if locked_task["target_bar_until"] != bar_until:
+                            raise StaleChanHeadError("Full-recompute task target_bar_until mismatch")
+                        locked_full_recompute_expected_heads = _read_extra(
+                            locked_task["expected_heads"]
+                        )
+                        if locked_full_recompute_expected_heads != _read_extra(
+                            full_recompute_task.get("expected_heads")
+                        ):
+                            raise StaleChanHeadError("Full-recompute task expected_heads mismatch")
                         run_id = await insert_run(resumable=True)
                     elif historical_replay_task is not None:
                         await lock_executable_replay_batch(
@@ -435,7 +510,7 @@ class PostgresChanWriter:
                             status="published",
                             last_error=None,
                             expected_heads=(
-                                _read_extra(full_recompute_task.get("expected_heads"))
+                                locked_full_recompute_expected_heads
                                 if full_recompute_task is not None
                                 else None
                             ),
