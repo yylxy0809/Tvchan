@@ -136,6 +136,9 @@ export type ModuleCExecutionProvenance = {
   catalog_revision_matches: boolean;
   eligibility_manifest_matches: boolean;
   config_hash_matches: boolean;
+  frozen_config_matches: boolean;
+  live_universe_matches: boolean;
+  catalog_manifest_matches: boolean;
   evidence_complete: boolean;
   drift_reasons: string[];
 };
@@ -150,6 +153,7 @@ export type ModuleCFreshnessActualWatermark = ModuleCFreshnessExpectedWatermark 
   actual_max: string | null;
   empty_scopes: number;
   stale_scopes: number;
+  future_scopes: number;
 };
 
 export type ModuleCExecutionFreshness = {

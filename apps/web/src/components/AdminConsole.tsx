@@ -606,6 +606,7 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
             <p>evidence complete: {formatBoolean(moduleCBatch?.provenance.evidence_complete)}</p>
             <p>manifest matches: {formatBoolean(moduleCBatch?.provenance.eligibility_manifest_matches)}</p>
             <p>config matches: {formatBoolean(moduleCBatch?.provenance.config_hash_matches)}</p>
+            <p>frozen config matches: {formatBoolean(moduleCBatch?.provenance.frozen_config_matches)}</p>
           </div>
           <div className="admin-feature-card">
             <h3>Freshness and catalog drift</h3>
@@ -618,6 +619,8 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
             <p>live revision: {moduleCBatch?.provenance.live_catalog_control_revision ?? "--"}</p>
             <p>catalog active: {formatBoolean(moduleCBatch?.provenance.catalog_is_active)}</p>
             <p>catalog revision matches: {formatBoolean(moduleCBatch?.provenance.catalog_revision_matches)}</p>
+            <p>live universe matches: {formatBoolean(moduleCBatch?.provenance.live_universe_matches)}</p>
+            <p>catalog manifest matches: {formatBoolean(moduleCBatch?.provenance.catalog_manifest_matches)}</p>
             <p>drift_reasons: {formatReasons(moduleCBatch?.provenance.drift_reasons)}</p>
             <p>catalog manifest: <HashValue value={moduleCBatch?.provenance.catalog_manifest_sha256} /></p>
             <p>active universe: <HashValue value={moduleCBatch?.provenance.audit_active_universe_sha256} /></p>
@@ -912,7 +915,7 @@ function WatermarkList({
           {"actual_min" in value ? (
             <>
               , actual {formatDate(value.actual_min)} to {formatDate(value.actual_max)}, empty{" "}
-              {value.empty_scopes}, stale {value.stale_scopes}
+              {value.empty_scopes}, stale {value.stale_scopes}, future {value.future_scopes}
             </>
           ) : null}
         </p>
