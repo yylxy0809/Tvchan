@@ -16,10 +16,38 @@ build bound to the batch.
 
 ## Canary
 
-Create a private selection JSON with `contract_version` set to
-`module-c-canary-selection-v1` and exactly 20 canonical symbol names. Its
-declared traits must cover `main_board`, `chinext`, `star`, `bj`,
-`suspended_or_sparse`, `gap`, `price_limit` and `long_history`.
+Generate the private selection JSON from the explicit strict-v2 eligibility
+build. The selector is read-only and binds its output to that build's canonical
+audit, authoritative freshness contract and scope catalog provenance:
+
+```powershell
+python -m collector.worker module-c-canary-selection `
+  --database-url $env:DATABASE_URL `
+  --source-build-id $fullEligibilityBuild `
+  --output $selectionJson
+```
+
+`module-c-canary-selection-v2` fixes exactly five symbols from each of main
+board, ChiNext, STAR and Beijing Exchange. Within each board it selects two
+lower-boundary, one median and two upper-boundary samples using the pinned
+audit's `5f rows / (1d rows * 49)` activity-coverage ratio; 49 includes the
+canonical 09:30 opening snapshot. This ratio is an
+auditable sparse/dense coverage proxy, not a claim about traded-value
+liquidity. Missing candidates, incomplete five-level evidence or provenance
+drift fail closed. Stable ratio, `symbol_id`, and canonical-symbol ordering plus
+canonical JSON hashing make repeated selection byte-reproducible.
+
+V2 deliberately does not promote the legacy v1 free-text `gap`, `price_limit`,
+`suspended_or_sparse`, or history traits to authoritative evidence. The frozen
+strict-v2 inputs do not contain machine-verifiable gap/limit events, and
+accepting arbitrary text would defeat deterministic reproduction. Those
+scenario checks remain separate regression evidence until a future append-only
+trait artifact binds them to the same audit/checkpoint/freshness/catalog hashes;
+the v2 manifest does not claim that coverage. This supersedes v1's untyped
+trait gate for newly planned canaries.
+
+Legacy `module-c-canary-selection-v1` manifests remain readable for historical
+audit compatibility. Use v2 for every newly planned production canary.
 
 ```powershell
 python -m collector.worker module-c-batch-control freeze-canary `

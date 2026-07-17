@@ -34,6 +34,7 @@ LEVEL_NAMES = tuple(CODE_TO_TIMEFRAME[level] for level in LEVELS)
 REQUIRED_CANARY_TRAITS = frozenset(
     {"main_board", "chinext", "star", "bj", "suspended_or_sparse", "gap", "price_limit", "long_history"}
 )
+PRODUCTION_CANARY_SELECTION_VERSION = "module-c-canary-selection-v2"
 STRICT_V2_PROVENANCE_FIELDS = (
     "canonical_audit_run_id",
     "audit_evidence_sha256",
@@ -140,7 +141,15 @@ def _strict_v2_provenance(
 def load_selection(path: Path) -> tuple[tuple[str, ...], str, dict[str, Any]]:
     raw = path.read_bytes()
     payload = json.loads(raw.decode("utf-8"))
-    if payload.get("contract_version") != "module-c-canary-selection-v1":
+    contract_version = payload.get("contract_version")
+    if contract_version == "module-c-canary-selection-v2":
+        from collector.module_c_canary_selection import validate_selection_manifest
+
+        payload = validate_selection_manifest(payload)
+        entries = payload["symbols"]
+        names = tuple(str(entry["symbol"]).strip().upper() for entry in entries)
+        return names, str(payload["selection_sha256"]), payload
+    if contract_version != "module-c-canary-selection-v1":
         raise ValueError("Unsupported canary selection contract_version")
     entries = payload.get("symbols")
     if not isinstance(entries, list) or len(entries) != 20:
@@ -177,6 +186,20 @@ def load_selection(path: Path) -> tuple[tuple[str, ...], str, dict[str, Any]]:
         if not any(entry.get("evidence") for entry in by_trait[trait]):
             raise ValueError(f"Canary selection trait {trait} requires auditable evidence")
     return names, hashlib.sha256(raw).hexdigest(), payload
+
+
+def validate_production_canary_selection(
+    *, parameters: Mapping[str, Any], active_symbols: int
+) -> None:
+    if (
+        active_symbols != 20
+        or parameters.get("scope") != "canary"
+        or parameters.get("selection_contract_version")
+        != PRODUCTION_CANARY_SELECTION_VERSION
+    ):
+        raise RuntimeError(
+            "Canary batches require a frozen deterministic selection-v2 eligibility build"
+        )
 
 
 async def validate_strict_build(
@@ -412,10 +435,13 @@ def validate_canary_run_set(
 
 async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> dict[str, Any]:
     symbols, selection_sha, selection = load_selection(args.selection_manifest)
+    if selection["contract_version"] != PRODUCTION_CANARY_SELECTION_VERSION:
+        raise RuntimeError("New canary freezes require module-c-canary-selection-v2")
     async with conn.transaction(isolation="serializable"):
         source = await conn.fetchrow(
             """
-            select build_id::text, config_hash, active_symbols, disposition_rows,
+            select build_id::text, config_hash, active_universe_hash, manifest_hash,
+                   active_symbols, disposition_rows,
                    parameters, summary, canonical_audit_run_id::text,
                    audit_evidence_sha256, audit_checkpoint_sha256,
                    freshness_contract_version, freshness_contract_sha256,
@@ -434,6 +460,31 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         await validate_strict_build(
             conn, source, build_id=args.source_build_id, require_v2=True
         )
+        if selection["contract_version"] == "module-c-canary-selection-v2":
+            from collector.module_c_canary_selection import (
+                rebuild_selection_manifest,
+                validate_selection_source,
+            )
+
+            await revalidate_strict_v2_build(
+                conn, source, build_id=args.source_build_id
+            )
+            if str(source["active_universe_hash"]) != str(
+                source["audit_active_universe_sha256"]
+            ):
+                raise RuntimeError(
+                    "Source eligibility active universe is not audit-bound"
+                )
+            validate_selection_source(
+                selection, source, build_id=args.source_build_id
+            )
+            reproduced = await rebuild_selection_manifest(
+                conn, source_build_id=args.source_build_id, build=source
+            )
+            if selection != reproduced:
+                raise RuntimeError(
+                    "selection-v2 manifest is not the deterministic source selection"
+                )
         source_provenance, copied_parameters = _strict_v2_provenance(source)
         source_rows = int(await conn.fetchval(
             "select count(*) from module_c_eligibility where build_id=$1::uuid",
@@ -642,8 +693,10 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         parameters = _json_object(build["parameters"])
         approved_canary = None
         if args.batch_kind == "canary":
-            if int(build["active_symbols"]) != 20 or parameters.get("scope") != "canary":
-                raise RuntimeError("Canary batches require a frozen 20-symbol canary eligibility build")
+            validate_production_canary_selection(
+                parameters=parameters,
+                active_symbols=int(build["active_symbols"]),
+            )
         else:
             if parameters.get("scope") == "canary":
                 raise RuntimeError("A baseline batch cannot use a canary eligibility build")
@@ -664,12 +717,19 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
                 """,
                 args.approved_canary_batch_id,
             )
-            source_id = _json_object(approved_canary["parameters"]).get("source_build_id") if approved_canary else None
+            approved_parameters = (
+                _json_object(approved_canary["parameters"])
+                if approved_canary
+                else {}
+            )
+            source_id = approved_parameters.get("source_build_id")
             if (
                 approved_canary is None
                 or approved_canary["status"] != "sealed"
                 or approved_canary["child_status"] != "completed"
                 or source_id != args.eligibility_build_id
+                or approved_parameters.get("selection_contract_version")
+                != PRODUCTION_CANARY_SELECTION_VERSION
             ):
                 raise RuntimeError("Approved canary is not sealed against this baseline eligibility build")
             for field in ("code_commit", "image_digest", "vendor_manifest_sha256", "config_hash"):
