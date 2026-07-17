@@ -64,6 +64,24 @@ def test_selection_requires_exactly_twenty_unique_symbols_and_trait_coverage(tmp
         load_selection(path)
 
 
+def test_prepare_cli_requires_explicit_positive_max_attempts() -> None:
+    base = [
+        "prepare",
+        "--database-url", "postgresql://disposable",
+        "--batch-key", "canary-20260718",
+        "--eligibility-build-id", "33333333-3333-3333-3333-333333333333",
+        "--run-group-id", "group-1",
+        "--code-commit", "commit",
+        "--image-digest", "image",
+        "--vendor-manifest-sha256", "a" * 64,
+    ]
+    with pytest.raises(SystemExit):
+        batch_control.parse_args(base)
+    with pytest.raises(SystemExit):
+        batch_control.parse_args([*base, "--max-attempts", "0"])
+    assert batch_control.parse_args([*base, "--max-attempts", "3"]).max_attempts == 3
+
+
 def test_selection_rejects_missing_diversity_trait(tmp_path) -> None:
     payload = _selection()
     payload["symbols"][3]["traits"].remove("bj")
@@ -629,6 +647,7 @@ class _ActivateConnection:
                 "concurrency_per_worker": 1,
                 "shard_count": 4,
                 "eligibility_build_id": "33333333-3333-3333-3333-333333333333",
+                "max_attempts": 3,
             },
             "parent_run_group_id": "group-1",
             "parent_publication_namespace": "production",
@@ -685,6 +704,18 @@ def _stub_activation_validations(monkeypatch) -> None:
 def test_activation_identity_rejects_parent_child_manifest_drift(field, value) -> None:
     connection = _ActivateConnection()
     connection.row[field] = value
+
+    with pytest.raises(RuntimeError, match="batch identity"):
+        validate_activation_identity(connection.row)
+
+
+@pytest.mark.parametrize("max_attempts", [None, 0, -1, True, "3"])
+def test_activation_identity_requires_exact_frozen_max_attempts(max_attempts) -> None:
+    connection = _ActivateConnection()
+    if max_attempts is None:
+        connection.row["effective_config"].pop("max_attempts")
+    else:
+        connection.row["effective_config"]["max_attempts"] = max_attempts
 
     with pytest.raises(RuntimeError, match="batch identity"):
         validate_activation_identity(connection.row)

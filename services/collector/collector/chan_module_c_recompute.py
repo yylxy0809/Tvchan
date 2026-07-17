@@ -124,6 +124,8 @@ async def main() -> None:
         raise ValueError("--prepare-native-bars is forbidden for a production Module C batch")
     if not args.dry_run and args.concurrency != 1:
         raise ValueError("A durable B4 worker must use --concurrency=1; scale with static shards")
+    if not args.dry_run and args.max_attempts < 1:
+        raise ValueError("--max-attempts must be positive for a durable B4 worker")
     if not args.dry_run and set(modes) != {"confirmed", "predictive"}:
         raise ValueError("A production Module C batch must publish confirmed and predictive modes")
     run_group_id = args.run_group_id or f"dry-run-{uuid.uuid4()}"
@@ -162,7 +164,7 @@ async def main() -> None:
             return
 
         worker_id = args.worker_id or f"module-c-b4-s{shard_index}-{uuid.uuid4().hex[:12]}"
-        await ensure_recompute_batch(
+        durable_max_attempts = await ensure_recompute_batch(
             kline_writer=kline_writer,
             batch_id=args.batch_id,
             eligibility_build_id=args.eligibility_build_id,
@@ -172,6 +174,7 @@ async def main() -> None:
             profile_id=args.profile_id,
             shard_count=shard_count,
             levels=levels,
+            max_attempts=args.max_attempts,
         )
         emit(
             "chan_module_c_pass_started",
@@ -211,7 +214,7 @@ async def main() -> None:
                 shard_index=shard_index,
                 shard_count=shard_count,
                 lease_seconds=max(30, args.lease_seconds),
-                max_attempts=max(1, args.max_attempts),
+                max_attempts=durable_max_attempts,
                 sleep=max(0.0, args.sleep),
                 chan_py_path=args.chan_py_path,
             )
@@ -352,12 +355,13 @@ async def ensure_recompute_batch(
     profile_id: str,
     shard_count: int,
     levels: list[str],
-) -> None:
+    max_attempts: int,
+) -> int:
     """Create one immutable batch manifest and its level-specific tasks."""
     assert kline_writer._pool is not None
     async with kline_writer._pool.acquire() as conn:
         async with conn.transaction():
-            await ensure_recompute_batch_on_connection(
+            return await ensure_recompute_batch_on_connection(
                 conn=conn,
                 batch_id=batch_id,
                 eligibility_build_id=eligibility_build_id,
@@ -367,6 +371,7 @@ async def ensure_recompute_batch(
                 profile_id=profile_id,
                 shard_count=shard_count,
                 levels=levels,
+                max_attempts=max_attempts,
                 allow_create=False,
             )
 
@@ -382,15 +387,17 @@ async def ensure_recompute_batch_on_connection(
     profile_id: str,
     shard_count: int,
     levels: list[str],
+    max_attempts: int,
     allow_create: bool,
-) -> None:
+) -> int:
     """Create a recompute child and tasks inside the caller's transaction."""
     level_codes = [timeframe_to_db_code(level) for level in levels]
     parent = await conn.fetchrow(
         """
         select parent.status, parent.batch_kind, parent.run_group_id,
                parent.config_hash, parent.publication_namespace, parent.profile_id,
-               parent.eligible_manifest_sha256, build.manifest_hash
+               parent.eligible_manifest_sha256, parent.effective_config,
+               build.manifest_hash
           from chan_c_batches parent
           join module_c_eligibility_builds build on build.build_id=$2::uuid
          where parent.id=$1
@@ -415,7 +422,27 @@ async def ensure_recompute_batch_on_connection(
         "eligible_manifest_sha256": parent["manifest_hash"],
     }
     actual_parent = {key: parent[key] for key in expected_parent}
-    if parent["batch_kind"] not in {"canary", "baseline"} or actual_parent != expected_parent:
+    effective_config = parent["effective_config"]
+    if isinstance(effective_config, str):
+        effective_config = json.loads(effective_config)
+    expected_effective_config = {
+        "contract": "module-c-native-five-level-v1",
+        "levels": list(levels),
+        "modes": ["confirmed", "predictive"],
+        "concurrency_per_worker": 1,
+        "shard_count": shard_count,
+        "eligibility_build_id": str(eligibility_build_id),
+        "max_attempts": max_attempts,
+    }
+    if (
+        parent["batch_kind"] not in {"canary", "baseline"}
+        or actual_parent != expected_parent
+        or not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or max_attempts < 1
+        or not isinstance(effective_config, Mapping)
+        or dict(effective_config) != expected_effective_config
+    ):
         raise RuntimeError(f"Parent batch {batch_id} identity mismatch: {actual_parent!r}")
 
     batch = await conn.fetchrow(
@@ -530,6 +557,7 @@ async def ensure_recompute_batch_on_connection(
             f"Batch {batch_id} task manifest is incomplete: "
             f"tasks={task_count} expected={disposition_rows}"
         )
+    return int(effective_config["max_attempts"])
 
 
 async def claim_recompute_task(
@@ -547,13 +575,17 @@ async def claim_recompute_task(
         row = await conn.fetchrow(
             """
             with executable_parent as materialized (
-                select parent.id
+                select parent.id,
+                       (parent.effective_config->>'max_attempts')::integer max_attempts
                   from chan_c_batches parent
                  where parent.id = $1
                    and parent.status = 'running'
+                   and jsonb_typeof(parent.effective_config->'max_attempts') = 'number'
+                   and (parent.effective_config->>'max_attempts')::integer > 0
+                   and (parent.effective_config->>'max_attempts')::integer = $6
                  for share of parent
             ), executable_batch as materialized (
-                select batch.batch_id
+                select batch.batch_id, parent.max_attempts
                   from chan_c_full_recompute_batches batch
                   join executable_parent parent
                     on parent.id = batch.batch_id
@@ -567,7 +599,7 @@ async def claim_recompute_task(
                     on batch.batch_id = task.batch_id
                  where task.batch_id = $1
                    and task.eligible
-                   and task.attempts < $6
+                   and task.attempts < batch.max_attempts
                    and mod(task.shard_bucket::integer, $5) = $4
                    and (
                         task.status in ('pending', 'failed')
@@ -750,13 +782,16 @@ async def process_claimed_tasks(
         await conn.execute(
             """
             with executable_parent as materialized (
-                select parent.id
+                select parent.id,
+                       (parent.effective_config->>'max_attempts')::integer max_attempts
                   from chan_c_batches parent
                  where parent.id = $1
                    and parent.status = 'running'
+                   and jsonb_typeof(parent.effective_config->'max_attempts') = 'number'
+                   and (parent.effective_config->>'max_attempts')::integer > 0
                  for share of parent
             ), executable_batch as materialized (
-                select batch.batch_id
+                select batch.batch_id, parent.max_attempts
                   from chan_c_full_recompute_batches batch
                   join executable_parent parent on parent.id = batch.batch_id
                  where batch.batch_id = $1
@@ -768,7 +803,8 @@ async def process_claimed_tasks(
                        when exists (
                            select 1 from chan_c_full_recompute_tasks task
                             where task.batch_id = batch.batch_id
-                              and task.status = 'failed' and task.attempts >= $2
+                              and task.status = 'failed'
+                              and task.attempts >= executable.max_attempts
                        ) then 'failed'
                        else 'completed'
                    end,
@@ -781,12 +817,12 @@ async def process_claimed_tasks(
                     where task.batch_id = batch.batch_id
                       and (
                           task.status in ('pending', 'running')
-                          or (task.status = 'failed' and task.attempts < $2)
+                          or (task.status = 'failed'
+                              and task.attempts < executable.max_attempts)
                       )
                )
             """,
             batch_id,
-            max_attempts,
         )
         failed = await conn.fetchval(
             """

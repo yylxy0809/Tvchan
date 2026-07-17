@@ -328,6 +328,7 @@ async def validate_pristine_task_manifest(
 
 def validate_activation_identity(batch: Mapping[str, Any]) -> None:
     effective_config = _json_object(batch["effective_config"])
+    max_attempts = effective_config.get("max_attempts")
     expected_config = {
         "contract": "module-c-native-five-level-v1",
         "levels": list(LEVEL_NAMES),
@@ -335,9 +336,13 @@ def validate_activation_identity(batch: Mapping[str, Any]) -> None:
         "concurrency_per_worker": 1,
         "shard_count": int(batch["child_shard_count"]),
         "eligibility_build_id": str(batch["build_id"]),
+        "max_attempts": max_attempts,
     }
     if (
         batch["batch_kind"] not in {"canary", "baseline"}
+        or not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or max_attempts < 1
         or effective_config != expected_config
         or str(batch["parent_config_hash"]) != str(batch["config_hash"])
         or str(batch["parent_manifest_hash"]) != str(batch["manifest_hash"])
@@ -684,6 +689,7 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
                 "modes": ["confirmed", "predictive"],
                 "concurrency_per_worker": 1,
                 "shard_count": args.shard_count,
+                "max_attempts": args.max_attempts,
             }
             if any(canary_config.get(key) != value for key, value in expected_contract.items()):
                 raise RuntimeError("Approved canary effective config does not match")
@@ -714,6 +720,7 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
             "concurrency_per_worker": 1,
             "shard_count": args.shard_count,
             "eligibility_build_id": args.eligibility_build_id,
+            "max_attempts": args.max_attempts,
         }
         inserted_id = await conn.fetchval(
             """
@@ -763,6 +770,7 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
             profile_id=args.profile_id,
             shard_count=args.shard_count,
             levels=list(LEVEL_NAMES),
+            max_attempts=args.max_attempts,
             allow_create=True,
         )
     return {"batch_id": batch_id, "status": "planned", "created": inserted_id is not None}
@@ -1007,6 +1015,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--publication-namespace", default="production")
     parser.add_argument("--profile-id", default="module-c-native-5lvl")
     parser.add_argument("--shard-count", type=int, default=4)
+    parser.add_argument("--max-attempts", type=int)
     parser.add_argument("--approved-canary-batch-id", type=int)
     parser.add_argument("--notes")
     parser.add_argument("--sealed-by", default=os.getenv("USERNAME") or "module-c-batch-control")
@@ -1019,6 +1028,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "prepare": (
             "batch_key", "eligibility_build_id", "run_group_id", "code_commit",
             "image_digest", "vendor_manifest_sha256",
+            "max_attempts",
         ),
         "activate": ("batch_id",),
         "status": ("batch_id",),
@@ -1029,6 +1039,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(args.action + " requires " + ", ".join(f"--{name.replace('_','-')}" for name in missing))
     if args.shard_count < 1:
         parser.error("--shard-count must be positive")
+    if args.max_attempts is not None and args.max_attempts < 1:
+        parser.error("--max-attempts must be positive")
     if args.vendor_manifest_sha256 and (
         len(args.vendor_manifest_sha256) != 64
         or any(char not in "0123456789abcdef" for char in args.vendor_manifest_sha256)
