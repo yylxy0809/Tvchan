@@ -9,14 +9,15 @@ from time import perf_counter
 from app.backtest.metrics import compute_metrics
 from app.backtest.report_writer import write_report
 from app.backtest.replay_engine import ReplayEngine
+from app.config.strategy_execution import (
+    require_diagnostic_strategy as require_diagnostic_backtest_strategy,
+)
 from app.config.strategy_params import (
     DIAG_SAME_BAR_B1_B2S_STRATEGY_CODE,
     DIAG_TRUST_B2_OR_B2S_STRATEGY_CODE,
     DIAG_TRUST_B2_STRATEGY_CODE,
     SANITY_LOOSE_STRATEGY_CODE,
-    STRATEGY_CODE,
     STRICT_EXPLICIT_B1_STRATEGY_CODE,
-    StrategyParams,
 )
 from app.db import create_pool
 from app.domain.enums import BacktestMode, MarketCapPolicy
@@ -27,28 +28,6 @@ from app.engine.strategy_runner import StrategyRunner
 from app.repositories.kline_repo import KlineRepository
 from app.repositories.module_c_repo import ModuleCRepository
 from app.repositories.strategy_repo import StrategyRepository
-
-
-DIAGNOSTIC_BACKTEST_STRATEGY_CODES = frozenset(
-    {
-        STRICT_EXPLICIT_B1_STRATEGY_CODE,
-        DIAG_TRUST_B2_STRATEGY_CODE,
-        DIAG_TRUST_B2_OR_B2S_STRATEGY_CODE,
-        DIAG_SAME_BAR_B1_B2S_STRATEGY_CODE,
-        SANITY_LOOSE_STRATEGY_CODE,
-    }
-)
-
-
-def require_diagnostic_backtest_strategy(strategy_code: str) -> StrategyParams:
-    if strategy_code == STRATEGY_CODE:
-        raise ValueError(
-            "official strategy execution is unavailable in the generic backtest runner; "
-            "the current official decision remains NO_GO"
-        )
-    if strategy_code not in DIAGNOSTIC_BACKTEST_STRATEGY_CODES:
-        raise ValueError(f"unsupported diagnostic backtest strategy: {strategy_code}")
-    return StrategyParams.from_strategy_code(strategy_code)
 
 
 def _strategy_meta(strategy_code: str) -> tuple[str, str]:

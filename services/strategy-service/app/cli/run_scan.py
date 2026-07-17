@@ -6,13 +6,13 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from app.config.strategy_execution import require_diagnostic_strategy
 from app.config.strategy_params import (
     DIAG_SAME_BAR_B1_B2S_STRATEGY_CODE,
     DIAG_TRUST_B2_OR_B2S_STRATEGY_CODE,
     DIAG_TRUST_B2_STRATEGY_CODE,
     SANITY_LOOSE_STRATEGY_CODE,
     STRICT_EXPLICIT_B1_STRATEGY_CODE,
-    StrategyParams,
 )
 from app.db import create_pool
 from app.domain.enums import MarketCapPolicy
@@ -47,12 +47,12 @@ def _strategy_meta(strategy_code: str) -> tuple[str, str]:
 
 
 async def _run(args) -> int:
+    params = require_diagnostic_strategy(args.strategy)
     pool = await create_pool()
     try:
         module_c_repo = ModuleCRepository(pool)
         kline_repo = KlineRepository(pool)
         strategy_repo = StrategyRepository(pool)
-        params = StrategyParams.from_strategy_code(args.strategy)
         if args.market_cap_policy:
             params = params.with_overrides(market_cap_policy=args.market_cap_policy)
         strategy_name, description = _strategy_meta(params.strategy_code)
