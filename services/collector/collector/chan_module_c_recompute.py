@@ -27,6 +27,12 @@ from trading_protocol import Bar, MODULE_C_CONFIG_HASH
 
 DEFAULT_MODULE_C_CHAN_LEVELS = "5f,30f,1d,1w,1m"
 CN_TZ = ZoneInfo("Asia/Shanghai")
+EXECUTABLE_PARENT_BATCH_STATUSES = frozenset({"planned", "running"})
+EXECUTABLE_RECOMPUTE_BATCH_STATUSES = frozenset({"pending", "running"})
+
+
+class InactiveRecomputeBatchError(RuntimeError):
+    """The durable recompute batch is no longer allowed to execute."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -346,6 +352,34 @@ async def ensure_recompute_batch(
     level_codes = [timeframe_to_db_code(level) for level in levels]
     async with kline_writer._pool.acquire() as conn:
         async with conn.transaction():
+            parent = await conn.fetchrow(
+                "select status from chan_c_batches where id = $1 for update",
+                batch_id,
+            )
+            if parent is None:
+                raise InactiveRecomputeBatchError(f"Unknown parent batch: {batch_id}")
+            parent_status = str(parent["status"])
+            if parent_status not in EXECUTABLE_PARENT_BATCH_STATUSES:
+                raise InactiveRecomputeBatchError(
+                    f"Parent batch {batch_id} is not executable: {parent_status}"
+                )
+
+            batch = await conn.fetchrow(
+                """
+                select eligibility_build_id::text as eligibility_build_id,
+                       run_group_id, config_hash, publication_namespace,
+                       profile_id, shard_count, status
+                  from chan_c_full_recompute_batches
+                 where batch_id = $1
+                 for update
+                """,
+                batch_id,
+            )
+            if batch is not None and str(batch["status"]) not in EXECUTABLE_RECOMPUTE_BATCH_STATUSES:
+                raise InactiveRecomputeBatchError(
+                    f"Full-recompute batch {batch_id} is not executable: {batch['status']}"
+                )
+
             await conn.execute(
                 """
                 insert into chan_c_full_recompute_batches (
@@ -372,19 +406,24 @@ async def ensure_recompute_batch(
                 shard_count,
                 level_codes,
             )
-            batch = await conn.fetchrow(
-                """
-                select eligibility_build_id::text as eligibility_build_id,
-                       run_group_id, config_hash, publication_namespace,
-                       profile_id, shard_count
-                  from chan_c_full_recompute_batches
-                 where batch_id = $1
-                 for update
-                """,
-                batch_id,
-            )
+            if batch is None:
+                batch = await conn.fetchrow(
+                    """
+                    select eligibility_build_id::text as eligibility_build_id,
+                           run_group_id, config_hash, publication_namespace,
+                           profile_id, shard_count, status
+                      from chan_c_full_recompute_batches
+                     where batch_id = $1
+                     for update
+                    """,
+                    batch_id,
+                )
             if batch is None:
                 raise RuntimeError(f"Unknown eligibility build: {eligibility_build_id}")
+            if str(batch["status"]) not in EXECUTABLE_RECOMPUTE_BATCH_STATUSES:
+                raise InactiveRecomputeBatchError(
+                    f"Full-recompute batch {batch_id} is not executable: {batch['status']}"
+                )
             expected = {
                 "eligibility_build_id": str(eligibility_build_id),
                 "run_group_id": run_group_id,
@@ -455,19 +494,30 @@ async def claim_recompute_task(
     async with kline_writer._pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            with candidate as (
-                select batch_id, symbol_id, chan_level
-                  from chan_c_full_recompute_tasks
-                 where batch_id = $1
-                   and eligible
-                   and attempts < $6
-                   and mod(shard_bucket::integer, $5) = $4
+            with executable_batch as materialized (
+                select batch.batch_id
+                  from chan_c_full_recompute_batches batch
+                  join chan_c_batches parent
+                    on parent.id = batch.batch_id
+                 where batch.batch_id = $1
+                   and batch.status in ('pending', 'running')
+                   and parent.status in ('planned', 'running')
+                 for share of batch, parent
+            ), candidate as (
+                select task.batch_id, task.symbol_id, task.chan_level
+                  from chan_c_full_recompute_tasks task
+                  join executable_batch batch
+                    on batch.batch_id = task.batch_id
+                 where task.batch_id = $1
+                   and task.eligible
+                   and task.attempts < $6
+                   and mod(task.shard_bucket::integer, $5) = $4
                    and (
-                       status in ('pending', 'failed')
-                       or (status = 'running' and lease_until <= now())
+                        task.status in ('pending', 'failed')
+                        or (task.status = 'running' and task.lease_until <= now())
                    )
-                 order by attempts, symbol_id, chan_level
-                 for update skip locked
+                 order by task.attempts, task.symbol_id, task.chan_level
+                 for update of task skip locked
                  limit 1
             )
             update chan_c_full_recompute_tasks task
@@ -499,10 +549,17 @@ async def claim_recompute_task(
         if row is not None:
             await conn.execute(
                 """
+                with executable_parent as materialized (
+                    select id
+                      from chan_c_batches
+                     where id = $1 and status in ('planned', 'running')
+                     for share
+                )
                 update chan_c_full_recompute_batches
                    set status = 'running', started_at = coalesce(started_at, now()),
                        finished_at = null, updated_at = now()
-                 where batch_id = $1 and status <> 'running'
+                  from executable_parent
+                 where batch_id = executable_parent.id and status = 'pending'
                 """,
                 batch_id,
             )
@@ -618,6 +675,12 @@ async def process_claimed_tasks(
     async with kline_writer._pool.acquire() as conn:
         await conn.execute(
             """
+            with executable_parent as materialized (
+                select id
+                  from chan_c_batches
+                 where id = $1 and status in ('planned', 'running')
+                 for share
+            )
             update chan_c_full_recompute_batches batch
                set status = case
                        when exists (
@@ -627,7 +690,9 @@ async def process_claimed_tasks(
                        else 'completed'
                    end,
                    finished_at = now(), updated_at = now()
-             where batch.batch_id = $1
+              from executable_parent
+             where batch.batch_id = executable_parent.id
+               and batch.status in ('pending', 'running')
                and not exists (
                    select 1 from chan_c_full_recompute_tasks task
                     where task.batch_id = batch.batch_id

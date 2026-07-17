@@ -7,10 +7,14 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from collector.chan_module_c_recompute import (
+    InactiveRecomputeBatchError,
     MODULE_C_CONFIG_HASH,
     aggregate_from_5f,
     claim_recompute_task,
+    ensure_recompute_batch,
     filter_completed_symbols,
     is_module_c_complete,
     parse_args,
@@ -99,6 +103,14 @@ class _FakeAcquire:
 
     async def __aenter__(self):
         return self.conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+
+class _FakeTransaction:
+    async def __aenter__(self):
+        return self
 
     async def __aexit__(self, exc_type, exc, tb):
         return None
@@ -241,9 +253,108 @@ def test_full_recompute_claim_is_sharded_leased_and_attempt_bounded() -> None:
 
     assert result == row
     query, args = pool.conn.calls[0]
-    assert "for update skip locked" in query.lower()
+    assert "for share of batch, parent" in query.lower()
+    assert "for update of task skip locked" in query.lower()
+    assert "from chan_c_full_recompute_batches batch" in query.lower()
+    assert "join chan_c_batches parent" in query.lower()
+    assert "batch.status in ('pending', 'running')" in query.lower()
+    assert "parent.status in ('planned', 'running')" in query.lower()
     assert "lease_version = task.lease_version + 1" in query
     assert args == (11, "worker-2", 900, 2, 4, 3)
+    activation_query, activation_args = pool.conn.calls[1]
+    assert "status in ('planned', 'running')" in activation_query.lower()
+    assert "status = 'pending'" in activation_query.lower()
+    assert activation_args == (11,)
+
+
+@pytest.mark.parametrize("status", ["sealed", "failed", "aborted"])
+def test_batch_init_rejects_inactive_parent_before_writes(status: str) -> None:
+    class Conn:
+        def __init__(self) -> None:
+            self.execute_calls = []
+
+        def transaction(self):
+            return _FakeTransaction()
+
+        async def fetchrow(self, query, *_args):
+            assert "from chan_c_batches" in query.lower()
+            return {"status": status}
+
+        async def execute(self, query, *args):
+            self.execute_calls.append((query, args))
+            return "OK"
+
+    conn = Conn()
+    writer = SimpleNamespace(_pool=SimpleNamespace(acquire=lambda: _FakeAcquire(conn)))
+
+    with pytest.raises(InactiveRecomputeBatchError, match=status):
+        asyncio.run(
+            ensure_recompute_batch(
+                kline_writer=writer,
+                batch_id=11,
+                eligibility_build_id="00000000-0000-0000-0000-000000000001",
+                run_group_id="batch-11",
+                config_hash=MODULE_C_CONFIG_HASH,
+                publication_namespace="canonical",
+                profile_id="module-c-v4",
+                shard_count=4,
+                levels=["5f", "30f", "1d", "1w", "1m"],
+            )
+        )
+
+    assert conn.execute_calls == []
+
+
+@pytest.mark.parametrize("status", ["completed", "stopped", "failed"])
+def test_batch_init_rejects_terminal_recompute_batch_before_writes(status: str) -> None:
+    expected_batch = {
+        "eligibility_build_id": "00000000-0000-0000-0000-000000000001",
+        "run_group_id": "batch-11",
+        "config_hash": MODULE_C_CONFIG_HASH,
+        "publication_namespace": "canonical",
+        "profile_id": "module-c-v4",
+        "shard_count": 4,
+        "status": status,
+    }
+
+    class Conn:
+        def __init__(self) -> None:
+            self.fetchrow_calls = 0
+            self.execute_calls = []
+
+        def transaction(self):
+            return _FakeTransaction()
+
+        async def fetchrow(self, query, *_args):
+            self.fetchrow_calls += 1
+            if "from chan_c_batches" in query.lower():
+                return {"status": "running"}
+            assert "from chan_c_full_recompute_batches" in query.lower()
+            return expected_batch
+
+        async def execute(self, query, *args):
+            self.execute_calls.append((query, args))
+            return "OK"
+
+    conn = Conn()
+    writer = SimpleNamespace(_pool=SimpleNamespace(acquire=lambda: _FakeAcquire(conn)))
+
+    with pytest.raises(InactiveRecomputeBatchError, match=status):
+        asyncio.run(
+            ensure_recompute_batch(
+                kline_writer=writer,
+                batch_id=11,
+                eligibility_build_id=expected_batch["eligibility_build_id"],
+                run_group_id="batch-11",
+                config_hash=MODULE_C_CONFIG_HASH,
+                publication_namespace="canonical",
+                profile_id="module-c-v4",
+                shard_count=4,
+                levels=["5f", "30f", "1d", "1w", "1m"],
+            )
+        )
+
+    assert conn.execute_calls == []
 
 
 def test_batch_init_casts_config_hash_for_asyncpg() -> None:
