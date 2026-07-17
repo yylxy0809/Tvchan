@@ -618,6 +618,8 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
     )
     expected_complete = freshness_contract_matches and all(expected_values.values())
     audit_completed = batch.get("audit_status") == "completed" and batch.get("audit_apply_mode") is False
+    raw_audit_gate_pass = _json_object(batch.get("audit_summary")).get("gate_pass")
+    audit_gate_pass = raw_audit_gate_pass if isinstance(raw_audit_gate_pass, bool) else None
     strict_provenance, strict_parameters_match = _typed_strict_provenance(batch)
     checkpoint_rows = (
         await conn.fetch(CHECKPOINT_EVIDENCE_SQL, batch.get("canonical_audit_run_id"))
@@ -748,6 +750,8 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
     drift_reasons: list[str] = []
     if not audit_completed:
         drift_reasons.append("canonical_audit_not_completed")
+    if audit_gate_pass is not True:
+        drift_reasons.append("canonical_audit_gate_failed")
     if batch.get("catalog_generation_status") != "complete":
         drift_reasons.append("catalog_generation_not_complete")
     if not catalog_is_active:
@@ -789,6 +793,7 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
         and catalog_manifest_matches
         and frozen_config_matches
         and audit_completed
+        and audit_gate_pass is True
         and batch.get("catalog_generation_status") == "complete"
         and catalog_is_active
         and catalog_revision_matches
@@ -861,6 +866,7 @@ async def get_module_c_execution_status(conn, *, batch_id: int | None) -> dict[s
             "audit_checkpoint_sha256": batch.get("audit_checkpoint_sha256"),
             "audit_status": batch.get("audit_status"),
             "audit_apply_mode": batch.get("audit_apply_mode"),
+            "audit_gate_pass": audit_gate_pass,
             "freshness_contract_version": batch.get("freshness_contract_version"),
             "freshness_contract_sha256": batch.get("freshness_contract_sha256"),
             "catalog_generation_id": batch.get("catalog_generation_id"),

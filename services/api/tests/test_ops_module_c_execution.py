@@ -381,6 +381,7 @@ def test_repository_returns_structured_bound_provenance_in_one_readonly_snapshot
     assert provenance["eligibility_manifest_matches"] is True
     assert provenance["config_hash_matches"] is True
     assert provenance["execution_identity_matches"] is True
+    assert provenance["audit_gate_pass"] is True
     assert provenance["drift_reasons"] == []
     assert "notes" not in result["batch"]
     assert "last_error" not in result["batch"]["execution"]["tasks"][0]
@@ -470,6 +471,23 @@ def test_execution_identity_drift_is_fail_visible(field, value) -> None:
     if field == "child_config_hash":
         assert provenance["config_hash_matches"] is False
         assert "config_hash_drift" in provenance["drift_reasons"]
+
+
+@pytest.mark.parametrize("gate_pass", [False, None, "true"])
+def test_canonical_audit_gate_failure_is_typed_and_fail_visible(gate_pass) -> None:
+    batch = _batch()
+    summary = {**batch["audit_summary"], "gate_pass": gate_pass}
+    batch["audit_summary"] = json.dumps(summary) if gate_pass == "true" else summary
+    result = asyncio.run(
+        get_module_c_execution_status(
+            FakeConnection(batch=batch), batch_id=42
+        )
+    )
+
+    provenance = result["batch"]["provenance"]
+    assert provenance["audit_gate_pass"] is (False if gate_pass is False else None)
+    assert provenance["evidence_complete"] is False
+    assert "canonical_audit_gate_failed" in provenance["drift_reasons"]
 
 
 def test_freshness_uses_pinned_audit_universe_not_canary_subset() -> None:

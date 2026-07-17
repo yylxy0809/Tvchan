@@ -310,6 +310,7 @@ class ModuleCExecutionProvenanceResponse(BaseModel):
     audit_checkpoint_sha256: str | None = None
     audit_status: str | None = None
     audit_apply_mode: bool | None = None
+    audit_gate_pass: bool | None = None
     freshness_contract_version: str | None = None
     freshness_contract_sha256: str | None = None
     catalog_generation_id: str | None = None
