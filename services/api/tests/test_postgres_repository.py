@@ -4,6 +4,8 @@ import asyncio
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from app.repositories.postgres import (
     TIMEFRAME_TO_DB,
     _candidate_lower_bounds,
@@ -89,10 +91,16 @@ class FakePool:
         *,
         watermark=datetime(2026, 7, 6, tzinfo=UTC),
         timeframe_exists=True,
+        catalog_state=None,
+        catalog_states=None,
+        catalog_error=None,
     ) -> None:
         self.conn = conn
         self.watermark = watermark
         self.timeframe_exists = timeframe_exists
+        self.catalog_state = catalog_state
+        self.catalog_states = catalog_states
+        self.catalog_error = catalog_error
 
     def acquire(self):
         return FakeAcquire(self.conn)
@@ -105,6 +113,17 @@ class FakePool:
             return 1
         if "from scheme2_ingest_watermarks" in query:
             return self.watermark
+        if "from active_kline_scope_catalog" in query:
+            self.conn.queries.append(query)
+            self.conn.args.append(args)
+            if self.catalog_error is not None:
+                raise self.catalog_error
+            state = (
+                self.catalog_states.get(args[1])
+                if self.catalog_states is not None
+                else self.catalog_state
+            )
+            return True if state == "empty" else None
         if "select exists" in query and "from klines" in query:
             self.conn.queries.append(query)
             self.conn.args.append(args)
@@ -137,11 +156,11 @@ class FakeConn:
         ]
 
 
-def test_known_symbol_without_timeframe_watermark_returns_empty_before_kline_scan() -> None:
+def test_active_complete_exact_empty_returns_before_kline_scan() -> None:
     async def scenario():
         conn = FakeConn()
         rows = await get_bars_db(
-            FakePool(conn, watermark=None, timeframe_exists=False),
+            FakePool(conn, watermark=None, timeframe_exists=True, catalog_state="empty"),
             symbol="920047.BJ",
             timeframe="5f",
             start=None,
@@ -151,8 +170,132 @@ def test_known_symbol_without_timeframe_watermark_returns_empty_before_kline_sca
 
         assert rows == []
         assert len(conn.queries) == 1
-        assert "select exists" in conn.queries[0].lower()
+        assert "from active_kline_scope_catalog" in conn.queries[0].lower()
+        assert "state = 'empty'" in conn.queries[0].lower()
+        assert "bounds_complete" in conn.queries[0].lower()
         assert conn.args == [(1, TIMEFRAME_TO_DB["5f"])]
+
+    asyncio.run(scenario())
+
+
+def test_missing_catalog_row_retains_kline_existence_fallback() -> None:
+    async def scenario():
+        conn = FakeConn()
+        rows = await get_bars_db(
+            FakePool(conn, watermark=None, timeframe_exists=False, catalog_state=None),
+            symbol="920047.BJ",
+            timeframe="5f",
+            start=None,
+            end=None,
+            limit=300,
+        )
+
+        assert rows == []
+        assert len(conn.queries) == 2
+        assert "from active_kline_scope_catalog" in conn.queries[0].lower()
+        assert "select exists" in conn.queries[1].lower()
+
+    asyncio.run(scenario())
+
+
+def test_catalog_present_row_still_uses_authoritative_kline_fallback() -> None:
+    async def scenario():
+        conn = FakeConn()
+        rows = await get_bars_db(
+            FakePool(conn, watermark=None, timeframe_exists=True, catalog_state="present"),
+            symbol="000001.SZ",
+            timeframe="5f",
+            start=None,
+            end=None,
+            limit=300,
+        )
+
+        assert rows
+        assert any("select exists" in query.lower() for query in conn.queries)
+        assert any("with canonical as" in query.lower() for query in conn.queries)
+
+    asyncio.run(scenario())
+
+
+def test_missing_catalog_relation_retains_kline_existence_fallback() -> None:
+    class MissingRelationError(RuntimeError):
+        sqlstate = "42P01"
+
+    async def scenario():
+        conn = FakeConn()
+        rows = await get_bars_db(
+            FakePool(
+                conn,
+                watermark=None,
+                timeframe_exists=True,
+                catalog_error=MissingRelationError(),
+            ),
+            symbol="000001.SZ",
+            timeframe="5f",
+            start=None,
+            end=None,
+            limit=300,
+        )
+
+        assert rows
+        assert any("select exists" in query.lower() for query in conn.queries)
+        assert any("with canonical as" in query.lower() for query in conn.queries)
+
+    asyncio.run(scenario())
+
+
+def test_non_missing_relation_catalog_error_is_not_hidden() -> None:
+    class PermissionDeniedError(RuntimeError):
+        sqlstate = "42501"
+
+    with pytest.raises(PermissionDeniedError):
+        asyncio.run(get_bars_db(
+            FakePool(
+                FakeConn(),
+                watermark=None,
+                catalog_error=PermissionDeniedError(),
+            ),
+            symbol="000001.SZ",
+            timeframe="5f",
+            start=None,
+            end=None,
+            limit=300,
+        ))
+
+
+def test_derived_timeframe_exact_empty_still_falls_back_to_non_empty_5f() -> None:
+    class DerivedConn(FakeConn):
+        async def fetch(self, query, *args):
+            self.queries.append(query)
+            self.args.append(args)
+            if args[1] != TIMEFRAME_TO_DB["5f"]:
+                return []
+            return _base_5f_rows()
+
+    async def scenario():
+        conn = DerivedConn()
+        rows = await get_bars_db(
+            FakePool(
+                conn,
+                watermark=None,
+                timeframe_exists=True,
+                catalog_states={
+                    TIMEFRAME_TO_DB["30f"]: "empty",
+                    TIMEFRAME_TO_DB["5f"]: "present",
+                },
+            ),
+            symbol="000001.SZ",
+            timeframe="30f",
+            start=None,
+            end=None,
+            limit=300,
+        )
+
+        assert rows
+        assert any(
+            args[0:3] == (1, TIMEFRAME_TO_DB["5f"], [2, 3, 4, 5, 6, 7, 8, 9])
+            for args in conn.args
+        )
 
     asyncio.run(scenario())
 

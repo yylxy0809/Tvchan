@@ -284,6 +284,10 @@ async def _ingest_watermark(pool, *, symbol_id: int, timeframe_code: int) -> dat
 async def _timeframe_has_rows(
     pool, *, symbol_id: int, timeframe_code: int
 ) -> bool:
+    if await _scope_catalog_proves_empty(
+        pool, symbol_id=symbol_id, timeframe_code=timeframe_code
+    ):
+        return False
     return bool(
         await pool.fetchval(
             """
@@ -298,6 +302,32 @@ async def _timeframe_has_rows(
             timeframe_code,
         )
     )
+
+
+async def _scope_catalog_proves_empty(
+    pool, *, symbol_id: int, timeframe_code: int
+) -> bool:
+    """Trust only an exact empty row from the active complete generation."""
+    try:
+        proven_empty = await pool.fetchval(
+            """
+            select true
+            from active_kline_scope_catalog
+            where symbol_id = $1
+              and timeframe = $2
+              and state = 'empty'
+              and bounds_complete
+            """,
+            symbol_id,
+            timeframe_code,
+        )
+    except Exception as exc:
+        # Preserve the authoritative hypertable fallback during rolling deploys
+        # where API code may start before migration 040 has been applied.
+        if getattr(exc, "sqlstate", None) == "42P01":
+            return False
+        raise
+    return bool(proven_empty)
 
 
 async def _fetch_bars_by_symbol_id(
