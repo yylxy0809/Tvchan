@@ -146,10 +146,21 @@ export class MarketSidebarStore {
     }
   }
   private markParserError(error: unknown): void {
+    const profileBySymbol = Object.fromEntries(
+      Object.entries(this.snapshot.profileBySymbol).map(([symbol, profile]) => [
+        symbol,
+        {
+          ...unavailableProfile(symbol),
+          source: profile.source,
+          chanStrokeStates: profile.chanStrokeStates,
+          strategySignals: profile.strategySignals,
+        },
+      ]),
+    );
     this.snapshot = {
       ...this.snapshot,
       quotesBySymbol: {},
-      profileBySymbol: {},
+      profileBySymbol,
       newsBySymbol: {},
       strength: undefined,
       status: { state: "error", message: error instanceof Error ? error.message : String(error) },
