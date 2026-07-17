@@ -93,7 +93,7 @@ export function createDatafeed(manager: ChartDataManager = chartDataManager) {
       const symbol = symbolName.toUpperCase();
       window.setTimeout(() => {
         recordTvDebug("datafeed.resolveSymbol", { symbol });
-        const exchange = symbol.endsWith(".SH") ? "SH" : "SZ";
+        const exchange = symbol.endsWith(".BJ") ? "BJ" : symbol.endsWith(".SH") ? "SH" : "SZ";
         onResolve({
           ticker: symbol,
           name: symbol,

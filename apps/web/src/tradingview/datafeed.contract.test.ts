@@ -250,13 +250,23 @@ test("A to B to A never joins the aborted first A flight and completes the curre
   } finally { globalThis.fetch = original; }
 });
 
-test("resolved A-share symbols expose Shanghai trading sessions", async () => {
+test("resolved A-share symbols expose their listed exchange and Shanghai trading sessions", async () => {
   const feed = createDatafeed();
-  const info = await new Promise<Record<string, unknown>>((resolve, reject) => {
-    feed.resolveSymbol("000001.SZ", (...args) => resolve(args[0] as Record<string, unknown>), (...args) => reject(args[0]));
-  });
-  assert.equal(info.session, "0930-1130,1300-1500");
-  assert.equal(info.timezone, "Asia/Shanghai");
+  const cases = [
+    ["600000.SH", "SH"],
+    ["000001.SZ", "SZ"],
+    ["920047.BJ", "BJ"],
+  ] as const;
+
+  for (const [symbol, exchange] of cases) {
+    const info = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      feed.resolveSymbol(symbol, (...args) => resolve(args[0] as Record<string, unknown>), (...args) => reject(args[0]));
+    });
+    assert.equal(info.exchange, exchange);
+    assert.equal(info.listed_exchange, exchange);
+    assert.equal(info.session, "0930-1130,1300-1500");
+    assert.equal(info.timezone, "Asia/Shanghai");
+  }
 });
 
 test("TradingView timestamps preserve intraday, daily, weekly, and monthly rules", () => {
