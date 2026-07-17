@@ -10,6 +10,7 @@ from app.repositories.chan_screener import (
     parse_chan_screener_query,
     query_chan_screener,
 )
+from trading_protocol import MODULE_C_CONFIG_HASH
 
 
 def test_parse_multi_level_structure_and_segment_query() -> None:
@@ -142,8 +143,10 @@ def test_module_c_screener_queries_only_published_module_c_outputs() -> None:
         async def fetch(self, query: str, *args):
             self.queries.append(query)
             if "from symbols s" in query:
+                assert args[1] == [MODULE_C_CONFIG_HASH]
                 return [{"id": 7, "code": "000001", "exchange": "SZ", "name": "Ping An"}]
             if "with ranked_heads" in query:
+                assert args[1] == [MODULE_C_CONFIG_HASH]
                 return [{
                     "symbol_id": 7,
                     "chan_level": 5,

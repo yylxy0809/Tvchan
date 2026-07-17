@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.engine.module_c_history_backfill import build_input_signature
+from app.engine.module_c_history_backfill import MODULE_C_CONFIG_HASH as BACKFILL_CONFIG_HASH, build_input_signature
+from trading_protocol import MODULE_C_CONFIG_HASH
+
+
+def test_historical_backfill_writer_uses_authoritative_module_c_semantics():
+    assert BACKFILL_CONFIG_HASH == MODULE_C_CONFIG_HASH
 
 
 def test_backfill_input_signature_is_stable():

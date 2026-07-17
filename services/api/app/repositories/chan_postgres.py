@@ -39,7 +39,6 @@ MODULE_C_CHAN_TABLES = {
 }
 SUPPORTED_MODULE_C_CONFIG_HASHES = (
     MODULE_C_CONFIG_HASH,
-    "module-c:native-5lvl-v3-bi-strict-false",
 )
 
 
@@ -65,16 +64,20 @@ async def get_available_precomputed_chan_levels_db(
             select distinct head.chan_level
             from {table} head
             join symbols symbol on symbol.id = head.symbol_id
+            join chan_c_runs run on run.id = head.run_id
             where symbol.code = $1
               and symbol.exchange = $2
               and symbol.is_active = true
               and head.status = 'published'
               and head.run_id is not null
               and head.chan_level = any($3::integer[])
+              and run.status = 'success'
+              and run.config_hash = $4
             """,
             code,
             exchange,
             requested_codes,
+            MODULE_C_CONFIG_HASH,
         )
     except Exception as exc:
         if exc.__class__.__name__ in {"UndefinedColumnError", "UndefinedTableError"}:
@@ -592,29 +595,33 @@ async def _select_runs(
     published_rows = await conn.fetch(
         f"""
         select
-            chan_level,
-            mode,
-            run_id,
-            snapshot_version,
-            base_from_bar_end,
-            base_to_bar_end,
-            published_at,
-            updated_at
-        from {published_heads_table}
-        where symbol_id = $1
-          and chan_level = any($2::integer[])
-          and status = 'published'
-          and run_id is not null
-          and base_from_bar_end is not null
-          and base_to_bar_end is not null
-          and base_from_bar_end <= $3
-          and base_to_bar_end >= $4
-        order by coalesce(published_at, updated_at) desc, id desc
+            head.chan_level,
+            head.mode,
+            head.run_id,
+            head.snapshot_version,
+            head.base_from_bar_end,
+            head.base_to_bar_end,
+            head.published_at,
+            head.updated_at
+        from {published_heads_table} head
+        join chan_c_runs run on run.id = head.run_id
+        where head.symbol_id = $1
+          and head.chan_level = any($2::integer[])
+          and head.status = 'published'
+          and head.run_id is not null
+          and head.base_from_bar_end is not null
+          and head.base_to_bar_end is not null
+          and head.base_from_bar_end <= $3
+          and head.base_to_bar_end >= $4
+          and run.status = 'success'
+          and run.config_hash = $5
+        order by coalesce(head.published_at, head.updated_at) desc, head.id desc
         """,
         symbol_id,
         requested_codes,
         last_ts,
         first_ts,
+        MODULE_C_CONFIG_HASH,
     )
     published = _group_published_runs(
         published_rows,

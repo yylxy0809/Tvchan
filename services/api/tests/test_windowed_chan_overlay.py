@@ -20,6 +20,7 @@ from app.repositories.chan_postgres import (
     get_windowed_module_c_overlay_db,
 )
 from app.routes import chan
+from trading_protocol import MODULE_C_CONFIG_HASH
 
 
 class _Acquire:
@@ -187,7 +188,7 @@ def test_head_selection_rejects_each_invalid_head_attribute() -> None:
         "base_from_bar_end": _dt(1), "base_to_bar_end": _dt(99),
         "bar_from": _dt(1), "bar_until": _dt(99), "base_timeframe": 5,
         "head_status": "published", "run_status": "success",
-        "config_hash": "module-c:native-5lvl-v3-bi-strict-false",
+        "config_hash": MODULE_C_CONFIG_HASH,
     }
     # The query predicates are tested independently because a DB fake must not
     # accidentally accept rows that a real WHERE clause would reject.

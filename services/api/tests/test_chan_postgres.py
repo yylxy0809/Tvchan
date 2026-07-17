@@ -4,11 +4,14 @@ import asyncio
 from datetime import UTC, datetime
 
 from app.repositories.chan_postgres import (
+    _select_runs,
     _select_windowed_module_c_runs,
     _stroke_row_to_response,
     get_available_precomputed_chan_levels_db,
+    get_module_c_published_head_coverage_db,
 )
 from app.repositories.postgres import TIMEFRAME_TO_DB
+from trading_protocol import MODULE_C_CONFIG_HASH
 
 
 class FakePool:
@@ -22,10 +25,22 @@ class FakePool:
             TIMEFRAME_TO_DB["1w"],
             TIMEFRAME_TO_DB["1m"],
         ]
+        assert args[3] == MODULE_C_CONFIG_HASH
         return [
             {"chan_level": TIMEFRAME_TO_DB["1d"]},
             {"chan_level": TIMEFRAME_TO_DB["5f"]},
         ]
+
+
+class _Acquire:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, *_args):
+        return None
 
 
 def test_available_module_c_levels_preserve_requested_order_and_integer_codes() -> None:
@@ -35,6 +50,82 @@ def test_available_module_c_levels_preserve_requested_order_and_integer_codes() 
         levels=["5f", "30f", "1d", "1w", "1m"],
     ))
     assert levels == ["5f", "1d"]
+
+
+def test_runtime_module_c_readers_reject_v3_only_and_prefer_v4() -> None:
+    v3 = "module-c:native-5lvl-v3-bi-strict-false"
+    first_ts = datetime.fromtimestamp(100, UTC)
+    last_ts = datetime.fromtimestamp(200, UTC)
+
+    class HeadConn:
+        def __init__(self, candidates):
+            self.candidates = candidates
+
+        async def fetch(self, query, *args):
+            assert "join chan_c_runs run on run.id = head.run_id" in query
+            assert "run.status = 'success'" in query
+            assert "run.config_hash = $5" in query
+            assert args[4] == MODULE_C_CONFIG_HASH
+            return [row for row in self.candidates if row["config_hash"] == args[4]]
+
+    v3_row = {
+        "chan_level": 5,
+        "mode": "confirmed",
+        "run_id": 3,
+        "snapshot_version": "v3",
+        "base_from_bar_end": first_ts,
+        "base_to_bar_end": last_ts,
+        "published_at": last_ts,
+        "updated_at": last_ts,
+        "config_hash": v3,
+    }
+    v4_row = {
+        **v3_row,
+        "run_id": 4,
+        "snapshot_version": "v4",
+        "config_hash": MODULE_C_CONFIG_HASH,
+    }
+
+    assert asyncio.run(_select_runs(
+        HeadConn([v3_row]),
+        symbol_id=1,
+        levels=["5f"],
+        first_ts=first_ts,
+        last_ts=last_ts,
+        tables={"published_heads": "scheme2_chan_c_published_heads"},
+    )) is None
+
+    selected = asyncio.run(_select_runs(
+        HeadConn([v3_row, v4_row]),
+        symbol_id=1,
+        levels=["5f"],
+        first_ts=first_ts,
+        last_ts=last_ts,
+        tables={"published_heads": "scheme2_chan_c_published_heads"},
+    ))
+    assert selected is not None
+    assert selected["5f"]["id"] == 4
+
+
+def test_module_c_health_is_not_ready_for_v3_only_coverage() -> None:
+    class Conn:
+        async def fetch(self, query, *args):
+            assert args == ([MODULE_C_CONFIG_HASH],)
+            return []
+
+        async def fetchrow(self, query, *args):
+            assert args == ([MODULE_C_CONFIG_HASH],)
+            return None
+
+    class Pool:
+        def acquire(self):
+            return _Acquire(Conn())
+
+    status = asyncio.run(get_module_c_published_head_coverage_db(Pool()))
+    assert status["ready"] is False
+    assert status["configured_config_hash"] == MODULE_C_CONFIG_HASH
+    assert status["compatible_config_hashes"] == [MODULE_C_CONFIG_HASH]
+    assert status["current_config_heads"] == 0
 
 
 def test_windowed_module_c_head_selection_requires_native_successful_published_runs() -> None:

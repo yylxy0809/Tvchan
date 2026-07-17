@@ -16,6 +16,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import asyncpg
+from trading_protocol import MODULE_C_CONFIG_HASH
 
 from app.domain.enums import DB_TO_LEVEL, LEVEL_TO_DB
 from app.domain.models import SymbolInfo
@@ -26,7 +27,6 @@ from app.repositories.module_c_repo import MODE_TO_DB, ModuleCRepository
 SH_TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_PROFILE = "research_daily_close"
 SUPPORTED_PROFILES = {"research_daily_close", "strategy_30f"}
-MODULE_C_CONFIG_HASH = "module-c:native-5lvl-v3-bi-strict-false"
 RUN_KIND_HISTORICAL_BACKFILL = "historical_backfill"
 DEFAULT_LEVELS = ("5f", "30f", "1d", "1w", "1m")
 
@@ -393,6 +393,7 @@ class HistoricalBackfillWriter:
                   and run_kind = $4
                   and run_group_id = $5
                   and bar_until = $6
+                  and config_hash = $7
                   and status = 'success'
                 limit 1
                 """,
@@ -402,6 +403,7 @@ class HistoricalBackfillWriter:
                 RUN_KIND_HISTORICAL_BACKFILL,
                 run_group_id,
                 cutoff_time,
+                MODULE_C_CONFIG_HASH,
             )
         return row is not None
 
@@ -423,6 +425,7 @@ class HistoricalBackfillWriter:
                   and mode = $3
                   and run_kind = $4
                   and run_group_id = $5
+                  and config_hash = $6
                   and status = 'success'
                 """,
                 symbol_id,
@@ -430,6 +433,7 @@ class HistoricalBackfillWriter:
                 MODE_TO_DB[mode],
                 RUN_KIND_HISTORICAL_BACKFILL,
                 run_group_id,
+                MODULE_C_CONFIG_HASH,
             )
         payload: dict[str, set[datetime]] = {level: set() for level in levels}
         for row in rows:
