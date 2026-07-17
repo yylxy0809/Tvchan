@@ -11,6 +11,12 @@ LIFECYCLE_ADVISORY_LOCK_SQL = "select pg_advisory_xact_lock(hashtext('chan-lifec
 TRY_LIFECYCLE_SESSION_LOCK_SQL = "select pg_try_advisory_lock(hashtext('chan-lifecycle-v1'))"
 UNLOCK_LIFECYCLE_SESSION_SQL = "select pg_advisory_unlock(hashtext('chan-lifecycle-v1'))"
 
+HISTORY_PAYLOAD_IDENTITY_FIELDS = (
+    "id", "symbol_id", "chan_level", "mode", "base_timeframe",
+    "config_hash", "publication_profile", "run_group_id",
+    "old_run_id", "new_run_id", "snapshot_version",
+)
+
 CLAIM_OUTBOX_SQL = """
 with due as (
     select id
@@ -329,6 +335,7 @@ class LifecycleObserver:
         )
         if history is None:
             raise RuntimeError(f"Missing head history: {claimed['head_history_id']}")
+        payload = self._validate_history_identity(claimed, history)
         common = dict(
             symbol_id=int(history["symbol_id"]), chan_level=int(history["chan_level"]),
             mode=str(history["mode"]),
@@ -339,6 +346,8 @@ class LifecycleObserver:
         new_config_hash = await conn.fetchval(
             "select config_hash from chan_c_runs where id = $1", history["new_run_id"]
         )
+        if history["config_hash"] != new_config_hash:
+            raise RuntimeError(f"Lifecycle head-history/run config mismatch: {claimed['id']}")
         previous = await self.load_observations(
             conn, run_id=history["old_run_id"], config_hash=str(old_config_hash or ""), **common
         )
@@ -400,12 +409,36 @@ class LifecycleObserver:
                     f"Missing historical replay cutoff for run_id={history['new_run_id']}"
                 )
         await self.persist_and_acknowledge(
-            conn, claimed=claimed, events=events,
+            conn,
+            claimed={**claimed, "payload": {**payload, "publication_profile": profile}},
+            events=events,
             effective_time=effective_time, observed_time=history["published_at"],
             run_id=int(history["new_run_id"]),
             current_mode=str(history["mode"]),
         )
         return len(events)
+
+    def _validate_history_identity(
+        self, claimed: dict[str, Any], history: Any,
+    ) -> dict[str, Any]:
+        payload = claimed.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise RuntimeError(
+                    f"Invalid lifecycle outbox payload: {claimed['id']}"
+                ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Invalid lifecycle outbox payload: {claimed['id']}")
+
+        for field in HISTORY_PAYLOAD_IDENTITY_FIELDS:
+            if field not in payload or payload[field] != history[field]:
+                raise RuntimeError(
+                    f"Lifecycle outbox/history identity mismatch for {field}: {claimed['id']}"
+                )
+
+        return payload
 
     async def rebuild_current_projection(self, conn: Any) -> None:
         """Recreate the disposable read model solely from append-only events."""

@@ -246,6 +246,7 @@ class ProcessClaimedConnection:
         self, *, profile: str, published_at: datetime, cutoff: datetime | None,
         visible_heads: list[dict[str, object]] | None = None,
         reject_live_heads: bool = False,
+        run_config_hash: str = "cfg",
     ) -> None:
         self.profile = profile
         self.published_at = published_at
@@ -253,22 +254,45 @@ class ProcessClaimedConnection:
         self.visible_heads = visible_heads or []
         self.reject_live_heads = reject_live_heads
         self.live_head_queries = 0
+        self.run_config_hash = run_config_hash
 
-    async def fetchrow(self, sql: str, *_args):
-        assert "chan_c_head_history" in sql
-        return {
+    def claimed(self, *, outbox_id: int, head_history_id: int, **overrides):
+        payload = {
+            "id": head_history_id,
             "symbol_id": 1,
             "chan_level": 5,
             "mode": "predictive",
+            "base_timeframe": 5,
+            "config_hash": "cfg",
+            "publication_profile": self.profile,
+            "run_group_id": "run-group",
+            "old_run_id": 1,
+            "new_run_id": 2,
+            "snapshot_version": "snapshot-2",
+        }
+        payload.update(overrides)
+        return {"id": outbox_id, "head_history_id": head_history_id, "payload": payload}
+
+    async def fetchrow(self, sql: str, *args):
+        assert "chan_c_head_history" in sql
+        return {
+            "id": args[0],
+            "symbol_id": 1,
+            "chan_level": 5,
+            "mode": "predictive",
+            "base_timeframe": 5,
+            "config_hash": "cfg",
             "old_run_id": 1,
             "new_run_id": 2,
             "publication_profile": self.profile,
+            "run_group_id": "run-group",
+            "snapshot_version": "snapshot-2",
             "published_at": self.published_at,
         }
 
     async def fetchval(self, sql: str, *_args):
         if "select config_hash" in sql:
-            return "cfg"
+            return self.run_config_hash
         if "select cutoff_time" in sql:
             return self.cutoff
         raise AssertionError(sql)
@@ -298,7 +322,7 @@ def test_historical_disappearance_uses_only_causal_replay_heads() -> None:
 
     count = asyncio.run(observer.process_claimed(
         connection,
-        {"id": 7, "head_history_id": 11, "payload": {"publication_profile": "historical_replay"}},
+        connection.claimed(outbox_id=7, head_history_id=11),
     ))
 
     assert count == 1
@@ -323,7 +347,7 @@ def test_online_disappearance_is_suppressed_when_another_current_mode_still_expo
 
     count = asyncio.run(observer.process_claimed(
         connection,
-        {"id": 8, "head_history_id": 12, "payload": {"publication_profile": "online"}},
+        connection.claimed(outbox_id=8, head_history_id=12),
     ))
 
     assert count == 0
@@ -332,6 +356,95 @@ def test_online_disappearance_is_suppressed_when_another_current_mode_still_expo
     assert observer.persisted["events"] == []
     assert observer.persisted["effective_time"] == published_at
     assert observer.persisted["observed_time"] == published_at
+
+
+@pytest.mark.parametrize(
+    ("history_profile", "payload_profile"),
+    [("online", "historical_replay"), ("historical_replay", "online")],
+)
+def test_profile_mismatch_fails_before_lifecycle_persistence(
+    history_profile: str, payload_profile: str,
+) -> None:
+    published_at = datetime(2026, 7, 17, 1, tzinfo=UTC)
+    observer = CapturingProcessObserver({1: [observation()], 2: []})
+    connection = ProcessClaimedConnection(
+        profile=history_profile,
+        published_at=published_at,
+        cutoff=published_at if history_profile == "historical_replay" else None,
+    )
+
+    with pytest.raises(RuntimeError, match="publication_profile"):
+        asyncio.run(observer.process_claimed(
+            connection,
+            connection.claimed(
+                outbox_id=9, head_history_id=13,
+                publication_profile=payload_profile,
+            ),
+        ))
+
+    assert observer.persisted is None
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("config_hash", "other-cfg"), ("old_run_id", 101), ("new_run_id", 202),
+        ("symbol_id", 99), ("chan_level", 30), ("mode", "confirmed"),
+        ("base_timeframe", 30), ("run_group_id", "other-group"),
+        ("snapshot_version", "other-snapshot"),
+    ],
+)
+def test_payload_identity_mismatch_fails_before_lifecycle_persistence(
+    field: str, wrong_value,
+) -> None:
+    published_at = datetime(2026, 7, 17, 1, tzinfo=UTC)
+    observer = CapturingProcessObserver({})
+    connection = ProcessClaimedConnection(
+        profile="online", published_at=published_at, cutoff=None,
+    )
+
+    with pytest.raises(RuntimeError, match=field):
+        asyncio.run(observer.process_claimed(
+            connection,
+            connection.claimed(
+                outbox_id=10, head_history_id=14, **{field: wrong_value},
+            ),
+        ))
+
+    assert observer.persisted is None
+
+
+def test_history_config_must_match_new_run_before_lifecycle_persistence() -> None:
+    published_at = datetime(2026, 7, 17, 1, tzinfo=UTC)
+    observer = CapturingProcessObserver({})
+    connection = ProcessClaimedConnection(
+        profile="online", published_at=published_at, cutoff=None,
+        run_config_hash="different-run-config",
+    )
+
+    with pytest.raises(RuntimeError, match="head-history/run config mismatch"):
+        asyncio.run(observer.process_claimed(
+            connection, connection.claimed(outbox_id=11, head_history_id=15),
+        ))
+
+    assert observer.persisted is None
+
+
+@pytest.mark.parametrize("payload", [None, [], "secret-not-json"])
+def test_malformed_payload_fails_before_lifecycle_persistence(payload) -> None:
+    published_at = datetime(2026, 7, 17, 1, tzinfo=UTC)
+    observer = CapturingProcessObserver({})
+    connection = ProcessClaimedConnection(
+        profile="online", published_at=published_at, cutoff=None,
+    )
+    claimed = connection.claimed(outbox_id=10, head_history_id=14)
+    claimed["payload"] = payload
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(observer.process_claimed(connection, claimed))
+
+    assert "secret-not-json" not in str(error.value)
+    assert observer.persisted is None
 
 
 def test_migration_039_separates_observed_and_effective_time() -> None:
