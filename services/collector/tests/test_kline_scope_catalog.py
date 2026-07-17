@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from collector import kline_scope_catalog as catalog
 from collector.kline_scope_catalog import (
     IncompleteScopeGeneration,
     InvalidScopeGeneration,
@@ -386,6 +387,181 @@ def test_cli_bootstrap_requires_explicit_opt_in() -> None:
     assert args.bootstrap is False
     assert args.finalize is False
     assert args.fail is False
+
+
+class ManagementSnapshotConnection:
+    def __init__(
+        self, *, active_generation_id: UUID | None,
+        building_generation_id: UUID | None,
+        control_revision: int = 7,
+    ) -> None:
+        self.active_generation_id = active_generation_id
+        self.building_generation_id = building_generation_id
+        self.control_revision = control_revision
+        self.closed = False
+        self.queries: list[str] = []
+        self.readonly_snapshot = False
+
+    @asynccontextmanager
+    async def transaction(self, *, isolation: str, readonly: bool):
+        assert isolation == "repeatable_read"
+        assert readonly is True
+        self.readonly_snapshot = True
+        yield
+
+    async def fetchrow(self, sql: str, *args: object):
+        normalized = " ".join(sql.lower().split())
+        assert normalized.startswith("select")
+        self.queries.append(normalized)
+        if "from kline_scope_catalog_control" in normalized:
+            return {
+                "active_generation_id": self.active_generation_id,
+                "revision": self.control_revision,
+            }
+        if "status = 'building'" in normalized and "limit 1" in normalized:
+            if self.building_generation_id is None:
+                return None
+            return {"generation_id": self.building_generation_id}
+        if "from kline_scope_catalog_generations" in normalized:
+            assert "base_active_generation_id" in normalized
+            assert "base_control_revision" in normalized
+            generation_id = args[0]
+            is_building = generation_id == self.building_generation_id
+            return {
+                "generation_id": generation_id,
+                "status": "building" if is_building else "complete",
+                "expected_scope_count": 14,
+                "base_active_generation_id": self.active_generation_id,
+                "base_control_revision": self.control_revision,
+                "created_at": "2026-07-17T00:00:00Z",
+                "completed_at": None if is_building else "2026-07-17T00:30:00Z",
+                "failed_at": None,
+                "failure": None,
+            }
+        if "count(*)::bigint as scope_count" in normalized:
+            return {
+                "scope_count": 11,
+                "unknown_count": 2,
+                "incomplete_count": 3,
+            }
+        raise AssertionError(sql)
+
+    async def fetchval(self, sql: str, *args: object):
+        # Retained only so the pre-snapshot implementation fails on assertions,
+        # rather than because the test double lacks its legacy query method.
+        assert sql.lower().lstrip().startswith("select")
+        self.queries.append(" ".join(sql.lower().split()))
+        return self.active_generation_id
+
+    async def execute(self, sql: str, *args: object) -> str:
+        raise AssertionError(f"management snapshot must be read-only: {sql}")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _run_management_snapshot(
+    monkeypatch: pytest.MonkeyPatch, connection: ManagementSnapshotConnection,
+) -> dict[str, object]:
+    async def connect(_database_url: str) -> ManagementSnapshotConnection:
+        return connection
+
+    monkeypatch.setattr(catalog.asyncpg, "connect", connect)
+    return asyncio.run(catalog.run(parse_args(["--database-url", "postgresql://catalog"])))
+
+
+def test_management_snapshot_discovers_building_generation_without_active_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    building_generation_id = uuid4()
+    connection = ManagementSnapshotConnection(
+        active_generation_id=None,
+        building_generation_id=building_generation_id,
+        control_revision=0,
+    )
+
+    result = _run_management_snapshot(monkeypatch, connection)
+
+    assert result["active_generation_id"] is None
+    assert result["control_revision"] == 0
+    assert result["building_generation"] == {
+        "generation_id": str(building_generation_id),
+        "status": "building",
+        "expected_scope_count": 14,
+        "base_active_generation_id": None,
+        "base_control_revision": 0,
+        "created_at": "2026-07-17T00:00:00Z",
+        "completed_at": None,
+        "failed_at": None,
+        "failure": None,
+        "scope_count": 11,
+        "unknown_count": 2,
+        "incomplete_count": 3,
+    }
+    assert connection.closed is True
+    assert connection.readonly_snapshot is True
+    assert connection.queries and all(query.startswith("select") for query in connection.queries)
+
+
+def test_management_snapshot_preserves_active_report_and_exposes_building_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_generation_id = uuid4()
+    building_generation_id = uuid4()
+    connection = ManagementSnapshotConnection(
+        active_generation_id=active_generation_id,
+        building_generation_id=building_generation_id,
+    )
+
+    result = _run_management_snapshot(monkeypatch, connection)
+
+    assert result["generation_id"] == str(active_generation_id)
+    assert result["status"] == "complete"
+    assert result["control_revision"] == 7
+    building = result["building_generation"]
+    assert isinstance(building, dict)
+    assert building["generation_id"] == str(building_generation_id)
+    assert building["base_active_generation_id"] == str(active_generation_id)
+    assert building["base_control_revision"] == 7
+    assert building["scope_count"] == 11
+    assert building["unknown_count"] == 2
+    assert building["incomplete_count"] == 3
+    assert connection.closed is True
+
+
+def test_management_snapshot_reports_no_building_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_generation_id = uuid4()
+    connection = ManagementSnapshotConnection(
+        active_generation_id=active_generation_id,
+        building_generation_id=None,
+    )
+
+    result = _run_management_snapshot(monkeypatch, connection)
+
+    assert result["generation_id"] == str(active_generation_id)
+    assert result["building_generation"] is None
+    assert connection.closed is True
+
+
+def test_management_snapshot_closes_connection_when_a_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingConnection(ManagementSnapshotConnection):
+        async def fetchrow(self, sql: str, *args: object):
+            assert sql.lower().lstrip().startswith("select")
+            raise RuntimeError("catalog read failed")
+
+    connection = FailingConnection(
+        active_generation_id=None,
+        building_generation_id=None,
+    )
+
+    with pytest.raises(RuntimeError, match="catalog read failed"):
+        _run_management_snapshot(monkeypatch, connection)
+
+    assert connection.closed is True
 
 
 def test_delete_hook_invalidates_existing_scopes_in_one_statement_without_inserting() -> None:

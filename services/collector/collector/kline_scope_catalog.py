@@ -481,7 +481,8 @@ async def invalidate_scopes(
 
 async def generation_report(conn: Any, *, generation_id: UUID) -> dict[str, Any]:
     generation = await conn.fetchrow(
-        """select generation_id, status, expected_scope_count, created_at,
+        """select generation_id, status, expected_scope_count,
+                  base_active_generation_id, base_control_revision, created_at,
                   completed_at, failed_at, failure
              from kline_scope_catalog_generations
             where generation_id = $1""",
@@ -491,6 +492,39 @@ async def generation_report(conn: Any, *, generation_id: UUID) -> dict[str, Any]
         raise InvalidScopeGeneration(f"scope catalog generation not found: {generation_id}")
     summary = await conn.fetchrow(GENERATION_SUMMARY_SQL, generation_id)
     return {**dict(generation), **dict(summary)}
+
+
+async def management_snapshot(conn: Any) -> dict[str, Any]:
+    """Report active and resumable building generations without changing state."""
+    async with conn.transaction(isolation="repeatable_read", readonly=True):
+        control = await conn.fetchrow(
+            """select active_generation_id, revision
+                 from kline_scope_catalog_control
+                where control_key = 'active'"""
+        )
+        if control is None:
+            raise InvalidScopeGeneration("scope catalog active control row is missing")
+        building_row = await conn.fetchrow(
+            """select generation_id
+                 from kline_scope_catalog_generations
+                where status = 'building'
+                order by created_at
+                limit 1"""
+        )
+        building = None
+        if building_row is not None:
+            building = await generation_report(
+                conn, generation_id=building_row["generation_id"],
+            )
+
+        active_generation_id = control["active_generation_id"]
+        if active_generation_id is None:
+            snapshot: dict[str, Any] = {"active_generation_id": None}
+        else:
+            snapshot = await generation_report(conn, generation_id=active_generation_id)
+        snapshot["control_revision"] = int(control["revision"])
+        snapshot["building_generation"] = building
+    return snapshot
 
 
 async def finalize_generation(conn: Any, *, generation_id: UUID) -> dict[str, Any]:
@@ -665,14 +699,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             return {"generation_id": str(args.generation_id), "failed": changed}
         if args.generation_id is None:
-            active = await conn.fetchval(
-                """select active_generation_id from kline_scope_catalog_control
-                    where control_key = 'active'"""
-            )
-            if active is None:
-                return {"active_generation_id": None}
-            args.generation_id = active
-        report = await generation_report(conn, generation_id=args.generation_id)
+            report = await management_snapshot(conn)
+        else:
+            report = await generation_report(conn, generation_id=args.generation_id)
         return json.loads(json.dumps(report, default=str))
     finally:
         await conn.close()
