@@ -79,6 +79,119 @@ export type AdminOpsStatus = {
   lifecycle_observer: LifecycleObserverStatus;
 };
 
+export type ModuleCExecutionTask = {
+  chan_level: number;
+  status: string;
+  count: number;
+  attempts: number;
+  bars: number;
+  strokes: number;
+  segments: number;
+  centers: number;
+  signals: number;
+  latest_update: string | null;
+};
+
+export type ModuleCFrozenConfig = {
+  contract: string | null;
+  levels: string[];
+  modes: string[];
+  concurrency_per_worker: number | null;
+  shard_count: number | null;
+  max_attempts: number | null;
+  eligibility_build_id: string | null;
+};
+
+export type ModuleCExecutionSummary = {
+  shard_count: number;
+  active_symbols: number;
+  disposition_rows: number;
+  latest_task_update: string | null;
+  tasks: ModuleCExecutionTask[];
+  retryable_failed: number | null;
+  exhausted_failed: number | null;
+  expired_leases: number;
+};
+
+export type ModuleCExecutionProvenance = {
+  policy: string | null;
+  eligibility_build_id: string | null;
+  manifest_version: string | null;
+  eligibility_manifest_sha256: string | null;
+  build_manifest_sha256: string | null;
+  canonical_audit_run_id: string | null;
+  audit_evidence_sha256: string | null;
+  audit_checkpoint_sha256: string | null;
+  audit_status: string | null;
+  audit_apply_mode: boolean | null;
+  freshness_contract_version: string | null;
+  freshness_contract_sha256: string | null;
+  catalog_generation_id: string | null;
+  catalog_control_revision: number | null;
+  catalog_manifest_sha256: string | null;
+  audit_active_universe_sha256: string | null;
+  catalog_generation_status: string | null;
+  catalog_is_active: boolean;
+  live_catalog_control_revision: number | null;
+  catalog_revision_matches: boolean;
+  eligibility_manifest_matches: boolean;
+  config_hash_matches: boolean;
+  evidence_complete: boolean;
+  drift_reasons: string[];
+};
+
+export type ModuleCFreshnessExpectedWatermark = {
+  timeframe: string;
+  expected: string | null;
+};
+
+export type ModuleCFreshnessActualWatermark = ModuleCFreshnessExpectedWatermark & {
+  actual_min: string | null;
+  actual_max: string | null;
+  empty_scopes: number;
+  stale_scopes: number;
+};
+
+export type ModuleCExecutionFreshness = {
+  as_of: string | null;
+  status: string;
+  reasons: string[];
+  expected_closed_watermarks: ModuleCFreshnessExpectedWatermark[];
+  actual_checkpoint_watermarks: ModuleCFreshnessActualWatermark[];
+};
+
+export type ModuleCExecutionBatch = {
+  batch_id: number;
+  batch_key: string;
+  batch_kind: string;
+  parent_status: string;
+  child_status: string;
+  publication_namespace: string;
+  profile_id: string;
+  run_group_id: string;
+  code_commit: string;
+  image_digest: string;
+  vendor_manifest_sha256: string;
+  config_hash: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+  execution: ModuleCExecutionSummary;
+  frozen_config: ModuleCFrozenConfig;
+  provenance: ModuleCExecutionProvenance;
+  freshness: ModuleCExecutionFreshness;
+};
+
+export type ModuleCExecutionStatus = {
+  observed_at: string;
+  readonly: boolean;
+  running_parent_batches: number;
+  running_child_batches: number;
+  running_tasks: number;
+  batch: ModuleCExecutionBatch | null;
+};
+
 export class AdminRequestError extends Error {
   constructor(
     readonly status: number,
@@ -123,6 +236,17 @@ export async function fetchLlmProviders(token: string): Promise<LlmProvidersConf
 
 export async function fetchAdminOpsStatus(token: string): Promise<AdminOpsStatus> {
   return requestAdmin<AdminOpsStatus>(token, "/api/v1/admin/ops/status");
+}
+
+export async function fetchModuleCExecution(
+  token: string,
+  batchId?: number,
+): Promise<ModuleCExecutionStatus> {
+  const query = batchId === undefined ? "" : `?batch_id=${encodeURIComponent(String(batchId))}`;
+  return requestAdmin<ModuleCExecutionStatus>(
+    token,
+    `/api/v1/admin/ops/module-c/execution${query}`,
+  );
 }
 
 export async function saveLlmProviders(
