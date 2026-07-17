@@ -10,6 +10,7 @@ import pytest
 
 from collector.module_c_batch_control import (
     _strict_v2_provenance,
+    activate_batch,
     freeze_canary,
     load_selection,
     validate_canary_report,
@@ -397,3 +398,84 @@ def test_output_failure_rolls_back_frozen_canary(tmp_path, monkeypatch) -> None:
         asyncio.run(freeze_canary(connection, args))
     assert connection.transaction_failed is True
     assert connection.inserted_args is not None
+
+
+class _ActivateConnection:
+    def __init__(
+        self,
+        *,
+        parent_status: str = "planned",
+        child_status: str = "pending",
+        disposition_rows: int = 100,
+        task_count: int = 100,
+        update_results: tuple[str, ...] = ("UPDATE 1", "UPDATE 1"),
+    ) -> None:
+        self.row = {
+            "parent_status": parent_status,
+            "batch_kind": "canary",
+            "child_status": child_status,
+            "disposition_rows": disposition_rows,
+            "task_count": task_count,
+        }
+        self.update_results = iter(update_results)
+        self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
+        self.transaction_failed = False
+
+    @asynccontextmanager
+    async def transaction(self, *, isolation=None):
+        assert isolation == "serializable"
+        try:
+            yield
+        except Exception:
+            self.transaction_failed = True
+            raise
+
+    async def fetchrow(self, sql, *args):
+        normalized = " ".join(sql.lower().split())
+        assert "for update of parent, child" in normalized
+        assert args == (42,)
+        return self.row
+
+    async def execute(self, sql, *args):
+        self.execute_calls.append((" ".join(sql.lower().split()), args))
+        return next(self.update_results)
+
+
+def test_activate_batch_atomically_transitions_parent_and_child() -> None:
+    connection = _ActivateConnection()
+
+    result = asyncio.run(activate_batch(connection, Namespace(batch_id=42)))
+
+    assert result == {"batch_id": 42, "status": "running"}
+    assert len(connection.execute_calls) == 2
+    child_sql, child_args = connection.execute_calls[0]
+    parent_sql, parent_args = connection.execute_calls[1]
+    assert "update chan_c_full_recompute_batches" in child_sql
+    assert "set status='running'" in child_sql
+    assert "where batch_id=$1 and status='pending'" in child_sql
+    assert child_args == (42,)
+    assert "update chan_c_batches" in parent_sql
+    assert "set status='running'" in parent_sql
+    assert "where id=$1 and status='planned'" in parent_sql
+    assert parent_args == (42,)
+    assert connection.transaction_failed is False
+
+
+def test_activate_batch_rejects_second_activation_without_writes() -> None:
+    connection = _ActivateConnection(parent_status="running", child_status="running")
+
+    with pytest.raises(RuntimeError, match="planned/pending"):
+        asyncio.run(activate_batch(connection, Namespace(batch_id=42)))
+
+    assert connection.execute_calls == []
+    assert connection.transaction_failed is True
+
+
+@pytest.mark.parametrize("update_results", [("UPDATE 0",), ("UPDATE 1", "UPDATE 0")])
+def test_activate_batch_rolls_back_when_either_status_cas_misses(update_results) -> None:
+    connection = _ActivateConnection(update_results=update_results)
+
+    with pytest.raises(RuntimeError, match="atomically activate"):
+        asyncio.run(activate_batch(connection, Namespace(batch_id=42)))
+
+    assert connection.transaction_failed is True

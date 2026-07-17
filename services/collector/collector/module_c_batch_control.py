@@ -655,7 +655,27 @@ async def activate_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> 
             raise RuntimeError("Only a complete planned/pending Module C batch can be activated")
         if int(row["task_count"]) != int(row["disposition_rows"]):
             raise RuntimeError("Cannot activate an incomplete task manifest")
-        await conn.execute("update chan_c_batches set status='running' where id=$1", args.batch_id)
+        child_result = await conn.execute(
+            """
+            update chan_c_full_recompute_batches
+               set status='running', started_at=coalesce(started_at, clock_timestamp()),
+                   finished_at=null, updated_at=clock_timestamp()
+             where batch_id=$1 and status='pending'
+            """,
+            args.batch_id,
+        )
+        if child_result != "UPDATE 1":
+            raise RuntimeError("Failed to atomically activate the Module C parent/child batch")
+        parent_result = await conn.execute(
+            """
+            update chan_c_batches
+               set status='running'
+             where id=$1 and status='planned'
+            """,
+            args.batch_id,
+        )
+        if parent_result != "UPDATE 1":
+            raise RuntimeError("Failed to atomically activate the Module C parent/child batch")
     return {"batch_id": args.batch_id, "status": "running"}
 
 
