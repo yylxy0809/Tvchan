@@ -951,6 +951,7 @@ export function ModuleCSelectionEvidenceCard({
       <p>hash matches: {formatBoolean(selection?.hash_matches ?? undefined)}</p>
       <p>source matches: {formatBoolean(selection?.source_matches ?? undefined)}</p>
       <p>quotas match: {formatBoolean(selection?.quotas_match ?? undefined)}</p>
+      <p>active universe matches: {formatBoolean(selection?.active_universe_matches ?? undefined)}</p>
       <p>
         selection drift_reasons: {selection
           ? formatReasons(selection.drift_reasons)

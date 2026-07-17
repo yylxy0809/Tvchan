@@ -135,6 +135,7 @@ export type ModuleCSelectionEvidence = {
   hash_matches: boolean | null;
   source_matches: boolean | null;
   quotas_match: boolean | null;
+  active_universe_matches: boolean | null;
   drift_reasons: string[];
 };
 

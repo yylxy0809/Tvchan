@@ -311,6 +311,7 @@ class ModuleCCanarySelectionProvenanceResponse(BaseModel):
     hash_matches: bool | None = None
     source_matches: bool | None = None
     quotas_match: bool | None = None
+    active_universe_matches: bool | None = None
     drift_reasons: list[str] = Field(default_factory=list)
 
 

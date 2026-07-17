@@ -6,8 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 import collector.module_c_execution_report as report_module
-from collector.module_c_eligibility import _canonical_sha256, _stable_hash
+from collector.module_c_eligibility import _canonical_sha256
 from collector.module_c_canary_selection import build_selection_manifest
+from trading_protocol.module_c_canary_selection import (
+    evaluate_selection_evidence,
+    selection_active_universe_sha256,
+)
 
 from collector.module_c_execution_report import (
     BATCH_SQL,
@@ -15,6 +19,7 @@ from collector.module_c_execution_report import (
     HEAD_COVERAGE_SQL,
     _json_object,
     build_report,
+    build_selection_evidence,
     parse_args,
     write_artifacts,
 )
@@ -124,12 +129,10 @@ def _canary_parameters() -> dict[str, object]:
 
 
 def _selection_active_universe_hash(parameters: dict[str, object]) -> str:
-    selection = parameters["canary_selection"]
-    identities = sorted(
-        (int(entry["symbol_id"]), str(entry["symbol"]).upper())
-        for entry in selection["symbols"]
-    )
-    return _stable_hash(symbol for _symbol_id, symbol in identities)
+    try:
+        return selection_active_universe_sha256(parameters["canary_selection"])
+    except ValueError:
+        return "f" * 64
 
 
 @pytest.fixture(autouse=True)
@@ -362,6 +365,7 @@ def test_canary_report_validates_first_class_selection_v2_evidence() -> None:
     assert selection["hash_matches"] is True
     assert selection["source_matches"] is True
     assert selection["quotas_match"] is True
+    assert selection["active_universe_matches"] is True
     assert selection["board_counts"] == {
         "main_board": 5, "chinext": 5, "star": 5, "bj": 5
     }
@@ -375,7 +379,7 @@ def test_canary_report_fails_closed_for_missing_or_tampered_selection() -> None:
         Conn(batch_kind="canary", eligibility_parameters=_strict_parameters()), 7
     ))
     assert missing["selection"]["status"] == "unavailable"
-    assert "canary_selection_missing" in missing["selection"]["drift_reasons"]
+    assert "canary_selection_unavailable" in missing["selection"]["drift_reasons"]
 
     parameters = _canary_parameters()
     parameters["canary_selection"]["symbols"][0]["symbol"] = "600999.SH"
@@ -399,6 +403,10 @@ def test_canary_report_fails_closed_when_subset_universe_or_traits_drift() -> No
         7,
     ))
     assert wrong_universe["strict_v2_provenance"]["decision"] == "FAIL"
+    assert wrong_universe["selection"]["active_universe_matches"] is False
+    assert "canary_selection_active_universe_drift" in wrong_universe["selection"][
+        "drift_reasons"
+    ]
 
     parameters = _canary_parameters()
     parameters["selection_traits"] = ["bj"]
@@ -406,7 +414,62 @@ def test_canary_report_fails_closed_when_subset_universe_or_traits_drift() -> No
         Conn(batch_kind="canary", eligibility_parameters=parameters), 7
     ))
     assert wrong_traits["selection"]["status"] == "failed"
-    assert "contract_mismatch" in wrong_traits["selection"]["drift_reasons"]
+    assert "canary_selection_contract_drift" in wrong_traits["selection"][
+        "drift_reasons"
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda parameters: parameters.pop("canary_selection"),
+        lambda parameters: parameters["canary_selection"]["symbols"][0].update(
+            {"symbol": "600999.SH"}
+        ),
+        lambda parameters: parameters["canary_selection"]["symbols"][0].update(
+            {"activity_boundary": []}
+        ),
+        lambda parameters: parameters.update({"selection_contract_version": "v1"}),
+        lambda parameters: parameters.update({"source_build_id": AUDIT_ID}),
+    ],
+)
+def test_collector_selection_evidence_is_exact_shared_evaluator(
+    mutation,
+) -> None:
+    parameters = _canary_parameters()
+    active_universe_hash = _selection_active_universe_hash(parameters)
+    mutation(parameters)
+    frozen = _strict_parameters()
+    provenance = {"decision": "PASS", "frozen": frozen}
+    batch = {
+        "batch_kind": "canary",
+        "eligibility_parameters": parameters,
+        "active_universe_hash": active_universe_hash,
+    }
+
+    assert build_selection_evidence(batch, provenance) == evaluate_selection_evidence(
+        parameters,
+        frozen,
+        active_universe_hash,
+        applicable=True,
+    )
+
+
+def test_collector_baseline_selection_evidence_is_exact_shared_non_applicable() -> None:
+    batch = {
+        "batch_kind": "baseline",
+        "eligibility_parameters": _strict_parameters(),
+        "active_universe_hash": UNIVERSE_SHA,
+    }
+    frozen = _strict_parameters()
+    provenance = {"decision": "PASS", "frozen": frozen}
+
+    assert build_selection_evidence(batch, provenance) == evaluate_selection_evidence(
+        batch["eligibility_parameters"],
+        frozen,
+        UNIVERSE_SHA,
+        applicable=False,
+    )
 
 
 def test_report_no_go_lists_each_required_blocking_class() -> None:

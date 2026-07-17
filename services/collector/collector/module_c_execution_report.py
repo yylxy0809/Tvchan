@@ -19,16 +19,10 @@ from collector.module_c_eligibility import (
     _SHA256_RE,
     _load_strict_inputs,
     parse_freshness_contract,
-    _stable_hash,
 )
-from collector.module_c_canary_selection import (
-    BOARD_ORDER,
-    BOARD_QUOTAS,
-    BOUNDARY_COUNTS,
-    CONTRACT_VERSION as SELECTION_CONTRACT_VERSION,
-    _canonical_sha256 as _selection_sha256,
-    _policy as _selection_policy,
-    validate_selection_manifest,
+from trading_protocol.module_c_canary_selection import (
+    evaluate_selection_evidence,
+    selection_active_universe_sha256,
 )
 
 
@@ -318,139 +312,22 @@ def _failed_provenance(
     }
 
 
-_SELECTION_SOURCE_PROVENANCE_FIELDS = (
-    "canonical_audit_run_id",
-    "audit_evidence_sha256",
-    "audit_checkpoint_sha256",
-    "freshness_contract_version",
-    "freshness_contract_sha256",
-    "catalog_generation_id",
-    "catalog_control_revision",
-    "catalog_manifest_sha256",
-    "audit_active_universe_sha256",
-)
-
-
 def build_selection_evidence(
     batch: Mapping[str, Any],
     strict_v2_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     parameters = _json_object(batch.get("eligibility_parameters"))
-    empty_counts = {board: 0 for board in BOARD_ORDER}
-    empty_boundaries = {
-        board: {boundary: 0 for boundary in BOUNDARY_COUNTS}
-        for board in BOARD_ORDER
-    }
-    result: dict[str, Any] = {
-        "status": "not_applicable",
-        "contract_version": None,
-        "manifest_sha256": None,
-        "source_build_id": None,
-        "activity_basis": None,
-        "board_counts": empty_counts,
-        "boundary_counts": empty_boundaries,
-        "contract_matches": None,
-        "hash_matches": None,
-        "source_matches": None,
-        "quotas_match": None,
-        "drift_reasons": [],
-    }
-    if batch.get("batch_kind") != "canary":
-        return result
-
-    result["source_build_id"] = parameters.get("source_build_id")
-    selection = parameters.get("canary_selection")
-    if not isinstance(selection, Mapping):
-        result.update(
-            status="unavailable",
-            contract_version=parameters.get("selection_contract_version"),
-            manifest_sha256=parameters.get("selection_manifest_sha256"),
-            contract_matches=False,
-            hash_matches=False,
-            source_matches=False,
-            quotas_match=False,
-            drift_reasons=["canary_selection_missing"],
-        )
-        return result
-
-    payload = dict(selection)
-    policy = _json_object(payload.get("policy"))
-    source = _json_object(payload.get("source"))
-    symbols = payload.get("symbols")
-    result["contract_version"] = payload.get("contract_version")
-    result["manifest_sha256"] = payload.get("selection_sha256")
-    result["activity_basis"] = policy.get("activity_basis")
-    reasons: list[str] = []
-
-    observed_traits: set[str] = set()
-    if isinstance(symbols, list):
-        for entry in symbols:
-            if not isinstance(entry, Mapping):
-                continue
-            board = entry.get("board")
-            boundary = entry.get("activity_boundary")
-            traits = entry.get("traits")
-            if isinstance(traits, list):
-                observed_traits.update(str(trait) for trait in traits)
-            if isinstance(board, str) and board in result["board_counts"]:
-                result["board_counts"][board] += 1
-                if (
-                    isinstance(boundary, str)
-                    and boundary in result["boundary_counts"][board]
-                ):
-                    result["boundary_counts"][board][boundary] += 1
-
-    result["contract_matches"] = (
-        payload.get("contract_version") == SELECTION_CONTRACT_VERSION
-        and parameters.get("selection_contract_version")
-        == SELECTION_CONTRACT_VERSION
-        and parameters.get("selection_traits") == sorted(observed_traits)
+    frozen = (
+        _json_object(strict_v2_provenance.get("frozen"))
+        if strict_v2_provenance.get("decision") == "PASS"
+        else {}
     )
-    if not result["contract_matches"]:
-        reasons.append("contract_mismatch")
-
-    unsigned = {key: value for key, value in payload.items() if key != "selection_sha256"}
-    embedded_sha = payload.get("selection_sha256")
-    result["hash_matches"] = (
-        isinstance(embedded_sha, str)
-        and embedded_sha == _selection_sha256(unsigned)
-        and parameters.get("selection_manifest_sha256") == embedded_sha
+    return evaluate_selection_evidence(
+        parameters,
+        frozen,
+        batch.get("active_universe_hash"),
+        applicable=batch.get("batch_kind") == "canary",
     )
-    if not result["hash_matches"]:
-        reasons.append("manifest_hash_mismatch")
-
-    frozen = _json_object(strict_v2_provenance.get("frozen"))
-    source_provenance_matches = all(
-        source.get(field) == frozen.get(field)
-        for field in _SELECTION_SOURCE_PROVENANCE_FIELDS
-    )
-    result["source_matches"] = (
-        strict_v2_provenance.get("decision") == "PASS"
-        and source.get("eligibility_build_id") == parameters.get("source_build_id")
-        and source_provenance_matches
-    )
-    if not result["source_matches"]:
-        reasons.append("source_provenance_mismatch")
-
-    result["quotas_match"] = (
-        policy == _selection_policy()
-        and result["board_counts"] == BOARD_QUOTAS
-        and all(
-            result["boundary_counts"][board] == BOUNDARY_COUNTS
-            for board in BOARD_ORDER
-        )
-    )
-    if not result["quotas_match"]:
-        reasons.append("selection_policy_or_quota_mismatch")
-
-    try:
-        validate_selection_manifest(payload)
-    except (TypeError, ValueError, KeyError, AttributeError):
-        reasons.append("manifest_validation_failed")
-
-    result["drift_reasons"] = list(dict.fromkeys(reasons))
-    result["status"] = "pass" if not result["drift_reasons"] else "failed"
-    return result
 
 
 async def build_strict_v2_provenance(
@@ -691,23 +568,15 @@ async def build_strict_v2_provenance(
             frozen=frozen,
         )
     selection = _json_object(parameters.get("canary_selection"))
-    selection_symbols = selection.get("symbols")
     try:
-        canary_identities = sorted(
-            {
-                (int(entry["symbol_id"]), str(entry["symbol"]).strip().upper())
-                for entry in selection_symbols
-                if isinstance(entry, Mapping)
-            }
-        ) if isinstance(selection_symbols, list) else []
-    except (KeyError, TypeError, ValueError):
-        canary_identities = []
+        selection_universe_sha256 = selection_active_universe_sha256(selection)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        selection_universe_sha256 = None
     canary_universe_matches = bool(
         batch.get("batch_kind") == "canary"
         and parameters.get("scope") == "canary"
-        and len(canary_identities) == 20
-        and str(batch.get("active_universe_hash"))
-        == _stable_hash(name for _symbol_id, name in canary_identities)
+        and selection_universe_sha256 is not None
+        and str(batch.get("active_universe_hash")) == selection_universe_sha256
     )
     baseline_universe_matches = bool(
         batch.get("batch_kind") != "canary"
