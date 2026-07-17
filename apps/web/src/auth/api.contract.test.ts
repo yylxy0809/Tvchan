@@ -7,6 +7,7 @@ import {
   disableAdminToken,
   listAdminTokens,
 } from "./api";
+import { buildAdminHeaders } from "../api/adminRequest";
 
 type FetchCall = {
   input: string;
@@ -140,4 +141,23 @@ test("admin token CRUD does not fall back to localStorage on network or 404 fail
   await assert.rejects(disableAdminToken("admin", 99), /Not Found/);
   await assert.rejects(deleteAdminToken("admin", 99), /Not Found/);
   assert.equal(localStorageAccesses, 0);
+});
+
+test("admin request headers preserve standard HeadersInit forms without overriding auth", () => {
+  const record = buildAdminHeaders("canonical-admin", {
+    "X-Record": "kept",
+    Authorization: "Bearer attacker",
+  });
+  const headers = buildAdminHeaders(
+    "canonical-admin",
+    new Headers({ "X-Headers": "kept", "Content-Type": "text/plain" }),
+  );
+  const tuples = buildAdminHeaders("canonical-admin", [["X-Tuple", "kept"]]);
+
+  assert.equal(record.get("x-record"), "kept");
+  assert.equal(record.get("authorization"), "Bearer canonical-admin");
+  assert.equal(headers.get("x-headers"), "kept");
+  assert.equal(headers.get("content-type"), "text/plain");
+  assert.equal(tuples.get("x-tuple"), "kept");
+  assert.equal(tuples.get("content-type"), "application/json");
 });

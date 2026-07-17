@@ -1,4 +1,9 @@
-import { apiUrl } from "../config";
+import { requestAdmin } from "./adminRequest";
+export {
+  AdminRequestError,
+  handleAdminAuthenticationFailure,
+  isAdminAuthFailure,
+} from "./adminRequest";
 
 export type WencaiAdminConfig = {
   base_url: string;
@@ -225,20 +230,6 @@ export type ModuleCExecutionStatus = {
   batch: ModuleCExecutionBatch | null;
 };
 
-export class AdminRequestError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = "AdminRequestError";
-  }
-}
-
-export function isAdminAuthFailure(error: unknown): error is AdminRequestError {
-  return error instanceof AdminRequestError && (error.status === 401 || error.status === 403);
-}
-
 export async function fetchWencaiConfig(token: string): Promise<WencaiAdminConfig> {
   return requestAdmin<WencaiAdminConfig>(token, "/api/v1/admin/wencai/config");
 }
@@ -300,42 +291,4 @@ export async function testLlmProvider(
     method: "POST",
     body: JSON.stringify(provider),
   });
-}
-
-async function requestAdmin<T>(
-  token: string,
-  path: string,
-  init: RequestInit = {},
-): Promise<T> {
-  const response = await fetch(apiUrl(path), {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token.trim()}`,
-      ...init.headers,
-    },
-  });
-  if (!response.ok) {
-    const message = redactToken(await readResponseError(response), token);
-    throw new AdminRequestError(response.status, message);
-  }
-  return response.json() as Promise<T>;
-}
-
-function redactToken(message: string, token: string): string {
-  const normalized = token.trim();
-  return normalized ? message.split(normalized).join("[redacted]") : message;
-}
-
-async function readResponseError(response: Response): Promise<string> {
-  const text = await response.text();
-  if (!text) {
-    return `${response.status} ${response.statusText}`;
-  }
-  try {
-    const data = JSON.parse(text) as { detail?: unknown; message?: unknown };
-    return String(data.detail ?? data.message ?? text);
-  } catch {
-    return `${response.status} ${response.statusText}: ${text}`;
-  }
 }
