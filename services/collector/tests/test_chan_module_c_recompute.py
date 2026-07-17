@@ -144,6 +144,10 @@ class _FakeConn:
         self.calls.append((query, args))
         return "UPDATE 1"
 
+    async def fetchval(self, query, *args):
+        self.calls.append((query, args))
+        return 0
+
 
 def test_module_c_filter_completed_symbols_keeps_only_incomplete_symbols() -> None:
     pool = _FakePool(_complete_rows())
@@ -257,17 +261,14 @@ def test_full_recompute_claim_is_sharded_leased_and_attempt_bounded() -> None:
     assert "for update of task skip locked" in query.lower()
     assert "from chan_c_full_recompute_batches batch" in query.lower()
     assert "join chan_c_batches parent" in query.lower()
-    assert "batch.status in ('pending', 'running')" in query.lower()
-    assert "parent.status in ('planned', 'running')" in query.lower()
+    assert "batch.status = 'running'" in query.lower()
+    assert "parent.status = 'running'" in query.lower()
     assert "lease_version = task.lease_version + 1" in query
     assert args == (11, "worker-2", 900, 2, 4, 3)
-    activation_query, activation_args = pool.conn.calls[1]
-    assert "status in ('planned', 'running')" in activation_query.lower()
-    assert "status = 'pending'" in activation_query.lower()
-    assert activation_args == (11,)
+    assert len(pool.conn.calls) == 1
 
 
-@pytest.mark.parametrize("status", ["sealed", "failed", "aborted"])
+@pytest.mark.parametrize("status", ["planned", "sealed", "failed", "aborted"])
 def test_batch_init_rejects_inactive_parent_before_writes(status: str) -> None:
     class Conn:
         def __init__(self) -> None:
@@ -305,8 +306,76 @@ def test_batch_init_rejects_inactive_parent_before_writes(status: str) -> None:
     assert conn.execute_calls == []
 
 
-@pytest.mark.parametrize("status", ["completed", "stopped", "failed"])
-def test_batch_init_rejects_terminal_recompute_batch_before_writes(status: str) -> None:
+def test_worker_task_state_mutations_require_running_parent_and_child() -> None:
+    task = {
+        "batch_id": 11,
+        "symbol_id": 22,
+        "chan_level": 30,
+        "claim_token": "token",
+        "lease_version": 3,
+    }
+
+    heartbeat_pool = _FakePool([])
+    heartbeat_writer = SimpleNamespace(_pool=heartbeat_pool)
+    asyncio.run(
+        recompute.heartbeat_recompute_task(
+            kline_writer=heartbeat_writer,
+            task=task,
+            lease_seconds=900,
+        )
+    )
+    heartbeat_sql = heartbeat_pool.conn.calls[0][0].lower()
+    assert "from chan_c_full_recompute_batches batch" in heartbeat_sql
+    assert "join chan_c_batches parent" in heartbeat_sql
+    assert "batch.status = 'running'" in heartbeat_sql
+    assert "parent.status = 'running'" in heartbeat_sql
+
+    fail_pool = _FakePool([])
+    fail_writer = SimpleNamespace(_pool=fail_pool)
+    asyncio.run(
+        recompute.fail_recompute_task(
+            kline_writer=fail_writer,
+            task=task,
+            error="boom",
+        )
+    )
+    fail_sql = fail_pool.conn.calls[0][0].lower()
+    assert "from chan_c_full_recompute_batches batch" in fail_sql
+    assert "join chan_c_batches parent" in fail_sql
+    assert "batch.status = 'running'" in fail_sql
+    assert "parent.status = 'running'" in fail_sql
+
+
+def test_worker_child_finalizer_requires_running_parent_and_child() -> None:
+    pool = _FakePool([])
+    result = asyncio.run(
+        recompute.process_claimed_tasks(
+            kline_writer=SimpleNamespace(_pool=pool),
+            chan_writer=SimpleNamespace(),
+            batch_id=11,
+            modes=["confirmed", "predictive"],
+            worker_id="worker-2",
+            shard_index=0,
+            shard_count=1,
+            lease_seconds=900,
+            max_attempts=3,
+            sleep=0,
+            chan_py_path=None,
+        )
+    )
+
+    assert result == {"runs": 0, "failed": 0, "failures_observed": 0}
+    finalizer_sql = next(
+        query.lower()
+        for query, _args in pool.conn.calls
+        if "update chan_c_full_recompute_batches batch" in query.lower()
+    )
+    assert "parent.status = 'running'" in finalizer_sql
+    assert "batch.status = 'running'" in finalizer_sql
+
+
+@pytest.mark.parametrize("status", ["pending", "completed", "stopped", "failed"])
+def test_worker_rejects_non_running_recompute_batch_before_writes(status: str) -> None:
     expected_batch = {
         "eligibility_build_id": "00000000-0000-0000-0000-000000000001",
         "run_group_id": "batch-11",

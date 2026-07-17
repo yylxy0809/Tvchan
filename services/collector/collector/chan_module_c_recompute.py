@@ -27,8 +27,6 @@ from trading_protocol import Bar, MODULE_C_CONFIG_HASH
 
 DEFAULT_MODULE_C_CHAN_LEVELS = "5f,30f,1d,1w,1m"
 CN_TZ = ZoneInfo("Asia/Shanghai")
-EXECUTABLE_PARENT_BATCH_STATUSES = frozenset({"planned", "running"})
-EXECUTABLE_RECOMPUTE_BATCH_STATUSES = frozenset({"pending", "running"})
 
 
 class InactiveRecomputeBatchError(RuntimeError):
@@ -404,7 +402,8 @@ async def ensure_recompute_batch_on_connection(
     if parent is None:
         raise InactiveRecomputeBatchError(f"Unknown parent batch: {batch_id}")
     parent_status = str(parent["status"])
-    if parent_status not in EXECUTABLE_PARENT_BATCH_STATUSES:
+    required_parent_status = "planned" if allow_create else "running"
+    if parent_status != required_parent_status:
         raise InactiveRecomputeBatchError(
             f"Parent batch {batch_id} is not executable: {parent_status}"
         )
@@ -430,7 +429,8 @@ async def ensure_recompute_batch_on_connection(
         """,
         batch_id,
     )
-    if batch is not None and str(batch["status"]) not in EXECUTABLE_RECOMPUTE_BATCH_STATUSES:
+    required_batch_status = "pending" if allow_create else "running"
+    if batch is not None and str(batch["status"]) != required_batch_status:
         raise InactiveRecomputeBatchError(
             f"Full-recompute batch {batch_id} is not executable: {batch['status']}"
         )
@@ -474,7 +474,7 @@ async def ensure_recompute_batch_on_connection(
         )
     if batch is None:
         raise RuntimeError(f"Unknown eligibility build: {eligibility_build_id}")
-    if str(batch["status"]) not in EXECUTABLE_RECOMPUTE_BATCH_STATUSES:
+    if str(batch["status"]) != required_batch_status:
         raise InactiveRecomputeBatchError(
             f"Full-recompute batch {batch_id} is not executable: {batch['status']}"
         )
@@ -552,8 +552,8 @@ async def claim_recompute_task(
                   join chan_c_batches parent
                     on parent.id = batch.batch_id
                  where batch.batch_id = $1
-                   and batch.status in ('pending', 'running')
-                   and parent.status in ('planned', 'running')
+                   and batch.status = 'running'
+                   and parent.status = 'running'
                  for share of batch, parent
             ), candidate as (
                 select task.batch_id, task.symbol_id, task.chan_level
@@ -598,23 +598,6 @@ async def claim_recompute_task(
             shard_count,
             max_attempts,
         )
-        if row is not None:
-            await conn.execute(
-                """
-                with executable_parent as materialized (
-                    select id
-                      from chan_c_batches
-                     where id = $1 and status in ('planned', 'running')
-                     for share
-                )
-                update chan_c_full_recompute_batches
-                   set status = 'running', started_at = coalesce(started_at, now()),
-                       finished_at = null, updated_at = now()
-                  from executable_parent
-                 where batch_id = executable_parent.id and status = 'pending'
-                """,
-                batch_id,
-            )
     return dict(row) if row is not None else None
 
 
@@ -628,12 +611,23 @@ async def heartbeat_recompute_task(
     async with kline_writer._pool.acquire() as conn:
         result = await conn.execute(
             """
-            update chan_c_full_recompute_tasks
+            with executable_batch as materialized (
+                select batch.batch_id
+                  from chan_c_full_recompute_batches batch
+                  join chan_c_batches parent on parent.id = batch.batch_id
+                 where batch.batch_id = $1
+                   and batch.status = 'running'
+                   and parent.status = 'running'
+                 for share of batch, parent
+            )
+            update chan_c_full_recompute_tasks task
                set lease_until = now() + ($6::integer * interval '1 second'),
                    lease_heartbeat_at = now(), updated_at = now()
-             where batch_id = $1 and symbol_id = $2 and chan_level = $3
-               and status = 'running' and claim_token = $4
-               and lease_version = $5 and lease_until > now()
+              from executable_batch batch
+             where task.batch_id = batch.batch_id
+               and task.symbol_id = $2 and task.chan_level = $3
+               and task.status = 'running' and task.claim_token = $4
+               and task.lease_version = $5 and task.lease_until > now()
             """,
             task["batch_id"],
             task["symbol_id"],
@@ -655,12 +649,24 @@ async def fail_recompute_task(
     async with kline_writer._pool.acquire() as conn:
         result = await conn.execute(
             """
-            update chan_c_full_recompute_tasks
+            with executable_batch as materialized (
+                select batch.batch_id
+                  from chan_c_full_recompute_batches batch
+                  join chan_c_batches parent on parent.id = batch.batch_id
+                 where batch.batch_id = $1
+                   and batch.status = 'running'
+                   and parent.status = 'running'
+                 for share of batch, parent
+            )
+            update chan_c_full_recompute_tasks task
                set status = 'failed', last_error = $6,
                    worker_id = null, claim_token = null, lease_until = null,
                    lease_heartbeat_at = null, updated_at = now()
-             where batch_id = $1 and symbol_id = $2 and chan_level = $3
-               and status = 'running' and claim_token = $4 and lease_version = $5
+              from executable_batch batch
+             where task.batch_id = batch.batch_id
+               and task.symbol_id = $2 and task.chan_level = $3
+               and task.status = 'running' and task.claim_token = $4
+               and task.lease_version = $5
             """,
             task["batch_id"],
             task["symbol_id"],
@@ -727,11 +733,14 @@ async def process_claimed_tasks(
     async with kline_writer._pool.acquire() as conn:
         await conn.execute(
             """
-            with executable_parent as materialized (
-                select id
-                  from chan_c_batches
-                 where id = $1 and status in ('planned', 'running')
-                 for share
+            with executable_batch as materialized (
+                select batch.batch_id
+                  from chan_c_full_recompute_batches batch
+                  join chan_c_batches parent on parent.id = batch.batch_id
+                 where batch.batch_id = $1
+                   and batch.status = 'running'
+                   and parent.status = 'running'
+                 for share of batch, parent
             )
             update chan_c_full_recompute_batches batch
                set status = case
@@ -742,9 +751,9 @@ async def process_claimed_tasks(
                        else 'completed'
                    end,
                    finished_at = now(), updated_at = now()
-              from executable_parent
-             where batch.batch_id = executable_parent.id
-               and batch.status in ('pending', 'running')
+              from executable_batch executable
+             where batch.batch_id = executable.batch_id
+               and batch.status = 'running'
                and not exists (
                    select 1 from chan_c_full_recompute_tasks task
                     where task.batch_id = batch.batch_id
