@@ -40,6 +40,11 @@ _WORKERS: dict[str, WorkerSpec] = {
         module="collector.module_c_batch_control",
         description="Create, activate, inspect and seal frozen Module C batches.",
     ),
+    "module-c-canary-selection": WorkerSpec(
+        name="module-c-canary-selection",
+        module="collector.module_c_canary_selection",
+        description="Build a read-only deterministic strict-v2 canary selection.",
+    ),
     "chan-c-stream": WorkerSpec(
         name="chan-c-stream",
         module="collector.chan_c_stream",

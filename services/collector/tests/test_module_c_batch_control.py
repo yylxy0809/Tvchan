@@ -20,6 +20,7 @@ from collector.module_c_batch_control import (
     validate_canary_report,
     validate_canary_run_set,
     validate_activation_identity,
+    validate_production_canary_selection,
     validate_strict_build,
     validate_pristine_task_manifest,
     validate_terminal_tasks,
@@ -376,7 +377,7 @@ def test_freeze_canary_rejects_strict_v1_source() -> None:
         _strict_v2_provenance(source)
 
 
-def test_freeze_canary_rejects_strict_v1_source_before_inserting(tmp_path) -> None:
+def test_freeze_canary_rejects_v1_selection_before_database_access(tmp_path) -> None:
     selection_path = tmp_path / "selection.json"
     selection_path.write_text(json.dumps(_selection()), encoding="utf-8")
 
@@ -422,7 +423,7 @@ def test_freeze_canary_rejects_strict_v1_source_before_inserting(tmp_path) -> No
         source_build_id="22222222-2222-2222-2222-222222222222",
     )
 
-    with pytest.raises(RuntimeError, match="strict canonical audit"):
+    with pytest.raises(RuntimeError, match="selection-v2"):
         asyncio.run(freeze_canary(connection, args))
     assert connection.inserted is False
 
@@ -454,6 +455,8 @@ def test_output_failure_rolls_back_frozen_canary(tmp_path, monkeypatch) -> None:
     source = {
         **_strict_v2_source(),
         "config_hash": MODULE_C_CONFIG_HASH,
+        "active_universe_hash": "e" * 64,
+        "manifest_hash": "9" * 64,
         "active_symbols": 20,
         "disposition_rows": 100,
     }
@@ -549,6 +552,31 @@ def test_output_failure_rolls_back_frozen_canary(tmp_path, monkeypatch) -> None:
 
     connection = Connection()
 
+    v2_selection = {
+        **selection,
+        "contract_version": "module-c-canary-selection-v2",
+    }
+
+    def load_v2(_path):
+        return tuple(entry["symbol"] for entry in selection["symbols"]), "a" * 64, v2_selection
+
+    async def reproduce(*_args, **_kwargs):
+        return v2_selection
+
+    async def no_drift(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(batch_control, "load_selection", load_v2)
+    monkeypatch.setattr(batch_control, "revalidate_strict_v2_build", no_drift)
+    monkeypatch.setattr(
+        "collector.module_c_canary_selection.validate_selection_source",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "collector.module_c_canary_selection.rebuild_selection_manifest",
+        reproduce,
+    )
+
     def fail_outputs(*_args):
         raise OSError("output unavailable")
 
@@ -565,6 +593,23 @@ def test_output_failure_rolls_back_frozen_canary(tmp_path, monkeypatch) -> None:
         asyncio.run(freeze_canary(connection, args))
     assert connection.transaction_failed is True
     assert connection.inserted_args is not None
+
+
+@pytest.mark.parametrize(
+    "parameters,active_symbols",
+    [
+        ({"scope": "canary", "selection_contract_version": "module-c-canary-selection-v1"}, 20),
+        ({"scope": "canary", "selection_contract_version": "module-c-canary-selection-v2"}, 19),
+        ({"scope": "baseline", "selection_contract_version": "module-c-canary-selection-v2"}, 20),
+    ],
+)
+def test_prepare_canary_requires_deterministic_selection_v2(
+    parameters, active_symbols
+) -> None:
+    with pytest.raises(RuntimeError, match="deterministic selection-v2"):
+        validate_production_canary_selection(
+            parameters=parameters, active_symbols=active_symbols
+        )
 
 
 class _PrepareDriftConnection:
