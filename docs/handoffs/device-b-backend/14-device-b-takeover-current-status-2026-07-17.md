@@ -39,6 +39,7 @@ short SHA     = 379b26d
 - lifecycle reconciliation 已通过：projection mismatch 为零，published history missing 为零。
 - outbox blocking 为零，未发现需要用数据删除或重建掩盖的失败。
 - historical replay 的 `effective_time` 继续来自因果 cutoff，`observed_time` 不得早于 `effective_time`；baseline current state 与 historical replay 保持隔离。
+- Strategy 的 `events_as_of` / `snapshot_as_of` 是观察时点安全视图：事件必须同时满足 `effective_time <= as_of` 和 `observed_time <= as_of`。需要仅按因果生效时间读取的调用方不得复用该接口，必须使用名称与语义明确分离的 causal API。
 
 ### 3.3 真实 TradingView Advanced Charts 验收
 

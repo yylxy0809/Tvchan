@@ -9,7 +9,7 @@ from app.engine.time_utils import utc_time
 
 
 EVENTS_SQL = """
-select e.id, e.fingerprint, e.event_type, e.effective_time, e.point_time,
+select e.id, e.fingerprint, e.event_type, e.effective_time, e.observed_time, e.point_time,
        e.previous_mode, e.current_mode, e.run_id, e.provenance,
        h.symbol_id, h.chan_level, h.mode as head_mode,
        h.publication_profile, h.snapshot_version, h.published_at,
@@ -18,7 +18,8 @@ from chan_structure_lifecycle_events e
 join chan_c_head_history h on h.id = e.head_history_id
 join chan_structure_identity i on i.fingerprint = e.fingerprint
 where e.effective_time <= $1::timestamptz
-order by e.effective_time, e.id
+  and e.observed_time <= $1::timestamptz
+order by e.effective_time, e.observed_time, e.id
 """
 
 CURRENT_SQL = """
@@ -41,6 +42,7 @@ class LifecycleRepository:
         self.pool = pool
 
     async def events_as_of(self, as_of_time: datetime) -> list[dict[str, Any]]:
+        """Return events effective and observed no later than ``as_of_time``."""
         as_of = utc_time(as_of_time)
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(EVENTS_SQL, as_of)
@@ -53,6 +55,7 @@ class LifecycleRepository:
         return [dict(row) for row in rows]
 
     async def snapshot_as_of(self, as_of_time: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return one observation-safe lifecycle snapshot at ``as_of_time``."""
         as_of = utc_time(as_of_time)
         async with self.pool.acquire() as conn:
             async with conn.transaction(isolation="repeatable_read", readonly=True):
