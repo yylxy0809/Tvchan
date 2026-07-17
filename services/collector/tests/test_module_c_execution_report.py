@@ -21,6 +21,7 @@ from collector.module_c_execution_report import (
 
 AUDIT_ID = "11111111-1111-1111-1111-111111111111"
 CATALOG_ID = "22222222-2222-2222-2222-222222222222"
+BUILD_ID = "33333333-3333-3333-3333-333333333333"
 EVIDENCE_SHA = "a" * 64
 CHECKPOINT_SHA = "b" * 64
 CATALOG_SHA = "c" * 64
@@ -113,14 +114,24 @@ class Conn:
         if "report:batch" in sql:
             batch = {
                 "batch_id": args[0],
-                "eligibility_build_id": "build",
+                "eligibility_build_id": BUILD_ID,
+                "child_eligibility_build_id": BUILD_ID,
+                "build_id": BUILD_ID,
                 "run_group_id": "group",
+                "child_run_group_id": "group",
+                "parent_run_group_id": "group",
                 "config_hash": CONFIG_HASH,
+                "child_config_hash": CONFIG_HASH,
                 "parent_config_hash": CONFIG_HASH,
                 "build_config_hash": CONFIG_HASH,
                 "publication_namespace": "production",
+                "child_publication_namespace": "production",
+                "parent_publication_namespace": "production",
                 "profile_id": "native-five-level",
+                "child_profile_id": "native-five-level",
+                "parent_profile_id": "native-five-level",
                 "shard_count": 4,
+                "child_shard_count": 4,
                 "status": self.batch_status,
                 "active_symbols": 1,
                 "disposition_rows": 1,
@@ -130,6 +141,15 @@ class Conn:
                 "updated_at": datetime.now(UTC),
                 "batch_key": "batch",
                 "batch_kind": "baseline",
+                "parent_effective_config": {
+                    "contract": "module-c-native-five-level-v1",
+                    "levels": ["5f", "30f", "1d", "1w", "1m"],
+                    "modes": ["confirmed", "predictive"],
+                    "concurrency_per_worker": 1,
+                    "shard_count": 4,
+                    "eligibility_build_id": BUILD_ID,
+                    "max_attempts": 3,
+                },
                 "code_commit": "a" * 40,
                 "image_digest": "sha256:test",
                 "vendor_manifest_sha256": "b" * 64,
@@ -349,6 +369,74 @@ def test_report_fails_closed_when_batch_identity_provenance_is_invalid(
     assert report["next_phase_decision"]["decision"] == "NO_GO"
 
 
+@pytest.mark.parametrize(
+    "overrides,failure_code",
+    [
+        ({"child_profile_id": None}, "unavailable"),
+        ({"batch_kind": "diagnostic"}, "drift"),
+        ({"child_run_group_id": "other-group"}, "drift"),
+        ({"child_publication_namespace": "other-namespace"}, "drift"),
+        ({"child_config_hash": "module-c:other"}, "drift"),
+        ({"child_shard_count": 2}, "drift"),
+        ({"build_id": "44444444-4444-4444-4444-444444444444"}, "drift"),
+        (
+            {
+                "parent_effective_config": {
+                    "contract": "module-c-native-five-level-v1",
+                    "levels": ["5f", "30f", "1d", "1w", "1m"],
+                    "modes": ["confirmed", "predictive"],
+                    "concurrency_per_worker": 1,
+                    "shard_count": 4,
+                    "eligibility_build_id": BUILD_ID,
+                    "max_attempts": 3,
+                    "unexpected": True,
+                }
+            },
+            "drift",
+        ),
+        (
+            {
+                "parent_effective_config": {
+                    "contract": "module-c-native-five-level-v1",
+                    "levels": ["30f", "5f", "1d", "1w", "1m"],
+                    "modes": ["confirmed", "predictive"],
+                    "concurrency_per_worker": 1,
+                    "shard_count": 4,
+                    "eligibility_build_id": BUILD_ID,
+                    "max_attempts": 3,
+                }
+            },
+            "drift",
+        ),
+        (
+            {
+                "parent_effective_config": {
+                    "contract": "module-c-native-five-level-v1",
+                    "levels": ["5f", "30f", "1d", "1w", "1m"],
+                    "modes": ["confirmed", "predictive"],
+                    "concurrency_per_worker": 1,
+                    "shard_count": 4,
+                    "eligibility_build_id": BUILD_ID,
+                    "max_attempts": True,
+                }
+            },
+            "unavailable",
+        ),
+    ],
+)
+def test_report_fails_closed_when_execution_identity_is_invalid(
+    overrides,
+    failure_code,
+) -> None:
+    report = asyncio.run(
+        build_report(Conn(provenance_overrides=overrides), 8)
+    )
+
+    assert report["strict_v2_provenance"]["decision"] == "FAIL"
+    assert report["strict_v2_provenance"]["failure_code"] == failure_code
+    assert report["next_phase_decision"]["decision"] == "NO_GO"
+
+
 def test_canonical_gate_is_pinned_and_report_queries_never_scan_klines() -> None:
     canonical = " ".join(CANONICAL_SQL.lower().split())
     assert "where audit_run_id = $1::uuid" in canonical
@@ -369,6 +457,19 @@ def test_canonical_gate_is_pinned_and_report_queries_never_scan_klines() -> None
         assert f"eligibility.{field}" in batch
     assert "evidence.config_hash as parent_config_hash" in batch
     assert "eligibility.config_hash as build_config_hash" in batch
+    for field in (
+        "effective_config as parent_effective_config",
+        "run_group_id as parent_run_group_id",
+        "publication_namespace as parent_publication_namespace",
+        "profile_id as parent_profile_id",
+        "run_group_id as child_run_group_id",
+        "publication_namespace as child_publication_namespace",
+        "profile_id as child_profile_id",
+        "shard_count as child_shard_count",
+        "eligibility_build_id::text as child_eligibility_build_id",
+        "eligibility.build_id::text as build_id",
+    ):
+        assert field in batch
     for sql in report_module.__dict__.values():
         if isinstance(sql, str) and "report:" in sql:
             assert " from klines" not in " ".join(sql.lower().split())
