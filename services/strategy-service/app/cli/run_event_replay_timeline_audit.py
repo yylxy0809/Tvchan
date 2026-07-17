@@ -5,7 +5,7 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 
-from app.config.strategy_params import StrategyParams
+from app.config.strategy_execution import require_diagnostic_strategy
 from app.db import create_pool
 from app.engine.event_replay_timeline_audit import (
     build_event_replay_timeline_audit,
@@ -16,9 +16,9 @@ from app.repositories.module_c_repo import ModuleCRepository
 
 
 async def _run(args) -> int:
+    params = require_diagnostic_strategy(args.strategy)
     pool = await create_pool()
     try:
-        params = StrategyParams.from_strategy_code(args.strategy)
         module_c_repo = ModuleCRepository(pool)
         kline_repo = KlineRepository(pool)
         requested_symbols = list(args.symbols or [])
