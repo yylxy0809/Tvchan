@@ -74,6 +74,19 @@ def test_module_c_cli_parses_defaults(monkeypatch) -> None:
     args = parse_args()
     assert args.chan_levels == "5f,30f,1d,1w,1m"
     assert args.symbol_limit is None
+    assert args.max_attempts == 3
+
+
+def _batch_effective_config(*, max_attempts: int = 3) -> dict[str, object]:
+    return {
+        "contract": "module-c-native-five-level-v1",
+        "levels": ["5f", "30f", "1d", "1w", "1m"],
+        "modes": ["confirmed", "predictive"],
+        "concurrency_per_worker": 1,
+        "shard_count": 4,
+        "eligibility_build_id": "00000000-0000-0000-0000-000000000001",
+        "max_attempts": max_attempts,
+    }
 
 
 def test_collector_owned_adapter_disables_sub_peak_strokes() -> None:
@@ -143,6 +156,10 @@ class _FakeConn:
     async def execute(self, query, *args):
         self.calls.append((query, args))
         return "UPDATE 1"
+
+    async def fetchval(self, query, *args):
+        self.calls.append((query, args))
+        return 0
 
 
 def test_module_c_filter_completed_symbols_keeps_only_incomplete_symbols() -> None:
@@ -253,21 +270,27 @@ def test_full_recompute_claim_is_sharded_leased_and_attempt_bounded() -> None:
 
     assert result == row
     query, args = pool.conn.calls[0]
-    assert "for share of batch, parent" in query.lower()
-    assert "for update of task skip locked" in query.lower()
-    assert "from chan_c_full_recompute_batches batch" in query.lower()
-    assert "join chan_c_batches parent" in query.lower()
-    assert "batch.status in ('pending', 'running')" in query.lower()
-    assert "parent.status in ('planned', 'running')" in query.lower()
+    lowered = query.lower()
+    assert "with executable_parent as materialized" in lowered
+    assert "from chan_c_batches" in lowered
+    assert "for share" in lowered
+    assert "executable_batch as materialized" in lowered
+    assert "join executable_parent parent" in lowered
+    assert lowered.index("executable_parent as materialized") < lowered.index(
+        "executable_batch as materialized"
+    ) < lowered.index("candidate as")
+    assert "for update of task skip locked" in lowered
+    assert "batch.status = 'running'" in lowered
+    assert "parent.status = 'running'" in lowered
+    assert "parent.effective_config->>'max_attempts'" in lowered
+    assert "task.attempts < batch.max_attempts" in lowered
+    assert "max_attempts')::integer = $6" in lowered
     assert "lease_version = task.lease_version + 1" in query
     assert args == (11, "worker-2", 900, 2, 4, 3)
-    activation_query, activation_args = pool.conn.calls[1]
-    assert "status in ('planned', 'running')" in activation_query.lower()
-    assert "status = 'pending'" in activation_query.lower()
-    assert activation_args == (11,)
+    assert len(pool.conn.calls) == 1
 
 
-@pytest.mark.parametrize("status", ["sealed", "failed", "aborted"])
+@pytest.mark.parametrize("status", ["planned", "sealed", "failed", "aborted"])
 def test_batch_init_rejects_inactive_parent_before_writes(status: str) -> None:
     class Conn:
         def __init__(self) -> None:
@@ -299,14 +322,100 @@ def test_batch_init_rejects_inactive_parent_before_writes(status: str) -> None:
                 profile_id="module-c-v4",
                 shard_count=4,
                 levels=["5f", "30f", "1d", "1w", "1m"],
+                max_attempts=3,
             )
         )
 
     assert conn.execute_calls == []
 
 
-@pytest.mark.parametrize("status", ["completed", "stopped", "failed"])
-def test_batch_init_rejects_terminal_recompute_batch_before_writes(status: str) -> None:
+def test_worker_task_state_mutations_require_running_parent_and_child() -> None:
+    task = {
+        "batch_id": 11,
+        "symbol_id": 22,
+        "chan_level": 30,
+        "claim_token": "token",
+        "lease_version": 3,
+    }
+
+    heartbeat_pool = _FakePool([])
+    heartbeat_writer = SimpleNamespace(_pool=heartbeat_pool)
+    asyncio.run(
+        recompute.heartbeat_recompute_task(
+            kline_writer=heartbeat_writer,
+            task=task,
+            lease_seconds=900,
+        )
+    )
+    heartbeat_sql = heartbeat_pool.conn.calls[0][0].lower()
+    assert heartbeat_sql.index("executable_parent as materialized") < heartbeat_sql.index(
+        "executable_batch as materialized"
+    )
+    assert "from chan_c_batches" in heartbeat_sql
+    assert "from chan_c_full_recompute_batches batch" in heartbeat_sql
+    assert "join executable_parent parent" in heartbeat_sql
+    assert "batch.status = 'running'" in heartbeat_sql
+    assert "parent.status = 'running'" in heartbeat_sql
+
+    fail_pool = _FakePool([])
+    fail_writer = SimpleNamespace(_pool=fail_pool)
+    asyncio.run(
+        recompute.fail_recompute_task(
+            kline_writer=fail_writer,
+            task=task,
+            error="boom",
+        )
+    )
+    fail_sql = fail_pool.conn.calls[0][0].lower()
+    assert fail_sql.index("executable_parent as materialized") < fail_sql.index(
+        "executable_batch as materialized"
+    )
+    assert "from chan_c_batches" in fail_sql
+    assert "from chan_c_full_recompute_batches batch" in fail_sql
+    assert "join executable_parent parent" in fail_sql
+    assert "batch.status = 'running'" in fail_sql
+    assert "parent.status = 'running'" in fail_sql
+    assert "task.lease_until > now()" in fail_sql
+
+
+def test_worker_child_finalizer_requires_running_parent_and_child() -> None:
+    pool = _FakePool([])
+    result = asyncio.run(
+        recompute.process_claimed_tasks(
+            kline_writer=SimpleNamespace(_pool=pool),
+            chan_writer=SimpleNamespace(),
+            batch_id=11,
+            modes=["confirmed", "predictive"],
+            worker_id="worker-2",
+            shard_index=0,
+            shard_count=1,
+            lease_seconds=900,
+            max_attempts=3,
+            sleep=0,
+            chan_py_path=None,
+        )
+    )
+
+    assert result == {"runs": 0, "failed": 0, "failures_observed": 0}
+    finalizer_sql, finalizer_args = next(
+        (" ".join(query.lower().split()), args)
+        for query, args in pool.conn.calls
+        if "update chan_c_full_recompute_batches batch" in query.lower()
+    )
+    assert finalizer_sql.index("executable_parent as materialized") < finalizer_sql.index(
+        "executable_batch as materialized"
+    )
+    assert "join executable_parent parent" in finalizer_sql
+    assert "parent.status = 'running'" in finalizer_sql
+    assert "batch.status = 'running'" in finalizer_sql
+    assert "parent.effective_config->>'max_attempts'" in finalizer_sql
+    assert "task.status = 'failed' and task.attempts < executable.max_attempts" in finalizer_sql
+    assert "task.status = 'failed' and task.attempts >= executable.max_attempts" in finalizer_sql
+    assert finalizer_args == (11,)
+
+
+@pytest.mark.parametrize("status", ["pending", "completed", "stopped", "failed"])
+def test_worker_rejects_non_running_recompute_batch_before_writes(status: str) -> None:
     expected_batch = {
         "eligibility_build_id": "00000000-0000-0000-0000-000000000001",
         "run_group_id": "batch-11",
@@ -337,6 +446,7 @@ def test_batch_init_rejects_terminal_recompute_batch_before_writes(status: str) 
                     "profile_id": "module-c-v4",
                     "eligible_manifest_sha256": "manifest",
                     "manifest_hash": "manifest",
+                    "effective_config": _batch_effective_config(),
                 }
             assert "from chan_c_full_recompute_batches" in query.lower()
             return expected_batch
@@ -360,6 +470,7 @@ def test_batch_init_rejects_terminal_recompute_batch_before_writes(status: str) 
                 profile_id="module-c-v4",
                 shard_count=4,
                 levels=["5f", "30f", "1d", "1w", "1m"],
+                max_attempts=3,
             )
         )
 
@@ -384,6 +495,7 @@ def test_worker_verify_only_refuses_to_create_missing_child() -> None:
                     "run_group_id": "rg", "config_hash": MODULE_C_CONFIG_HASH,
                     "publication_namespace": "production", "profile_id": "module-c-native-5lvl",
                     "eligible_manifest_sha256": "manifest", "manifest_hash": "manifest",
+                    "effective_config": _batch_effective_config(),
                 }
             return None
 
@@ -397,8 +509,47 @@ def test_worker_verify_only_refuses_to_create_missing_child() -> None:
             eligibility_build_id="00000000-0000-0000-0000-000000000001",
             run_group_id="rg", config_hash=MODULE_C_CONFIG_HASH,
             publication_namespace="production", profile_id="module-c-native-5lvl",
-            shard_count=4, levels=["5f", "30f", "1d", "1w", "1m"],
+            shard_count=4, levels=["5f", "30f", "1d", "1w", "1m"], max_attempts=3,
         ))
+
+
+@pytest.mark.parametrize("durable_max_attempts", [None, 4])
+def test_worker_rejects_max_attempts_drift_before_child_or_task_access(
+    durable_max_attempts,
+) -> None:
+    effective_config = _batch_effective_config(max_attempts=durable_max_attempts or 3)
+    if durable_max_attempts is None:
+        effective_config.pop("max_attempts")
+
+    class Conn:
+        def __init__(self) -> None:
+            self.fetchrow_calls = 0
+
+        def transaction(self):
+            return _FakeTransaction()
+
+        async def fetchrow(self, query, *_args):
+            self.fetchrow_calls += 1
+            assert "from chan_c_batches" in query.lower()
+            return {
+                "status": "running", "batch_kind": "canary",
+                "run_group_id": "rg", "config_hash": MODULE_C_CONFIG_HASH,
+                "publication_namespace": "production", "profile_id": "module-c-native-5lvl",
+                "eligible_manifest_sha256": "manifest", "manifest_hash": "manifest",
+                "effective_config": effective_config,
+            }
+
+    conn = Conn()
+    writer = SimpleNamespace(_pool=SimpleNamespace(acquire=lambda: _FakeAcquire(conn)))
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        asyncio.run(ensure_recompute_batch(
+            kline_writer=writer, batch_id=42,
+            eligibility_build_id="00000000-0000-0000-0000-000000000001",
+            run_group_id="rg", config_hash=MODULE_C_CONFIG_HASH,
+            publication_namespace="production", profile_id="module-c-native-5lvl",
+            shard_count=4, levels=["5f", "30f", "1d", "1w", "1m"], max_attempts=3,
+        ))
+    assert conn.fetchrow_calls == 1
 
 
 @pytest.mark.parametrize("extra", [["--symbols", "001220.SZ"], ["--symbol-limit", "20"]])
@@ -414,6 +565,21 @@ def test_production_scope_flags_fail_before_database_pool(monkeypatch, extra) ->
         ],
     )
     with pytest.raises(ValueError, match="dry-run only"):
+        asyncio.run(recompute.main())
+
+
+def test_production_worker_rejects_non_positive_max_attempts_before_database_pool(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "chan-module-c-recompute",
+            "--run-group-id", "rg",
+            "--batch-id", "42",
+            "--eligibility-build-id", "00000000-0000-0000-0000-000000000001",
+            "--max-attempts", "0",
+        ],
+    )
+    with pytest.raises(ValueError, match="max-attempts must be positive"):
         asyncio.run(recompute.main())
 
 

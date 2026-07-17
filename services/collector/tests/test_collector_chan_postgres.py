@@ -110,6 +110,69 @@ class FakePool:
         return FakeAcquire(self.conn)
 
 
+class FullRecomputeConn(FakeConn):
+    def __init__(self, *, task_overrides=None, parent_overrides=None, child_overrides=None) -> None:
+        super().__init__()
+        self.task_overrides = task_overrides or {}
+        self.parent_overrides = parent_overrides or {}
+        self.child_overrides = child_overrides or {}
+
+    async def fetchrow(self, query: str, *args):
+        self.fetchrow_calls.append((query, args))
+        lowered = query.lower()
+        if "from chan_c_batches" in lowered:
+            return {
+                "id": 7,
+                "status": "running",
+                "batch_kind": "canary",
+                "run_group_id": "batch-7",
+                "config_hash": "module-c-v4",
+                "publication_namespace": "canonical",
+                "profile_id": "module-c-v4",
+                **self.parent_overrides,
+            }
+        if "from chan_c_full_recompute_batches" in lowered:
+            return {
+                "batch_id": 7,
+                "status": "running",
+                "run_group_id": "batch-7",
+                "config_hash": "module-c-v4",
+                "publication_namespace": "canonical",
+                "profile_id": "module-c-v4",
+                **self.child_overrides,
+            }
+        if "from chan_c_full_recompute_tasks" in lowered:
+            return {
+                "batch_id": 7,
+                "symbol_id": 1,
+                "chan_level": 5,
+                "status": "running",
+                "claim_token": "claim-1",
+                "lease_version": 2,
+                "target_bar_until": datetime.fromtimestamp(200, UTC),
+                "expected_heads": {},
+                **self.task_overrides,
+            }
+        return None
+
+
+def _full_recompute_writer(conn: FakeConn) -> PostgresChanWriter:
+    writer = PostgresChanWriter(
+        "postgresql://unused",
+        batch_id=7,
+        run_group_id="batch-7",
+        run_config_hash="module-c-v4",
+        native_base_timeframe=True,
+        publication_profile="baseline",
+        publication_source="full_recompute",
+        run_kind="full_recompute",
+        publication_namespace="canonical",
+        profile_id="module-c-v4",
+    )
+    writer._pool = FakePool(conn)
+    return writer
+
+
 def test_replace_analysis_defaults_to_module_c_tables() -> (
     None
 ):
@@ -365,7 +428,7 @@ def test_full_publish_rejects_a_head_changed_after_task_initialization() -> None
 
 
 def test_full_recompute_write_and_task_completion_share_the_fenced_transaction() -> None:
-    class FullConn(FakeConn):
+    class FullConn(FullRecomputeConn):
         async def execute(self, query: str, *args):
             self.execute_calls.append((query, args))
             if "set status = 'completed'" in query:
@@ -374,16 +437,12 @@ def test_full_recompute_write_and_task_completion_share_the_fenced_transaction()
 
     async def scenario() -> None:
         conn = FullConn()
-        conn._fetchval_results = iter([1, 1, 99])
-        writer = PostgresChanWriter(
-            "postgresql://unused", batch_id=7, run_group_id="batch-7",
-            native_base_timeframe=True,
-        )
-        writer._pool = FakePool(conn)
+        conn._fetchval_results = iter([1, 99])
+        writer = _full_recompute_writer(conn)
         task = {
             "batch_id": 7, "symbol_id": 1, "chan_level": 5,
             "claim_token": "claim-1", "lease_version": 2,
-            "expected_heads": {},
+            "target_bar_until": datetime.fromtimestamp(200, UTC), "expected_heads": {},
         }
 
         await writer.replace_analysis(
@@ -397,16 +456,22 @@ def test_full_recompute_write_and_task_completion_share_the_fenced_transaction()
             full_recompute_task=task,
         )
 
-        fence_query, fence_args = conn.fetchval_calls[1]
-        assert "from chan_c_full_recompute_tasks" in fence_query
-        assert "from chan_c_full_recompute_batches batch" in fence_query
-        assert "join chan_c_batches parent" in fence_query
-        assert "batch.status in ('pending', 'running')" in fence_query
-        assert "parent.status in ('planned', 'running')" in fence_query
-        assert "for share of parent, batch" in fence_query
-        assert "for update of task" in fence_query
-        assert fence_args == (7, 1, 5, "claim-1", 2)
-        run_query, _run_args = conn.fetchval_calls[2]
+        assert len(conn.fetchrow_calls) >= 3
+        parent_query, parent_args = conn.fetchrow_calls[0]
+        child_query, child_args = conn.fetchrow_calls[1]
+        task_query, task_args = conn.fetchrow_calls[2]
+        assert "from chan_c_batches" in parent_query
+        assert "status = 'running'" in parent_query
+        assert "for share" in parent_query
+        assert parent_args == (7,)
+        assert "from chan_c_full_recompute_batches" in child_query
+        assert "status = 'running'" in child_query
+        assert "for share" in child_query
+        assert child_args == (7,)
+        assert "from chan_c_full_recompute_tasks" in task_query
+        assert "for update" in task_query
+        assert task_args == (7, 1, 5, "claim-1", 2)
+        run_query, _run_args = conn.fetchval_calls[1]
         assert "on conflict (batch_id, run_identity)" in run_query
         completion = next(
             (query, args) for query, args in conn.execute_calls
@@ -419,17 +484,13 @@ def test_full_recompute_write_and_task_completion_share_the_fenced_transaction()
 
 def test_full_recompute_publication_rechecks_batch_status_before_any_write() -> None:
     async def scenario() -> None:
-        conn = FakeConn()
-        conn._fetchval_results = iter([1, None])
-        writer = PostgresChanWriter(
-            "postgresql://unused", batch_id=7, run_group_id="batch-7",
-            native_base_timeframe=True,
-        )
-        writer._pool = FakePool(conn)
+        conn = FullRecomputeConn(child_overrides={"status": "pending"})
+        conn._fetchval_results = iter([1])
+        writer = _full_recompute_writer(conn)
         task = {
             "batch_id": 7, "symbol_id": 1, "chan_level": 5,
             "claim_token": "claim-1", "lease_version": 2,
-            "expected_heads": {},
+            "target_bar_until": datetime.fromtimestamp(200, UTC), "expected_heads": {},
         }
 
         with pytest.raises(StaleChanHeadError, match="batch status fence failed"):
@@ -444,15 +505,148 @@ def test_full_recompute_publication_rechecks_batch_status_before_any_write() -> 
                 full_recompute_task=task,
             )
 
-        fence_query, _fence_args = conn.fetchval_calls[1]
-        assert "from chan_c_full_recompute_batches batch" in fence_query
-        assert "join chan_c_batches parent" in fence_query
-        assert "batch.status in ('pending', 'running')" in fence_query
-        assert "parent.status in ('planned', 'running')" in fence_query
-        assert "for share of parent, batch" in fence_query
-        assert "for update of task" in fence_query
+        assert len(conn.fetchrow_calls) == 2
+        assert "from chan_c_batches" in conn.fetchrow_calls[0][0].lower()
+        assert "from chan_c_full_recompute_batches" in conn.fetchrow_calls[1][0].lower()
         assert conn.execute_calls == []
         assert conn.copy_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_full_recompute_writer_requires_matching_task_before_pool_acquire() -> None:
+    class NoAcquirePool:
+        def acquire(self):
+            raise AssertionError("invalid full-recompute input must fail before acquiring a connection")
+
+    writer = PostgresChanWriter(
+        "postgresql://unused",
+        batch_id=7,
+        run_group_id="batch-7",
+        run_config_hash="module-c-v4",
+        native_base_timeframe=True,
+        publication_profile="baseline",
+        publication_source="full_recompute",
+        run_kind="full_recompute",
+        publication_namespace="canonical",
+        profile_id="module-c-v4",
+    )
+    writer._pool = NoAcquirePool()
+    kwargs = {
+        "symbol": "000001.SZ", "level": "5f", "modes": ["confirmed"],
+        "bar_from": datetime.fromtimestamp(100, UTC),
+        "bar_until": datetime.fromtimestamp(200, UTC), "bar_count": 20,
+        "response": {"snapshot_version": "v1"},
+    }
+
+    with pytest.raises(ValueError, match="requires a fenced task"):
+        asyncio.run(writer.replace_analysis(**kwargs))
+    with pytest.raises(ValueError, match="does not match writer batch"):
+        asyncio.run(writer.replace_analysis(
+            **kwargs,
+            full_recompute_task={"batch_id": 8},
+        ))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"run_kind": "online"},
+        {"publication_profile": "online"},
+        {"publication_source": "collector"},
+        {"native_base_timeframe": False},
+        {"batch_id": None},
+        {"run_group_id": None},
+        {"run_config_hash": ""},
+        {"publication_namespace": None},
+        {"profile_id": None},
+    ],
+)
+def test_full_recompute_task_rejects_incomplete_writer_before_pool_acquire(override) -> None:
+    class NoAcquirePool:
+        def acquire(self):
+            raise AssertionError("invalid full-recompute writer must fail before pool acquire")
+
+    writer_args = {
+        "batch_id": 7,
+        "run_group_id": "batch-7",
+        "run_config_hash": "module-c-v4",
+        "native_base_timeframe": True,
+        "publication_profile": "baseline",
+        "publication_source": "full_recompute",
+        "run_kind": "full_recompute",
+        "publication_namespace": "canonical",
+        "profile_id": "module-c-v4",
+        **override,
+    }
+    writer = PostgresChanWriter("postgresql://unused", **writer_args)
+    writer._pool = NoAcquirePool()
+
+    with pytest.raises(ValueError, match="exact writer configuration"):
+        asyncio.run(writer.replace_analysis(
+            symbol="000001.SZ",
+            level="5f",
+            modes=["confirmed"],
+            bar_from=datetime.fromtimestamp(100, UTC),
+            bar_until=datetime.fromtimestamp(200, UTC),
+            bar_count=20,
+            response={"snapshot_version": "v1"},
+            full_recompute_task={"batch_id": 7},
+        ))
+
+
+@pytest.mark.parametrize(
+    ("connection", "task_override", "message"),
+    [
+        (
+            FullRecomputeConn(parent_overrides={"run_group_id": "wrong"}),
+            {},
+            "parent identity",
+        ),
+        (
+            FullRecomputeConn(child_overrides={"profile_id": "wrong"}),
+            {},
+            "child identity",
+        ),
+        (
+            FullRecomputeConn(task_overrides={
+                "target_bar_until": datetime.fromtimestamp(201, UTC),
+            }),
+            {},
+            "target_bar_until",
+        ),
+        (
+            FullRecomputeConn(task_overrides={"expected_heads": {"confirmed": 9}}),
+            {"expected_heads": {"confirmed": 8}},
+            "expected_heads",
+        ),
+    ],
+)
+def test_full_recompute_fence_rejects_identity_cutoff_or_head_drift_before_writes(
+    connection, task_override, message,
+) -> None:
+    async def scenario() -> None:
+        connection._fetchval_results = iter([1])
+        writer = _full_recompute_writer(connection)
+        task = {
+            "batch_id": 7, "symbol_id": 1, "chan_level": 5,
+            "claim_token": "claim-1", "lease_version": 2,
+            "target_bar_until": datetime.fromtimestamp(200, UTC), "expected_heads": {},
+            **task_override,
+        }
+        with pytest.raises(StaleChanHeadError, match=message):
+            await writer.replace_analysis(
+                symbol="000001.SZ", level="5f", modes=["confirmed", "predictive"],
+                bar_from=datetime.fromtimestamp(100, UTC),
+                bar_until=datetime.fromtimestamp(200, UTC), bar_count=20,
+                response={
+                    "snapshot_version": "batch-7-snapshot",
+                    "strokes": [], "segments": [], "centers": [], "signals": [],
+                },
+                full_recompute_task=task,
+            )
+        assert connection.execute_calls == []
+        assert connection.copy_calls == []
 
     asyncio.run(scenario())
 
