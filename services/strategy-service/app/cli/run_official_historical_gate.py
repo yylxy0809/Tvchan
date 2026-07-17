@@ -2,168 +2,348 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from app.db import create_pool
 from app.engine.official_historical_gate import build_official_historical_gate
+from app.engine.historical_lifecycle_dataset import encode_historical_lifecycle_record
+from app.engine.time_utils import utc_time
+from app.repositories.historical_lifecycle_repo import HistoricalLifecycleRepository
 
 
-AS_OF = datetime.fromisoformat("2026-07-03T07:00:00+00:00")
+def _write_text(path: Path, content: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _write_json(path: Path, payload: object) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_dataset_manifest(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Historical lifecycle dataset manifest must be an object")
+    return payload
+
+
+def _validate_dataset_manifest(
+    *,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    scope: dict[str, Any],
+    as_of_time: datetime,
+    stats: dict[str, int],
+    levels: list[dict[str, Any]],
+    snapshot_jsonl_sha256: str,
+) -> str:
+    expected_scope = {
+        key: scope[key]
+        for key in (
+            "replay_batch_id",
+            "source_batch_id",
+            "contract_hash",
+            "scope_hash",
+            "eligible_universe_snapshot_id",
+            "canonical_gate_snapshot_id",
+        )
+    }
+    if manifest.get("dataset_validation") != "PASS":
+        raise ValueError("Historical lifecycle dataset is not validated")
+    if manifest.get("schema_version") != "historical-lifecycle-dataset-v1":
+        raise ValueError("Historical lifecycle dataset schema is invalid")
+    if manifest.get("dataset_kind") != "historical_replay_effective_time":
+        raise ValueError("Historical lifecycle dataset kind is invalid")
+    if manifest.get("cutoff_basis") != "effective_time":
+        raise ValueError("Historical lifecycle dataset cutoff basis is invalid")
+    if manifest.get("effective_cutoff") != utc_time(as_of_time).isoformat():
+        raise ValueError("Historical lifecycle dataset cutoff does not match the gate")
+    if any(manifest.get(key) != value for key, value in expected_scope.items()):
+        raise ValueError("Historical lifecycle dataset scope does not match the gate")
+    if (
+        manifest.get("source_contract") != "sealed_historical_replay_event_ledger_v1"
+        or manifest.get("publication_profile") != "historical_replay"
+    ):
+        raise ValueError("Historical lifecycle dataset source contract is invalid")
+    for field in (
+        "effective_after_cutoff_count",
+        "invalid_clock_count",
+        "non_scope_count",
+    ):
+        if int(manifest.get(field, -1)) != 0:
+            raise ValueError(f"Historical lifecycle dataset {field} is invalid")
+    expected_levels = {
+        str(int(row["chan_level"])): int(row["event_count"])
+        for row in levels
+    }
+    if manifest.get("counts_by_level") != expected_levels:
+        raise ValueError("Historical lifecycle dataset level counts do not match the gate")
+    if int(manifest.get("row_count", -1)) != int(stats.get("row_count", -2)):
+        raise ValueError("Historical lifecycle dataset row count does not match the gate")
+    expected_hash = str(manifest.get("official_jsonl_sha256", ""))
+    if len(expected_hash) != 64 or any(char not in "0123456789abcdef" for char in expected_hash):
+        raise ValueError("Historical lifecycle dataset content hash is invalid")
+    dataset_path = manifest_path.parent / "official.jsonl"
+    if not dataset_path.is_file() or _sha256_file(dataset_path) != expected_hash:
+        raise ValueError("Historical lifecycle dataset content does not match its manifest")
+    if snapshot_jsonl_sha256 != expected_hash:
+        raise ValueError("Historical lifecycle dataset content does not match the DB snapshot")
+    return expected_hash
+
+
+async def _hash_snapshot_events(snapshot: Any, *, prefetch: int = 1000) -> str:
+    digest = hashlib.sha256()
+    async for raw in snapshot.events(prefetch=prefetch):
+        digest.update(encode_historical_lifecycle_record(dict(raw)))
+    return digest.hexdigest()
 
 
 def _markdown(title: str, payload: dict) -> str:
-    lines = [f"# {title}", "", f"- Decision: `{payload['decision']}`", f"- Input hash: `{payload['input_hash']}`", "", "## Gate waterfall", ""]
+    lines = [
+        f"# {title}",
+        "",
+        f"- Decision: `{payload['decision']}`",
+        f"- Input hash: `{payload['input_hash']}`",
+        "",
+        "## Gate waterfall",
+        "",
+    ]
     lines.extend(f"- `{row['gate']}`: `{row['count']}`" for row in payload["gate_stages"])
     lines.extend(["", "## Blockers", ""])
     lines.extend(f"- `{item}`" for item in payload["blockers"])
     return "\n".join(lines) + "\n"
 
 
-def _build_official_dataset_manifest(report: dict) -> dict:
+def _build_official_dataset_manifest(
+    report: dict,
+    *,
+    scope: dict[str, Any],
+    as_of_time: str,
+    dataset_manifest: dict[str, Any] | None = None,
+) -> dict:
     return {
-        "as_of_time": AS_OF.isoformat(),
+        **(dataset_manifest or {}),
+        "as_of_time": as_of_time,
+        "cutoff_basis": "effective_time",
         "publication_profile": "historical_replay",
-        "source_ratio": 1.0,
-        "counts_by_level": report["official_events_by_level"],
-        "future_rows": 0,
+        "gate_counts_by_level": report["official_events_by_level"],
+        "replay_batch_id": scope["replay_batch_id"],
+        "source_batch_id": scope["source_batch_id"],
+        "contract_hash": scope["contract_hash"],
+        "scope_hash": scope["scope_hash"],
         "decision": report["decision"],
+        "input_hash": report["input_hash"],
     }
 
 
-async def _run(output_dir: Path) -> dict:
-    pool = await create_pool(min_size=1, max_size=2)
+def _publish_gate_artifacts(
+    *,
+    output_dir: Path,
+    report: dict[str, Any],
+    scope: dict[str, Any],
+    cutoff: datetime,
+    dataset_manifest: dict[str, Any],
+    failures: list[str],
+) -> None:
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists():
+        if any(output_dir.iterdir()):
+            raise ValueError("Gate output directory must be empty")
+        output_dir.rmdir()
+    staging_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.staging-", dir=output_dir.parent)
+    )
     try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                with source as materialized (
-                    select eligibility_build_id from chan_c_full_recompute_batches where batch_id=6
-                ), high_eligible as materialized (
-                    select symbol_id from module_c_eligibility, source
-                     where build_id=source.eligibility_build_id and timeframe in (1440,10080,43200) and eligible
-                     group by symbol_id having count(distinct timeframe)=3
-                ), intraday_eligible as materialized (
-                    select symbol_id from module_c_eligibility, source
-                     where build_id=source.eligibility_build_id and timeframe in (5,30) and eligible
-                     group by symbol_id having count(distinct timeframe)=2
-                ), signals as materialized (
-                    select identity.symbol_id, identity.chan_level, identity.bsp_type,
-                           identity.side_or_direction, identity.point_time, identity.price_x1000,
-                           event.effective_time, event.current_mode
-                      from chan_structure_lifecycle_events event
-                      join chan_structure_identity identity using(fingerprint)
-                      join intraday_eligible eligible on eligible.symbol_id=identity.symbol_id
-                     where event.event_type='first_seen'
-                       and event.effective_time <= $1::timestamptz
-                       and event.provenance->>'publication_profile'='historical_replay'
-                       and identity.structure_type='signal'
-                ), strict_daily as materialized (
-                    select distinct daily.symbol_id, daily.effective_time
-                      from signals daily join intraday_eligible eligible using(symbol_id)
-                     where daily.chan_level=1440 and daily.current_mode='predictive'
-                       and daily.side_or_direction='buy' and daily.bsp_type in ('2','2s')
-                       and exists (
-                           select 1 from signals daily_b1 where daily_b1.symbol_id=daily.symbol_id
-                             and daily_b1.chan_level=1440 and daily_b1.current_mode='predictive'
-                             and daily_b1.side_or_direction='buy' and daily_b1.bsp_type='1'
-                             and daily_b1.point_time<daily.point_time
-                             and daily_b1.price_x1000<daily.price_x1000
-                             and daily_b1.effective_time<=daily.effective_time
-                       )
-                       and exists (
-                           select 1 from signals weekly_b2 where weekly_b2.symbol_id=daily.symbol_id
-                             and weekly_b2.chan_level=10080 and weekly_b2.current_mode='predictive'
-                             and weekly_b2.side_or_direction='buy' and weekly_b2.bsp_type='2'
-                             and weekly_b2.effective_time<=daily.effective_time
-                             and exists (
-                                 select 1 from signals weekly_b1 where weekly_b1.symbol_id=weekly_b2.symbol_id
-                                   and weekly_b1.chan_level=10080 and weekly_b1.current_mode='predictive'
-                                   and weekly_b1.side_or_direction='buy' and weekly_b1.bsp_type='1'
-                                   and weekly_b1.point_time<weekly_b2.point_time
-                                   and weekly_b1.price_x1000<weekly_b2.price_x1000
-                                   and weekly_b1.effective_time<=weekly_b2.effective_time
-                             )
-                       )
-                )
-                select (select count(*) from high_eligible) source_high_level_eligible,
-                       (select count(distinct (event.provenance->>'symbol_id')::int)
-                          from chan_structure_lifecycle_events event
-                         where event.provenance->>'publication_profile'='historical_replay'
-                           and (event.provenance->>'chan_level')::int in (1440,10080,43200)) official_high_level_visible,
-                       (select count(*) from intraday_eligible) intraday_eligible,
-                       (select count(distinct signal.symbol_id) from signals signal join intraday_eligible eligible using(symbol_id)
-                         where signal.chan_level=10080 and signal.current_mode='predictive'
-                           and signal.side_or_direction='buy' and signal.bsp_type='1') predictive_weekly_b1,
-                       (select count(distinct signal.symbol_id) from signals signal join intraday_eligible eligible using(symbol_id)
-                         where signal.chan_level=10080 and signal.current_mode='predictive'
-                           and signal.side_or_direction='buy' and signal.bsp_type='2') predictive_weekly_b2,
-                       (select count(*) from strict_daily) strict_daily_episodes
-                """,
-                AS_OF,
+        _write_json(staging_dir / "gate_waterfall.json", report)
+        _write_text(
+            staging_dir / "gate_waterfall.md",
+            _markdown("Official Historical Gate Waterfall", report),
+        )
+        fail_rows = [
+            {
+                "symbol": symbol,
+                "failed_gate": "predictive_weekly_b2_visible",
+                "reason": "official_predictive_weekly_b2_unavailable",
+            }
+            for symbol in failures
+        ]
+        _write_text(
+            staging_dir / "fail_samples.jsonl",
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in fail_rows),
+        )
+        _write_text(staging_dir / "candidate_samples.jsonl", "")
+        manifest = _build_official_dataset_manifest(
+            report,
+            scope=scope,
+            as_of_time=cutoff.isoformat(),
+            dataset_manifest=dataset_manifest,
+        )
+        _write_json(staging_dir / "official_dataset_manifest.json", manifest)
+        _write_json(
+            staging_dir / "diagnostic_dataset_manifest.json",
+            {"as_of_time": cutoff.isoformat(), "count": 0, "excluded_from_official": True},
+        )
+        metrics = {
+            "strategy_code": report["strategy_code"],
+            "status": "not_run",
+            "trade_count": 0,
+            "metrics": None,
+            "reason": "official_event_replay_not_implemented",
+            "input_hash": report["input_hash"],
+            "decision": report["decision"],
+        }
+        _write_json(staging_dir / "event_replay_metrics.json", metrics)
+        _write_text(
+            staging_dir / "event_replay_metrics.md",
+            "# Official Event Replay\n\n- Status: `not_run`\n"
+            "- Reason: `official_event_replay_not_implemented`\n- Trade count: `0`\n"
+            f"- Decision: `{report['decision']}`\n",
+        )
+        _write_json(
+            staging_dir / "next_phase_decision.json",
+            {
+                "decision": report["decision"],
+                "blockers": report["blockers"],
+                "input_hash": report["input_hash"],
+            },
+        )
+        trace_dir = staging_dir / "trace"
+        trace_dir.mkdir()
+        for index, item in enumerate(fail_rows[:3], start=1):
+            trace = {
+                **item,
+                "trace_status": "incomplete",
+                "unavailable_from_gate": "predictive_weekly_b2_visible",
+                "official": True,
+            }
+            _write_json(trace_dir / f"rejection-{index}.json", trace)
+            _write_text(
+                trace_dir / f"rejection-{index}.md",
+                f"# Rejection Trace {index}\n\n- Symbol: `{item['symbol']}`\n"
+                "- Failed gate: `predictive_weekly_b2_visible`\n"
+                "- Complete candidate trace: `unavailable`\n",
             )
-            levels = await conn.fetch(
-                """
-                select (provenance->>'chan_level')::int chan_level, count(*)::bigint event_count,
-                       count(*) filter(where effective_time>observed_time)::bigint invalid_time_count
-                  from chan_structure_lifecycle_events
-                 where provenance->>'publication_profile'='historical_replay' and effective_time <= $1
-                 group by 1 order by 1
-                """,
-                AS_OF,
+        artifact_hashes = {
+            path.relative_to(staging_dir).as_posix(): _sha256_file(path)
+            for path in sorted(staging_dir.rglob("*"))
+            if path.is_file()
+        }
+        _write_json(
+            staging_dir / "gate-complete.json",
+            {
+                "schema_version": "official-historical-gate-complete-v1",
+                "input_hash": report["input_hash"],
+                "official_jsonl_sha256": dataset_manifest["official_jsonl_sha256"],
+                "artifacts": artifact_hashes,
+            },
+        )
+        os.replace(staging_dir, output_dir)
+    except Exception:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        raise
+
+
+async def _run(
+    *,
+    replay_batch_id: int,
+    expected_contract_hash: str,
+    as_of_time: datetime,
+    output_dir: Path,
+    dataset_manifest_path: Path,
+) -> dict:
+    cutoff = utc_time(as_of_time)
+    dataset_manifest = _load_dataset_manifest(dataset_manifest_path)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError("Gate output directory must be empty")
+    pool = await create_pool(min_size=1, max_size=1)
+    try:
+        repository = HistoricalLifecycleRepository(pool)
+        async with repository.open_snapshot(
+            replay_batch_id=replay_batch_id,
+            expected_contract_hash=expected_contract_hash,
+            effective_cutoff=cutoff,
+        ) as snapshot:
+            snapshot_jsonl_sha256 = await _hash_snapshot_events(snapshot)
+            counts, levels, failures = await snapshot.gate_inputs()
+            scope = snapshot.scope.manifest()
+            official_jsonl_sha256 = _validate_dataset_manifest(
+                manifest=dataset_manifest,
+                manifest_path=dataset_manifest_path,
+                scope=scope,
+                as_of_time=cutoff,
+                stats=snapshot.stats,
+                levels=levels,
+                snapshot_jsonl_sha256=snapshot_jsonl_sha256,
             )
-            failures = await conn.fetch(
-                """
-                with eligible as (
-                    select eligibility.symbol from module_c_eligibility eligibility
-                     where eligibility.build_id=(select eligibility_build_id from chan_c_full_recompute_batches where batch_id=6)
-                       and eligibility.timeframe in (5,30) and eligibility.eligible
-                     group by eligibility.symbol having count(distinct eligibility.timeframe)=2
-                ) select symbol from eligible order by symbol limit 20
-                """
+            report = build_official_historical_gate(
+                {
+                    "as_of_time": cutoff.isoformat(),
+                    "scope_hash": scope["scope_hash"],
+                    "scope": scope,
+                    "official_jsonl_sha256": official_jsonl_sha256,
+                    "counts": counts,
+                    "official_events_by_level": levels,
+                }
             )
     finally:
         await pool.close()
-    counts = dict(row)
-    counts.update({"official_30f_confirmations": 0, "official_5f_confirmations": 0, "official_candidates": 0})
-    report = build_official_historical_gate({
-        "as_of_time": AS_OF.isoformat(),
-        "counts": counts,
-        "official_events_by_level": [dict(item) for item in levels],
-    })
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(output_dir / "gate_waterfall.json", report)
-    (output_dir / "gate_waterfall.md").write_text(_markdown("Official Historical Gate Waterfall", report), encoding="utf-8")
-    fail_rows = [{"symbol": item["symbol"], "failed_gate": "predictive_weekly_b2_visible", "reason": "official_predictive_weekly_b2_unavailable"} for item in failures]
-    (output_dir / "fail_samples.jsonl").write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in fail_rows), encoding="utf-8")
-    (output_dir / "candidate_samples.jsonl").write_text("", encoding="utf-8")
-    manifest = _build_official_dataset_manifest(report)
-    _write_json(output_dir / "official_dataset_manifest.json", manifest)
-    _write_json(output_dir / "diagnostic_dataset_manifest.json", {"as_of_time": AS_OF.isoformat(), "count": 0, "excluded_from_official": True})
-    metrics = {"strategy_code": report["strategy_code"], "status": "not_run", "trade_count": 0, "metrics": None, "reason": "strict_upstream_gate_empty", "input_hash": report["input_hash"], "decision": "NO_GO"}
-    _write_json(output_dir / "event_replay_metrics.json", metrics)
-    (output_dir / "event_replay_metrics.md").write_text("# Official Event Replay\n\n- Status: `not_run`\n- Reason: `strict_upstream_gate_empty`\n- Trade count: `0`\n- Decision: `NO_GO`\n", encoding="utf-8")
-    _write_json(output_dir / "next_phase_decision.json", {"decision": report["decision"], "blockers": report["blockers"], "input_hash": report["input_hash"]})
-    trace_dir = output_dir / "trace"
-    trace_dir.mkdir(exist_ok=True)
-    for index, item in enumerate(fail_rows[:3], start=1):
-        trace = {**item, "trace_status": "incomplete", "unavailable_from_gate": "predictive_weekly_b2_visible", "official": True}
-        _write_json(trace_dir / f"rejection-{index}.json", trace)
-        (trace_dir / f"rejection-{index}.md").write_text(f"# Rejection Trace {index}\n\n- Symbol: `{item['symbol']}`\n- Failed gate: `predictive_weekly_b2_visible`\n- Complete candidate trace: `unavailable`\n", encoding="utf-8")
+
+    _publish_gate_artifacts(
+        output_dir=output_dir,
+        report=report,
+        scope=scope,
+        cutoff=cutoff,
+        dataset_manifest=dataset_manifest,
+        failures=failures,
+    )
     return report
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/device-b-historical-replay-20260714"))
+    parser.add_argument("--replay-batch-id", type=int, required=True)
+    parser.add_argument("--expected-contract-hash", required=True)
+    parser.add_argument("--as-of", type=utc_time, required=True)
+    parser.add_argument("--dataset-manifest", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    report = asyncio.run(_run(args.output_dir))
-    print(json.dumps({"decision": report["decision"], "blockers": report["blockers"], "input_hash": report["input_hash"]}, sort_keys=True))
+    report = asyncio.run(
+        _run(
+            replay_batch_id=args.replay_batch_id,
+            expected_contract_hash=args.expected_contract_hash,
+            as_of_time=args.as_of,
+            output_dir=args.output_dir,
+            dataset_manifest_path=args.dataset_manifest,
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "decision": report["decision"],
+                "blockers": report["blockers"],
+                "input_hash": report["input_hash"],
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
