@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -14,6 +15,7 @@ from uuid import uuid4
 import pytest
 
 from collector.chan_module_c_recompute import claim_recompute_task
+from collector.module_c_batch_control import activate_batch
 from collector.storage.chan_postgres import PostgresChanWriter, StaleChanHeadError
 from trading_protocol import MODULE_C_CONFIG_HASH
 
@@ -25,7 +27,7 @@ TEST_DATABASE_URL = os.getenv("MODULE_C_EXECUTION_TEST_DATABASE_URL", "")
     not TEST_DATABASE_URL,
     reason="set MODULE_C_EXECUTION_TEST_DATABASE_URL for a disposable migrated PostgreSQL database",
 )
-def test_publication_and_terminal_state_serialize_without_partial_writes() -> None:
+def test_publication_and_terminal_state_serialize_without_partial_writes(monkeypatch) -> None:
     asyncpg = pytest.importorskip("asyncpg")
 
     class _Acquire:
@@ -72,6 +74,21 @@ def test_publication_and_terminal_state_serialize_without_partial_writes() -> No
 
         async def copy_records_to_table(self, *args, **kwargs):
             return await self.connection.copy_records_to_table(*args, **kwargs)
+
+    class _ParentCasMissConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def transaction(self, *args, **kwargs):
+            return self.connection.transaction(*args, **kwargs)
+
+        async def fetchrow(self, query, *args):
+            return await self.connection.fetchrow(query, *args)
+
+        async def execute(self, query, *args):
+            if "update chan_c_batches" in query.lower():
+                return "UPDATE 0"
+            return await self.connection.execute(query, *args)
 
     async def seed(
         connection,
@@ -194,6 +211,21 @@ def test_publication_and_terminal_state_serialize_without_partial_writes() -> No
         )
 
     async def scenario() -> None:
+        async def no_revalidation(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(
+            "collector.module_c_batch_control.revalidate_strict_v2_build",
+            no_revalidation,
+        )
+        monkeypatch.setattr(
+            "collector.module_c_batch_control.validate_pristine_task_manifest",
+            no_revalidation,
+        )
+        monkeypatch.setattr(
+            "collector.module_c_batch_control.validate_activation_identity",
+            lambda _batch: None,
+        )
         setup = await asyncpg.connect(TEST_DATABASE_URL)
         try:
             planned = await seed(
@@ -217,6 +249,34 @@ def test_publication_and_terminal_state_serialize_without_partial_writes() -> No
                 planned["batch_id"],
                 planned["symbol_id"],
             ) == "pending"
+
+            assert await activate_batch(
+                setup, Namespace(batch_id=planned["batch_id"])
+            ) == {"batch_id": planned["batch_id"], "status": "running"}
+            assert tuple(await setup.fetchrow(
+                "select parent.status,child.status from chan_c_batches parent "
+                "join chan_c_full_recompute_batches child on child.batch_id=parent.id "
+                "where parent.id=$1",
+                planned["batch_id"],
+            )) == ("running", "running")
+
+            rollback = await seed(
+                setup,
+                parent_status="planned",
+                child_status="pending",
+                task_status="pending",
+            )
+            with pytest.raises(RuntimeError, match="atomically activate"):
+                await activate_batch(
+                    _ParentCasMissConnection(setup),
+                    Namespace(batch_id=rollback["batch_id"]),
+                )
+            assert tuple(await setup.fetchrow(
+                "select parent.status,child.status from chan_c_batches parent "
+                "join chan_c_full_recompute_batches child on child.batch_id=parent.id "
+                "where parent.id=$1",
+                rollback["batch_id"],
+            )) == ("planned", "pending")
 
             terminal = await seed(setup, parent_status="sealed")
             terminal_writer = writer(_Pool(setup), terminal)
