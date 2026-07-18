@@ -627,6 +627,50 @@ select symbol.id,symbol.code,symbol.exchange
  for share of symbol
 """
 
+CREATE_SCOPE_ORIGINAL_SQL = """
+create temp table _aggregate_scope_original on commit drop as
+select scope.symbol_id,
+       scope.timeframe,
+       count(catalog.symbol_id)::integer as catalog_rows,
+       bool_and(
+           catalog.symbol_id is not null
+           and catalog.bounds_complete is true
+           and (
+               (catalog.state='present' and catalog.min_ts is not null
+                and catalog.max_ts is not null and catalog.min_ts <= catalog.max_ts)
+               or
+               (catalog.state='empty' and catalog.min_ts is null and catalog.max_ts is null)
+           )
+       ) as catalog_valid,
+       max(catalog.max_ts) filter (where catalog.state='present') as original_max
+  from (select distinct symbol.id as symbol_id,stage.timeframe
+          from _native_parquet_kline_stage stage
+          join symbols symbol on symbol.code=stage.code and symbol.exchange=stage.exchange) scope
+  left join kline_scope_catalog catalog
+    on catalog.generation_id=$1
+   and catalog.symbol_id=scope.symbol_id
+   and catalog.timeframe=scope.timeframe
+ group by scope.symbol_id,scope.timeframe
+"""
+
+INVALID_SCOPE_ORIGINAL_SQL = """
+select symbol_id,timeframe,catalog_rows,catalog_valid
+  from _aggregate_scope_original
+ where catalog_rows <> 1 or not catalog_valid
+ limit 1
+"""
+
+
+async def _create_scope_original(conn: Any, catalog_generation_id: UUID) -> None:
+    await conn.execute(CREATE_SCOPE_ORIGINAL_SQL, catalog_generation_id)
+    invalid_original = await conn.fetchrow(INVALID_SCOPE_ORIGINAL_SQL)
+    if invalid_original is not None:
+        raise RuntimeError(
+            "aggregate increment scope catalog bounds are missing or incomplete: "
+            f"symbol_id={invalid_original['symbol_id']} "
+            f"timeframe={invalid_original['timeframe']}"
+        )
+
 
 class AggregateIncrementWriter(NativeParquetWriter):
     """Single-connection writer for the aggregate append-only contract."""
@@ -854,15 +898,7 @@ class AggregateIncrementWriter(NativeParquetWriter):
         )
         for scope in scopes:
             await conn.execute("select pg_advisory_xact_lock($1,$2)", scope["symbol_id"], scope["timeframe"])
-        await conn.execute(
-            """create temp table _aggregate_scope_original on commit drop as
-               select scope.symbol_id,scope.timeframe,max(kline.ts) as original_max
-                 from (select distinct symbol.id as symbol_id,stage.timeframe
-                         from _native_parquet_kline_stage stage
-                         join symbols symbol on symbol.code=stage.code and symbol.exchange=stage.exchange) scope
-                 left join klines kline on kline.symbol_id=scope.symbol_id and kline.timeframe=scope.timeframe
-                group by scope.symbol_id,scope.timeframe"""
-        )
+        await _create_scope_original(conn, catalog_generation_id)
         mismatch = await _fetch_stage_mismatch(conn, APPEND_ONLY_MISMATCH_SQL, bars)
         if mismatch is not None:
             raise RuntimeError(
