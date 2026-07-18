@@ -10,7 +10,10 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import get_settings
-from app.core.security import authenticate_token_value
+from app.core.security import (
+    AuthenticationServiceUnavailable,
+    authenticate_token_value,
+)
 from app.routes.chan import DEFAULT_MODES, _display_levels_for_chart, build_chan_overlay
 from app.routes.chart import (
     build_bars_response,
@@ -39,12 +42,20 @@ async def chart_ws(websocket: WebSocket) -> None:
     token = websocket.query_params.get("token")
     if settings.api_token or settings.admin_api_token:
         app = websocket.scope.get("app")
-        principal = await authenticate_token_value(
-            token, getattr(getattr(app, "state", None), "db_pool", None), settings
-        )
+        try:
+            principal = await authenticate_token_value(
+                token, getattr(getattr(app, "state", None), "db_pool", None), settings
+            )
+        except AuthenticationServiceUnavailable:
+            # A pre-accept close is converted to an HTTP 403 by ASGI servers.
+            await websocket.accept()
+            await websocket.close(code=1013)
+            return
     else:
         principal = True
     if principal is None:
+        # Complete the handshake so the client receives the policy close code.
+        await websocket.accept()
         await websocket.close(code=1008)
         return
 

@@ -9,6 +9,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import Settings, get_settings
 
 bearer = HTTPBearer(auto_error=False)
+AUTHENTICATION_SERVICE_UNAVAILABLE = "Authentication service unavailable"
+
+
+class AuthenticationServiceUnavailable(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -49,14 +54,18 @@ async def authenticate_token_value(
         return principal
 
     if pool is None:
-        return None
+        raise AuthenticationServiceUnavailable
 
     from app.repositories.tokens import find_active_token_by_hash, touch_token_last_used
 
-    row = await find_active_token_by_hash(pool, hash_token(token))
-    if row is None:
-        return None
-    await touch_token_last_used(pool, row["id"])
+    try:
+        row = await find_active_token_by_hash(pool, hash_token(token))
+        if row is None:
+            return None
+        if not await touch_token_last_used(pool, row["id"]):
+            return None
+    except Exception as exc:
+        raise AuthenticationServiceUnavailable from exc
     return TokenPrincipal(
         role=row["role"],
         display_name=row["display_name"],
@@ -77,11 +86,17 @@ async def require_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing bearer token",
         )
-    principal = await authenticate_token_value(
-        credentials.credentials,
-        getattr(request.app.state, "db_pool", None),
-        settings,
-    )
+    try:
+        principal = await authenticate_token_value(
+            credentials.credentials,
+            getattr(request.app.state, "db_pool", None),
+            settings,
+        )
+    except AuthenticationServiceUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=AUTHENTICATION_SERVICE_UNAVAILABLE,
+        ) from exc
     if principal is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

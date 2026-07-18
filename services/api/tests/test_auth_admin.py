@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app.core.config import Settings, get_settings
 from app.core.security import hash_token
@@ -73,10 +75,11 @@ class FakeTokenPool:
             return "DELETE 0"
         if normalized.startswith("update user_api_tokens set last_used_at"):
             token_id = args[0]
-            if token_id in self.rows:
+            if token_id in self.rows and self.rows[token_id]["is_active"]:
                 self.rows[token_id]["last_used_at"] = datetime.now(UTC)
                 self.touched.append(token_id)
-            return "UPDATE 1"
+                return "UPDATE 1"
+            return "UPDATE 0"
         raise AssertionError(f"unexpected execute query: {query}")
 
 
@@ -96,6 +99,17 @@ class FailingTouchTokenPool(FakeTokenPool):
         return await super().execute(query, *args)
 
 
+class RevokedAfterLookupTokenPool(FakeTokenPool):
+    async def fetchrow(self, query: str, *args):
+        row = await super().fetchrow(query, *args)
+        normalized = " ".join(query.lower().split())
+        if "where token_hash = $1" in normalized and row is not None:
+            active_snapshot = dict(row)
+            self.rows[row["id"]]["is_active"] = False
+            return active_snapshot
+        return row
+
+
 def _client(settings: Settings, pool: FakeTokenPool | None = None) -> TestClient:
     api_app = create_app()
     api_app.dependency_overrides[get_settings] = lambda: settings
@@ -103,6 +117,15 @@ def _client(settings: Settings, pool: FakeTokenPool | None = None) -> TestClient
     if pool is not None:
         api_app.state.db_pool = pool
     return client
+
+
+def _assert_websocket_closed(
+    client: TestClient, path: str, token: str, expected_code: int
+) -> None:
+    with client.websocket_connect(f"{path}?token={token}") as websocket:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            websocket.receive_json()
+    assert exc_info.value.code == expected_code
 
 
 def test_login_keeps_api_token_as_user_when_admin_token_is_not_configured() -> None:
@@ -220,7 +243,7 @@ def test_invalid_durable_token_remains_invalid_when_store_is_available() -> None
     assert pool.touched == []
 
 
-def test_protected_routes_keep_existing_invalid_token_semantics_without_store() -> None:
+def test_protected_routes_return_503_for_non_static_token_without_store() -> None:
     client = _client(Settings(api_token="api-token", admin_api_token="admin-token"))
 
     response = client.get(
@@ -229,8 +252,193 @@ def test_protected_routes_keep_existing_invalid_token_semantics_without_store() 
         headers={"Authorization": "Bearer durable-or-invalid-token"},
     )
 
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Authentication service unavailable"}
+
+
+def test_protected_routes_return_503_when_durable_lookup_fails_without_leaking_token() -> None:
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        FailingTokenPool(),
+    )
+
+    response = client.get(
+        "/api/v1/symbols",
+        params={"keyword": "000001"},
+        headers={"Authorization": "Bearer should-not-leak"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Authentication service unavailable"}
+    assert "should-not-leak" not in response.text
+
+
+def test_protected_routes_return_503_when_durable_usage_touch_fails() -> None:
+    pool = FailingTouchTokenPool()
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        pool,
+    )
+    created = client.post(
+        "/api/v1/admin/tokens",
+        json={"label": "desk-1"},
+        headers={"Authorization": "Bearer admin-token"},
+    ).json()
+
+    response = client.get(
+        "/api/v1/symbols",
+        params={"keyword": "000001"},
+        headers={"Authorization": f"Bearer {created['token']}"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Authentication service unavailable"}
+    assert created["token"] not in response.text
+
+
+def test_protected_routes_keep_invalid_durable_token_unauthorized_with_healthy_store() -> None:
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        FakeTokenPool(),
+    )
+
+    response = client.get(
+        "/api/v1/symbols",
+        params={"keyword": "000001"},
+        headers={"Authorization": "Bearer not-issued"},
+    )
+
     assert response.status_code == 403
     assert response.json() == {"detail": "Invalid bearer token"}
+
+
+def test_protected_routes_keep_disabled_durable_token_unauthorized() -> None:
+    pool = FakeTokenPool()
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        pool,
+    )
+    created = client.post(
+        "/api/v1/admin/tokens",
+        json={"label": "desk-1"},
+        headers={"Authorization": "Bearer admin-token"},
+    ).json()
+    client.post(
+        f"/api/v1/admin/tokens/{created['id']}/disable",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    response = client.get(
+        "/api/v1/symbols",
+        params={"keyword": "000001"},
+        headers={"Authorization": f"Bearer {created['token']}"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Invalid bearer token"}
+
+
+def test_protected_routes_reject_token_revoked_between_lookup_and_usage_touch() -> None:
+    pool = RevokedAfterLookupTokenPool()
+    token = "revoked-during-auth"
+    now = datetime.now(UTC)
+    pool.rows[1] = {
+        "id": 1,
+        "token_hash": hash_token(token),
+        "label": "desk-1",
+        "display_name": "Desk 1",
+        "role": "user",
+        "is_active": True,
+        "created_at": now,
+        "updated_at": now,
+        "disabled_at": None,
+        "last_used_at": None,
+    }
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        pool,
+    )
+
+    response = client.get(
+        "/api/v1/symbols",
+        params={"keyword": "000001"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Invalid bearer token"}
+    assert pool.touched == []
+
+
+@pytest.mark.parametrize("path", ["/ws/v1/realtime", "/ws/v2/chart"])
+def test_protected_websockets_close_1013_for_non_static_token_without_store(
+    path: str,
+) -> None:
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"))
+
+    _assert_websocket_closed(client, path, "durable-or-invalid-token", 1013)
+
+
+@pytest.mark.parametrize("path", ["/ws/v1/realtime", "/ws/v2/chart"])
+def test_protected_websockets_close_1013_when_durable_lookup_fails(path: str) -> None:
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        FailingTokenPool(),
+    )
+
+    _assert_websocket_closed(client, path, "should-not-leak", 1013)
+
+
+@pytest.mark.parametrize("path", ["/ws/v1/realtime", "/ws/v2/chart"])
+def test_protected_websockets_close_1013_when_durable_usage_touch_fails(
+    path: str,
+) -> None:
+    pool = FailingTouchTokenPool()
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        pool,
+    )
+    created = client.post(
+        "/api/v1/admin/tokens",
+        json={"label": "desk-1"},
+        headers={"Authorization": "Bearer admin-token"},
+    ).json()
+
+    _assert_websocket_closed(client, path, created["token"], 1013)
+
+
+@pytest.mark.parametrize("path", ["/ws/v1/realtime", "/ws/v2/chart"])
+def test_protected_websockets_keep_invalid_durable_token_unauthorized(
+    path: str,
+) -> None:
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        FakeTokenPool(),
+    )
+
+    _assert_websocket_closed(client, path, "not-issued", 1008)
+
+
+@pytest.mark.parametrize("path", ["/ws/v1/realtime", "/ws/v2/chart"])
+def test_protected_websockets_keep_disabled_durable_token_unauthorized(
+    path: str,
+) -> None:
+    pool = FakeTokenPool()
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        pool,
+    )
+    created = client.post(
+        "/api/v1/admin/tokens",
+        json={"label": "desk-1"},
+        headers={"Authorization": "Bearer admin-token"},
+    ).json()
+    client.post(
+        f"/api/v1/admin/tokens/{created['id']}/disable",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    _assert_websocket_closed(client, path, created["token"], 1008)
 
 
 def test_api_token_still_accesses_existing_data_routes_when_admin_token_is_configured() -> None:
