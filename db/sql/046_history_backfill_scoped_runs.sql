@@ -87,18 +87,43 @@ begin
     expected_run_id := nullif(
         current_setting('tvchan.history_backfill_scoped_run_id', true), ''
     );
-    if old.run_id is not null and expected_run_id is distinct from old.run_id::text then
+    if tg_op = 'INSERT' then
+        if new.run_id is not null
+           and expected_run_id is distinct from new.run_id::text then
+            raise exception using
+                errcode = '55000',
+                message = 'scoped historical backfill insert requires exact session run fence';
+        end if;
+        return new;
+    end if;
+    if tg_op = 'DELETE' then
+        if old.run_id is not null
+           and expected_run_id is distinct from old.run_id::text then
+            raise exception using
+                errcode = '55000',
+                message = 'scoped historical backfill delete requires exact session run fence';
+        end if;
+        return old;
+    end if;
+    if (old.run_id is not null or new.run_id is not null)
+       and expected_run_id is distinct from coalesce(old.run_id, new.run_id)::text then
         raise exception using
             errcode = '55000',
             message = 'scoped historical backfill mutation requires exact session run fence';
     end if;
-    if tg_op = 'UPDATE'
-       and new.run_id is distinct from old.run_id then
+    if old.run_id is distinct from new.run_id
+       or (old.run_id is not null and (
+           old.stop_at is distinct from new.stop_at
+           or old.symbol_id is distinct from new.symbol_id
+           or old.timeframe is distinct from new.timeframe
+           or old.provider is distinct from new.provider
+           or old.page_size is distinct from new.page_size
+       )) then
         raise exception using
             errcode = '55000',
-            message = 'scoped historical backfill run identity is immutable';
+            message = 'scoped historical backfill task identity is immutable';
     end if;
-    return case when tg_op = 'DELETE' then old else new end;
+    return new;
 end
 $$;
 
@@ -108,9 +133,8 @@ drop trigger if exists trg_historical_backfill_scoped_session_fence
     on historical_backfill_tasks;
 
 create trigger trg_historical_backfill_scoped_session_fence
-before update or delete on historical_backfill_tasks
+before insert or update or delete on historical_backfill_tasks
 for each row
-when (old.run_id is not null)
 execute function enforce_historical_backfill_scoped_session_fence();
 
 revoke all on table historical_backfill_scoped_runs from public;

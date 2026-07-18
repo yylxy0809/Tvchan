@@ -247,4 +247,6 @@ def test_migration_046_isolates_legacy_workers_and_scoped_identity() -> None:
     assert "where run_id is null" in migration
     assert "where run_id is not null" in migration
     assert "tvchan.history_backfill_scoped_run_id" in migration
-    assert "before update or delete" in migration
+    assert "before insert or update or delete" in migration
+    assert "scoped historical backfill insert requires exact session run fence" in migration
+    assert "scoped historical backfill task identity is immutable" in migration

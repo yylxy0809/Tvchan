@@ -184,6 +184,7 @@ class PostgresBackfillTaskStore:
 
         async with self._pool.acquire() as conn:
             async with conn.transaction(isolation="serializable"):
+                await _set_scoped_session_fence(conn, run_id)
                 control = await conn.fetchrow(
                     """
                     select control.active_generation_id, control.revision

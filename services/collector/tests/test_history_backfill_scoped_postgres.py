@@ -108,6 +108,70 @@ def test_scoped_run_is_durable_and_legacy_worker_cannot_claim_or_mutate_it() -> 
                     endpoint="127.0.0.1:7709", source_policy="primary_failover",
                 )
                 assert resumed_ids == scoped_ids
+                with pytest.raises(asyncpg.PostgresError) as blocked_insert:
+                    await setup.execute(
+                        """
+                        insert into historical_backfill_tasks(
+                            run_id, stop_at, symbol_id, timeframe, provider, page_size
+                        ) values($1,$2,$3,30,'pytdx',10)
+                        """,
+                        run_id,
+                        cutoff,
+                        symbol_id,
+                    )
+                assert blocked_insert.value.sqlstate == "55000"
+
+                with pytest.raises(asyncpg.PostgresError) as blocked_promotion:
+                    await setup.execute(
+                        """
+                        update historical_backfill_tasks
+                        set run_id=$1, stop_at=$2
+                        where id=$3
+                        """,
+                        run_id,
+                        cutoff,
+                        legacy_id,
+                    )
+                assert blocked_promotion.value.sqlstate == "55000"
+
+                async with setup.transaction():
+                    await setup.execute(
+                        "select set_config('tvchan.history_backfill_scoped_run_id',$1,true)",
+                        str(run_id),
+                    )
+                    with pytest.raises(asyncpg.PostgresError) as immutable_promotion:
+                        await setup.execute(
+                            """
+                            update historical_backfill_tasks
+                            set run_id=$1, stop_at=$2
+                            where id=$3
+                            """,
+                            run_id,
+                            cutoff,
+                            legacy_id,
+                        )
+                assert immutable_promotion.value.sqlstate == "55000"
+
+                for column, value in (
+                    ("stop_at", cutoff.replace(day=9)),
+                    ("symbol_id", symbol_id + 1),
+                    ("timeframe", 30),
+                    ("provider", "other"),
+                    ("page_size", 11),
+                ):
+                    async with setup.transaction():
+                        await setup.execute(
+                            "select set_config('tvchan.history_backfill_scoped_run_id',$1,true)",
+                            str(run_id),
+                        )
+                        with pytest.raises(asyncpg.PostgresError) as immutable_identity:
+                            await setup.execute(
+                                f"update historical_backfill_tasks set {column}=$1 where id=$2",
+                                value,
+                                scoped_ids[0],
+                            )
+                    assert immutable_identity.value.sqlstate == "55000"
+
                 with pytest.raises(RuntimeError, match="durable run identity mismatch"):
                     await store.ensure_scoped_run_tasks(
                         run_id=run_id, run_identity=run_identity,
