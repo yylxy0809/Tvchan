@@ -83,3 +83,67 @@ def test_spool_symbol_filters_window_and_writes_checkpoint(tmp_path: Path) -> No
     checkpoint = json.loads((tmp_path / "checkpoints" / "SH" / "605123.json").read_text(encoding="utf-8"))
     assert checkpoint["status"] == "success"
     assert checkpoint["bars"] == 2
+
+
+def test_spool_symbol_advances_raw_offset_after_filtered_provider_row(tmp_path: Path) -> None:
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.offsets = []
+
+        async def get_bars_page_with_raw_count(self, symbol: str, timeframe: str, *, offset: int, limit: int):
+            self.offsets.append(offset)
+            if offset == 0:
+                return ([_bar("2026-04-20T09:35:00"), _bar("2026-04-20T09:40:00")], 3)
+            if offset == 3:
+                return ([_bar("2026-04-17T15:00:00")], 1)
+            return ([], 0)
+
+    provider = FakeProvider()
+    result = asyncio.run(
+        spool.spool_symbol(
+            provider=provider,
+            symbol=SymbolInfo(symbol="605123.SH", code="605123", exchange="SH", name="sample"),
+            timeframe="5f",
+            start_dt=spool.parse_boundary("2026-04-18", end_of_day=False),
+            end_dt=spool.parse_boundary("2026-04-30", end_of_day=True),
+            output_root=tmp_path,
+            page_size=3,
+            max_pages_per_symbol=0,
+            sleep=0,
+        )
+    )
+
+    assert provider.offsets == [0, 3]
+    assert result.pages == 2
+    assert result.bars == 2
+    assert result.exhausted is True
+
+
+def test_spool_symbol_advances_when_an_entire_raw_page_is_filtered(tmp_path: Path) -> None:
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.offsets = []
+
+        async def get_bars_page_with_raw_count(self, symbol: str, timeframe: str, *, offset: int, limit: int):
+            self.offsets.append(offset)
+            return ([], 1) if offset == 0 else ([], 0)
+
+    provider = FakeProvider()
+    result = asyncio.run(
+        spool.spool_symbol(
+            provider=provider,
+            symbol=SymbolInfo(symbol="605123.SH", code="605123", exchange="SH", name="sample"),
+            timeframe="5f",
+            start_dt=spool.parse_boundary("2026-04-18", end_of_day=False),
+            end_dt=spool.parse_boundary("2026-04-30", end_of_day=True),
+            output_root=tmp_path,
+            page_size=1,
+            max_pages_per_symbol=0,
+            sleep=0,
+        )
+    )
+
+    assert provider.offsets == [0, 1]
+    assert result.pages == 1
+    assert result.bars == 0
+    assert result.exhausted is True

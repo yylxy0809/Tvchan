@@ -96,6 +96,18 @@ def test_pytdx_symbol_market_mapping() -> None:
     assert _split_tdx_symbol("000001.SZ") == (0, "000001")
     assert _split_tdx_symbol("600519.SH") == (1, "600519")
     assert _split_tdx_symbol("600000") == (1, "600000")
+    assert _split_tdx_symbol("510300.SH") == (1, "510300")
+    assert _split_tdx_symbol("510300") == (1, "510300")
+    assert _split_tdx_symbol("159915.SZ") == (0, "159915")
+    assert _split_tdx_symbol("159915") == (0, "159915")
+
+
+@pytest.mark.parametrize(
+    "symbol", ["920047.BJ", "920047", "430047", "00700.HK", "000001.UNKNOWN"]
+)
+def test_pytdx_symbol_market_mapping_rejects_unsupported_exchange(symbol: str) -> None:
+    with pytest.raises(ValueError, match="SH/SZ"):
+        _split_tdx_symbol(symbol)
 
 
 def test_pytdx_timeframe_mapping_keeps_monthly_1m() -> None:
@@ -111,6 +123,48 @@ def test_pytdx_timeout_is_configurable() -> None:
     provider = PytdxProvider(host="124.70.199.56", timeout=12, retries=4)
     assert provider.timeout == 12
     assert provider.retries == 4
+
+
+@pytest.mark.parametrize("comparator_offset", [9, 11])
+def test_pytdx_raw_page_uses_adjacent_overlap_and_reports_raw_count(comparator_offset: int) -> None:
+    def row(value: str) -> dict:
+        return {
+            "datetime": value,
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.5,
+            "close": 10.5,
+            "vol": 1000.0,
+            "amount": 1234.5,
+        }
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def get_security_bars(self, _category, market, code, offset, limit):
+            self.calls.append((market, code, offset, limit))
+            if offset == 10:
+                return [row("2026-07-10 13:00")]
+            if offset == comparator_offset:
+                return [row("2026-07-10 11:30")]
+            return [row("2026-07-10 13:05")]
+
+    api = FakeApi()
+    provider = PytdxProvider()
+    provider._get_connected_api = lambda _factory: api
+
+    bars, raw_count = provider._get_bars_page_with_raw_count_sync(
+        "000001.SZ", "5f", 10, 1
+    )
+
+    assert bars == []
+    assert raw_count == 1
+    assert api.calls == [
+        (0, "000001", 10, 1),
+        (0, "000001", 9, 1),
+        (0, "000001", 11, 1),
+    ]
 
 
 def test_pytdx_a_share_code_filter() -> None:
@@ -583,6 +637,125 @@ def test_history_backfill_process_task_advances_offsets_until_exhausted() -> Non
     assert [item["next_offset"] for item in writer.records] == [3, 4]
     assert [item["exhausted"] for item in writer.records] == [False, True]
     assert task_store.yields == []
+
+
+def test_history_backfill_advances_by_raw_rows_when_pytdx_filters_a_duplicate() -> None:
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.offsets = []
+
+        async def get_bars_page_with_raw_count(self, symbol, timeframe, *, offset, limit):
+            self.offsets.append(offset)
+            if offset == 0:
+                return ([_fake_bar(symbol, timeframe, 0), _fake_bar(symbol, timeframe, 1)], 3)
+            if offset == 3:
+                return ([_fake_bar(symbol, timeframe, 3)], 1)
+            return ([], 0)
+
+    class FakeKlineWriter:
+        def __init__(self) -> None:
+            self.records = []
+
+        async def commit_history_backfill_page(self, **kwargs):
+            self.records.append(kwargs)
+            return len(kwargs["bars"])
+
+    class FakeTaskStore:
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def yield_task(self, **_kwargs):
+            raise AssertionError("exhausted task must not yield")
+
+        async def record_failure(self, **kwargs):
+            raise AssertionError(f"unexpected failure: {kwargs}")
+
+    provider = FakeProvider()
+    writer = FakeKlineWriter()
+    result = asyncio.run(
+        process_history_task(
+            provider=provider,
+            kline_writer=writer,
+            task_store=FakeTaskStore(),
+            task={
+                "id": 10,
+                "symbol": "000001.SZ",
+                "timeframe": 5,
+                "page_size": 3,
+                "next_offset": 0,
+                "claim_token": "claim-raw-offset",
+                "lease_version": 1,
+            },
+            max_pages_per_task=0,
+            sleep=0,
+            lease_seconds=300,
+        )
+    )
+
+    assert result == {"pages": 2, "bars": 3}
+    assert provider.offsets == [0, 3]
+    assert [item["next_offset"] for item in writer.records] == [3, 4]
+    assert [item["exhausted"] for item in writer.records] == [False, True]
+
+
+def test_history_backfill_commits_progress_for_fully_filtered_raw_page() -> None:
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.offsets = []
+
+        async def get_bars_page_with_raw_count(self, symbol, timeframe, *, offset, limit):
+            self.offsets.append(offset)
+            if offset == 0:
+                return ([], 2)
+            if offset == 2:
+                return ([_fake_bar(symbol, timeframe, 2)], 1)
+            return ([], 0)
+
+    class FakeKlineWriter:
+        def __init__(self) -> None:
+            self.records = []
+
+        async def commit_history_backfill_page(self, **kwargs):
+            self.records.append(kwargs)
+            return len(kwargs["bars"])
+
+    class FakeTaskStore:
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def yield_task(self, **_kwargs):
+            raise AssertionError("exhausted task must not yield")
+
+        async def record_failure(self, **kwargs):
+            raise AssertionError(f"unexpected failure: {kwargs}")
+
+    provider = FakeProvider()
+    writer = FakeKlineWriter()
+    result = asyncio.run(
+        process_history_task(
+            provider=provider,
+            kline_writer=writer,
+            task_store=FakeTaskStore(),
+            task={
+                "id": 11,
+                "symbol": "000001.SZ",
+                "timeframe": 5,
+                "page_size": 2,
+                "next_offset": 0,
+                "claim_token": "claim-empty-page",
+                "lease_version": 1,
+            },
+            max_pages_per_task=0,
+            sleep=0,
+            lease_seconds=300,
+        )
+    )
+
+    assert result == {"pages": 2, "bars": 1}
+    assert provider.offsets == [0, 2]
+    assert [item["next_offset"] for item in writer.records] == [2, 3]
+    assert writer.records[0]["bars"] == []
+    assert [item["exhausted"] for item in writer.records] == [False, True]
 
 
 def test_history_backfill_processes_tasks_with_bounded_concurrency() -> None:

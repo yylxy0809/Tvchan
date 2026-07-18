@@ -183,6 +183,17 @@ def test_pytdx_discards_1300_when_both_amounts_are_null() -> None:
     assert [(bar.ts.hour, bar.ts.minute) for bar in rows] == [(11, 30)]
 
 
+def test_pytdx_page_uses_overlap_only_as_lunch_comparator() -> None:
+    rows = _tdx_rows_to_bars(
+        "000001.SZ",
+        "5f",
+        [_tdx_row("2026-07-10 13:00", amount=1234.5)],
+        comparator_items=[_tdx_row("2026-07-10 11:30", amount=1234.5)],
+    )
+
+    assert rows == []
+
+
 def _tdx_row(
     value: str,
     *,
