@@ -204,10 +204,17 @@ class PostgresKlineWriter:
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                if task.get("run_id") is not None:
+                    await conn.execute(
+                        "select set_config('tvchan.history_backfill_scoped_run_id', $1, true)",
+                        str(task["run_id"]),
+                    )
                 owned = await conn.fetchrow(
                     """
                     select task.id,
                            task.timeframe,
+                           task.run_id,
+                           task.stop_at,
                            symbol.code || '.' || symbol.exchange as symbol
                       from historical_backfill_tasks task
                       join symbols symbol on symbol.id = task.symbol_id
@@ -217,12 +224,16 @@ class PostgresKlineWriter:
                        and task.lease_version = $3
                        and task.lease_until > clock_timestamp()
                        and task.next_offset = $4
+                       and task.run_id is not distinct from $5::uuid
+                       and task.stop_at is not distinct from $6::timestamptz
                      for update of task, symbol
                     """,
                     task_id,
                     claim_token,
                     lease_version,
                     expected_offset,
+                    task.get("run_id"),
+                    task.get("stop_at"),
                 )
                 if owned is None:
                     raise LostBackfillLease(
@@ -230,12 +241,20 @@ class PostgresKlineWriter:
                     )
                 authoritative_symbol = str(owned["symbol"])
                 authoritative_timeframe = int(owned["timeframe"])
+                authoritative_stop_at = owned["stop_at"]
                 if (
                     str(task.get("symbol") or "") != authoritative_symbol
                     or int(task.get("timeframe") or -1) != authoritative_timeframe
                 ):
                     raise ValueError(
                         f"historical backfill claimed scope mismatch for task {task_id}"
+                    )
+                if any(
+                    authoritative_stop_at is not None and row[2] <= authoritative_stop_at
+                    for row in rows
+                ):
+                    raise ValueError(
+                        f"historical backfill page crosses scoped stop_at for task {task_id}"
                     )
                 if any(
                     str(row[0]) != authoritative_symbol
@@ -286,6 +305,8 @@ class PostgresKlineWriter:
                        and claim_token = $2
                        and lease_version = $3
                        and next_offset = $11
+                       and run_id is not distinct from $12::uuid
+                       and stop_at is not distinct from $13::timestamptz
                     returning id
                     """,
                     task_id,
@@ -299,6 +320,8 @@ class PostgresKlineWriter:
                     exhausted,
                     max(1, lease_seconds),
                     expected_offset,
+                    task.get("run_id"),
+                    task.get("stop_at"),
                 )
                 if updated is None:
                     raise LostBackfillLease(

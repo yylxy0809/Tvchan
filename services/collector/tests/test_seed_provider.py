@@ -34,6 +34,8 @@ from collector.tdx_csv_import import (
 from collector.history_backfill import (
     DB_TO_TIMEFRAME as HISTORY_DB_TO_TIMEFRAME,
     get_provider_page,
+    load_symbols_file,
+    parse_stop_at,
     process_task as process_history_task,
     process_tasks_concurrently as process_history_tasks_concurrently,
 )
@@ -554,6 +556,40 @@ def test_history_backfill_db_timeframe_mapping() -> None:
     assert HISTORY_DB_TO_TIMEFRAME[43200] == "1m"
 
 
+def test_history_backfill_loads_explicit_symbols_file(tmp_path) -> None:
+    path = tmp_path / "symbols.txt"
+    path.write_text("# scoped tail\n000001.SZ\n600000.SH\n", encoding="utf-8")
+
+    symbols = load_symbols_file(path)
+
+    assert [item.symbol for item in symbols] == ["000001.SZ", "600000.SH"]
+
+    path.write_text("000001.SZ\n000001.SZ\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate symbol"):
+        load_symbols_file(path)
+    path.write_text("000001.sz\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="canonical SH/SZ"):
+        load_symbols_file(path)
+
+
+def test_history_backfill_parses_exact_stop_at_for_every_timeframe() -> None:
+    cutoffs = parse_stop_at(
+        "5f=2026-07-17T07:00:00Z,30f=2026-07-17T07:00:00+00:00",
+        ["5f", "30f"],
+    )
+
+    assert cutoffs == {
+        "5f": datetime(2026, 7, 17, 7, 0, tzinfo=UTC),
+        "30f": datetime(2026, 7, 17, 7, 0, tzinfo=UTC),
+    }
+    with pytest.raises(ValueError, match="missing timeframes"):
+        parse_stop_at("5f=2026-07-17T07:00:00Z", ["5f", "30f"])
+    with pytest.raises(ValueError, match="Shanghai 15:00"):
+        parse_stop_at(
+            "5f=2026-07-17T07:01:00Z", ["5f"], canonical_tail_labels=True
+        )
+
+
 def test_history_backfill_provider_page_prefers_native_paging() -> None:
     class FakeProvider:
         def __init__(self) -> None:
@@ -880,6 +916,107 @@ def test_history_backfill_keeps_ownership_until_an_explicit_yield() -> None:
     ]
 
 
+def test_history_backfill_stop_at_writes_only_tail_and_completes() -> None:
+    cutoff = datetime(2026, 7, 17, 7, 0, tzinfo=UTC)
+
+    class FakeProvider:
+        async def get_bars_page(self, symbol, timeframe, *, offset, limit):
+            return [
+                _fake_bar_at(symbol, timeframe, cutoff.replace(hour=6)),
+                _fake_bar_at(symbol, timeframe, cutoff.replace(hour=8)),
+            ]
+
+    class FakeKlineWriter:
+        def __init__(self) -> None:
+            self.record = None
+
+        async def commit_history_backfill_page(self, **kwargs):
+            self.record = kwargs
+            return len(kwargs["bars"])
+
+    class FakeTaskStore:
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def yield_task(self, **_kwargs):
+            raise AssertionError("stop-at task must complete, not yield")
+
+        async def record_failure(self, **kwargs):
+            raise AssertionError(f"unexpected failure: {kwargs}")
+
+    writer = FakeKlineWriter()
+    result = asyncio.run(
+        process_history_task(
+            provider=FakeProvider(),
+            kline_writer=writer,
+            task_store=FakeTaskStore(),
+            task={
+                "id": 12, "symbol": "000001.SZ", "timeframe": 5,
+                "page_size": 2, "next_offset": 0,
+                "claim_token": "claim-stop", "lease_version": 1,
+            },
+            max_pages_per_task=1,
+            sleep=0,
+            lease_seconds=300,
+            stop_at=cutoff,
+        )
+    )
+
+    assert result == {"pages": 1, "bars": 1}
+    assert [bar.ts for bar in writer.record["bars"]] == [cutoff.replace(hour=8)]
+    assert writer.record["exhausted"] is True
+
+
+def test_history_backfill_stop_at_yields_until_page_reaches_boundary() -> None:
+    cutoff = datetime(2026, 7, 17, 7, 0, tzinfo=UTC)
+
+    class FakeProvider:
+        async def get_bars_page(self, symbol, timeframe, *, offset, limit):
+            return [_fake_bar_at(symbol, timeframe, cutoff.replace(hour=8))]
+
+    class FakeKlineWriter:
+        def __init__(self) -> None:
+            self.records = []
+
+        async def commit_history_backfill_page(self, **kwargs):
+            self.records.append(kwargs)
+            return len(kwargs["bars"])
+
+    class FakeTaskStore:
+        def __init__(self) -> None:
+            self.yields = []
+
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def yield_task(self, **kwargs):
+            self.yields.append(kwargs)
+            return True
+
+        async def record_failure(self, **kwargs):
+            raise AssertionError(f"unexpected failure: {kwargs}")
+
+    writer = FakeKlineWriter()
+    store = FakeTaskStore()
+    asyncio.run(
+        process_history_task(
+            provider=FakeProvider(), kline_writer=writer, task_store=store,
+            task={
+                "id": 13, "symbol": "000001.SZ", "timeframe": 5,
+                "page_size": 1, "next_offset": 0,
+                "claim_token": "claim-no-stop", "lease_version": 1,
+            },
+            max_pages_per_task=1, sleep=0, lease_seconds=300, stop_at=cutoff,
+        )
+    )
+
+    assert [bar.ts for bar in writer.records[0]["bars"]] == [cutoff.replace(hour=8)]
+    assert writer.records[0]["exhausted"] is False
+    assert store.yields == [
+        {"task_id": 13, "claim_token": "claim-no-stop", "lease_version": 1}
+    ]
+
+
 def _fake_bar(symbol: str, timeframe: str, index: int) -> Bar:
     return Bar(
         symbol=symbol,
@@ -891,5 +1028,13 @@ def _fake_bar(symbol: str, timeframe: str, index: int) -> Bar:
         close=float(index),
         volume=100 + index,
         source="pytdx",
+    )
+
+
+def _fake_bar_at(symbol: str, timeframe: str, timestamp: datetime) -> Bar:
+    return Bar(
+        symbol=symbol, timeframe=timeframe, ts=timestamp,
+        open=1.0, high=1.1, low=0.9, close=1.0,
+        volume=100, source="pytdx",
     )
 
