@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -9,6 +11,9 @@ import pytest
 
 from collector.aggregate_increment_import import (
     AggregateTask,
+    ALL_STAGE_MATCH_SQL,
+    _batch_timestamp_bounds,
+    _fetch_stage_mismatch,
     bind_quarantines_to_run,
     discover_tasks,
     load_authoritative_symbol_meta,
@@ -227,12 +232,30 @@ def test_append_only_sql_contract_is_present() -> None:
     assert "is distinct from" in normalized
     assert "existing.revision is distinct from stage.revision" in normalized
     assert "existing.source is distinct from stage.source" in normalized
+    assert "existing.ts >= $1" in normalized
+    assert "existing.ts <= $2" in normalized
     assert "raise" not in normalized
     assert "stage.bar_end > scope.original_max" in " ".join(INSERT_NEW_ROWS_SQL.lower().split())
     assert "on conflict" in INSERT_NEW_ROWS_SQL.lower()
     locked = " ".join(LOCK_ACTIVE_SYMBOLS_SQL.lower().split())
     assert "symbol.is_active is true" in locked
     assert "for share of symbol" in locked
+
+
+def test_batch_timestamp_bounds_cover_every_staged_bar() -> None:
+    early = datetime(2026, 7, 6, 9, 30)
+    late = datetime(2026, 7, 10, 15, 0)
+    bars = [
+        ("000001", "SZ", 30, late),
+        ("600519", "SH", 30, early),
+        ("688001", "SH", 30, datetime(2026, 7, 8, 10, 0)),
+    ]
+
+    assert _batch_timestamp_bounds(bars) == (early, late)
+
+    conn = AsyncMock()
+    asyncio.run(_fetch_stage_mismatch(conn, ALL_STAGE_MATCH_SQL, bars))
+    conn.fetchrow.assert_awaited_once_with(ALL_STAGE_MATCH_SQL, early, late)
 
 
 def test_run_identity_binds_canary_selection_and_exchange_policy(tmp_path: Path) -> None:
