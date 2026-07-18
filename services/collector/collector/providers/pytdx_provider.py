@@ -51,6 +51,15 @@ TIMEFRAME_TO_TDX_CATEGORY: dict[str, str] = {
     "1m": "KLINE_TYPE_MONTHLY",
 }
 
+_BARE_SH_PREFIXES = (
+    "600", "601", "603", "605", "688", "689",
+    "510", "511", "512", "513", "515", "516", "517", "518", "588",
+)
+_BARE_SZ_PREFIXES = (
+    "000", "001", "002", "003", "300", "301",
+    "159", "160", "161", "162", "163", "164", "165", "166", "167", "168", "169",
+)
+
 
 class PytdxProvider(MarketDataProvider):
     name = "pytdx"
@@ -132,8 +141,24 @@ class PytdxProvider(MarketDataProvider):
         offset: int,
         limit: int,
     ) -> list[Bar]:
+        bars, _raw_count = await self.get_bars_page_with_raw_count(
+            symbol,
+            timeframe,
+            offset=offset,
+            limit=limit,
+        )
+        return bars
+
+    async def get_bars_page_with_raw_count(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[Bar], int]:
         return await asyncio.to_thread(
-            self._get_bars_page_sync,
+            self._get_bars_page_with_raw_count_sync,
             symbol,
             timeframe,
             offset,
@@ -147,6 +172,18 @@ class PytdxProvider(MarketDataProvider):
         offset: int,
         limit: int,
     ) -> list[Bar]:
+        bars, _raw_count = self._get_bars_page_with_raw_count_sync(
+            symbol, timeframe, offset, limit
+        )
+        return bars
+
+    def _get_bars_page_with_raw_count_sync(
+        self,
+        symbol: str,
+        timeframe: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[Bar], int]:
         from pytdx.hq import TdxHq_API
         from pytdx.params import TDXParams
 
@@ -162,6 +199,15 @@ class PytdxProvider(MarketDataProvider):
                     break
                 try:
                     raw = api.get_security_bars(category, market, code, offset, limit) or []
+                    comparator_items: list[dict] = []
+                    if _raw_page_needs_lunch_comparator(normalized, raw):
+                        if offset > 0:
+                            comparator_items.extend(
+                                api.get_security_bars(category, market, code, offset - 1, 1) or []
+                            )
+                        comparator_items.extend(
+                            api.get_security_bars(category, market, code, offset + len(raw), 1) or []
+                        )
                     break
                 except Exception as exc:
                     last_error = exc
@@ -174,7 +220,15 @@ class PytdxProvider(MarketDataProvider):
                     "to inspect connectivity, or pass --tdx-host."
                 ) from last_error
 
-        return _tdx_rows_to_bars(symbol, normalized, raw)
+        return (
+            _tdx_rows_to_bars(
+                symbol,
+                normalized,
+                raw,
+                comparator_items=comparator_items,
+            ),
+            len(raw),
+        )
 
     async def healthcheck(self) -> ProviderHealth:
         try:
@@ -295,9 +349,20 @@ def _split_tdx_symbol(symbol: str) -> tuple[int, str]:
     normalized = symbol.strip().upper()
     if "." in normalized:
         code, exchange = normalized.split(".", 1)
+        if exchange not in {"SH", "SZ"}:
+            raise ValueError(
+                f"pytdx only supports SH/SZ symbols; unsupported exchange in {normalized}"
+            )
     else:
         code = normalized
-        exchange = "SH" if code.startswith("6") else "SZ"
+        if code.startswith(_BARE_SH_PREFIXES):
+            exchange = "SH"
+        elif code.startswith(_BARE_SZ_PREFIXES):
+            exchange = "SZ"
+        else:
+            raise ValueError(
+                f"pytdx only supports unambiguous SH/SZ symbols; explicit exchange required: {normalized}"
+            )
     market = 1 if exchange == "SH" else 0
     return market, code
 
@@ -362,7 +427,13 @@ def _tdx_bar_to_bar(symbol: str, timeframe: str, item: dict) -> Bar:
     )
 
 
-def _tdx_rows_to_bars(symbol: str, timeframe: str, items: list[dict]) -> list[Bar]:
+def _tdx_rows_to_bars(
+    symbol: str,
+    timeframe: str,
+    items: list[dict],
+    *,
+    comparator_items: list[dict] | None = None,
+) -> list[Bar]:
     normalized = normalize_timeframe(timeframe)
     if normalized not in {"5f", "15f", "30f", "1h"}:
         return sorted(
@@ -371,9 +442,12 @@ def _tdx_rows_to_bars(symbol: str, timeframe: str, items: list[dict]) -> list[Ba
         )
 
     parsed_rows = [(item, _parse_tdx_raw_datetime(item)) for item in items]
+    comparator_rows = [
+        (item, _parse_tdx_raw_datetime(item)) for item in (comparator_items or [])
+    ]
     morning_closes = {
         timestamp.date(): item
-        for item, timestamp in parsed_rows
+        for item, timestamp in (*parsed_rows, *comparator_rows)
         if (timestamp.hour, timestamp.minute) == (11, 30)
     }
     retained: list[dict] = []
@@ -401,6 +475,20 @@ def _tdx_rows_to_bars(symbol: str, timeframe: str, items: list[dict]) -> list[Ba
     return sorted(
         [_tdx_bar_to_bar(symbol, normalized, item) for item in retained],
         key=lambda bar: bar.ts,
+    )
+
+
+def _raw_page_needs_lunch_comparator(timeframe: str, items: list[dict]) -> bool:
+    if timeframe not in {"5f", "15f", "30f", "1h"}:
+        return False
+    parsed = [_parse_tdx_raw_datetime(item) for item in items]
+    morning_dates = {
+        timestamp.date() for timestamp in parsed if (timestamp.hour, timestamp.minute) == (11, 30)
+    }
+    return any(
+        (timestamp.hour, timestamp.minute) == (13, 0)
+        and timestamp.date() not in morning_dates
+        for timestamp in parsed
     )
 
 

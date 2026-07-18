@@ -260,7 +260,7 @@ async def process_task(
         while max_pages_per_task <= 0 or pages < max_pages_per_task:
             if lease_lost.is_set():
                 raise LostBackfillLease(f"historical backfill task lease lost: {task['id']}")
-            bars = await get_provider_page(
+            bars, raw_rows_read = await get_provider_page_with_raw_count(
                 provider,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -270,8 +270,8 @@ async def process_task(
             if lease_lost.is_set():
                 raise LostBackfillLease(f"historical backfill task lease lost: {task['id']}")
             bars_read = len(bars)
-            exhausted = bars_read < page_size
-            next_offset = offset + bars_read
+            exhausted = raw_rows_read < page_size
+            next_offset = offset + raw_rows_read
             oldest_ts = min((bar.ts for bar in bars), default=None)
             newest_ts = max((bar.ts for bar in bars), default=None)
             bars_written = await kline_writer.commit_history_backfill_page(
@@ -291,6 +291,7 @@ async def process_task(
                 offset=offset,
                 next_offset=next_offset,
                 bars_read=bars_read,
+                raw_rows_read=raw_rows_read,
                 bars_written=bars_written,
                 exhausted=exhausted,
             )
@@ -350,15 +351,42 @@ async def get_provider_page(
     offset: int,
     limit: int,
 ) -> list[Bar]:
-    if hasattr(provider, "get_bars_page"):
-        return await provider.get_bars_page(
+    bars, _raw_count = await get_provider_page_with_raw_count(
+        provider,
+        symbol=symbol,
+        timeframe=timeframe,
+        offset=offset,
+        limit=limit,
+    )
+    return bars
+
+
+async def get_provider_page_with_raw_count(
+    provider,
+    *,
+    symbol: str,
+    timeframe: str,
+    offset: int,
+    limit: int,
+) -> tuple[list[Bar], int]:
+    if hasattr(provider, "get_bars_page_with_raw_count"):
+        return await provider.get_bars_page_with_raw_count(
             symbol,
             timeframe,
             offset=offset,
             limit=limit,
         )
+    if hasattr(provider, "get_bars_page"):
+        bars = await provider.get_bars_page(
+            symbol,
+            timeframe,
+            offset=offset,
+            limit=limit,
+        )
+        return bars, len(bars)
     bars = await provider.get_bars(symbol, timeframe, limit=offset + limit)
-    return bars[offset : offset + limit]
+    page = bars[offset : offset + limit]
+    return page, len(page)
 
 
 async def sleep_between_requests(seconds: float) -> None:

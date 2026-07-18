@@ -166,26 +166,37 @@ async def spool_symbol(
     exhausted = False
     try:
         while max_pages_per_symbol <= 0 or pages < max_pages_per_symbol:
-            bars = await provider.get_bars_page(symbol.symbol, timeframe, offset=offset, limit=page_size)
-            if not bars:
+            if hasattr(provider, "get_bars_page_with_raw_count"):
+                bars, raw_rows_read = await provider.get_bars_page_with_raw_count(
+                    symbol.symbol, timeframe, offset=offset, limit=page_size
+                )
+            else:
+                bars = await provider.get_bars_page(
+                    symbol.symbol, timeframe, offset=offset, limit=page_size
+                )
+                raw_rows_read = len(bars)
+            if raw_rows_read == 0:
                 exhausted = True
                 break
             filtered = [bar for bar in bars if start_dt <= bar.ts <= end_dt]
             for bar in filtered:
                 bars_by_ts[bar.ts] = bar
             pages += 1
-            offset += len(bars)
-            oldest = min(bar.ts for bar in bars)
-            exhausted = len(bars) < page_size or oldest < start_dt
+            offset += raw_rows_read
+            oldest = min((bar.ts for bar in bars), default=None)
+            exhausted = raw_rows_read < page_size or (
+                oldest is not None and oldest < start_dt
+            )
             emit(
                 "pytdx_5f_spool_page",
                 symbol=symbol.symbol,
                 page=pages,
                 offset=offset,
                 bars_read=len(bars),
+                raw_rows_read=raw_rows_read,
                 bars_kept=len(filtered),
-                oldest=oldest.isoformat(),
-                newest=max(bar.ts for bar in bars).isoformat(),
+                oldest=oldest.isoformat() if oldest else None,
+                newest=max((bar.ts for bar in bars), default=None).isoformat() if bars else None,
                 exhausted=exhausted,
             )
             if exhausted:
