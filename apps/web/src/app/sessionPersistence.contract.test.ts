@@ -7,6 +7,7 @@ import {
   loadSavedToken,
   persistSession,
 } from "./sessionPersistence";
+import { SessionAuthorityFence } from "../auth/sessionAuthorityFence";
 
 const originalWindow = globalThis.window;
 
@@ -119,4 +120,75 @@ test("App resets chart transports at authentication session boundaries", () => {
   );
   assert.match(authenticated, /chartDataManager\.resetSession\(\)/);
   assert.match(logout, /chartDataManager\.resetSession\(\)/);
+});
+
+test("a prior admin generation cannot clear a newly authenticated session", () => {
+  const fence = new SessionAuthorityFence();
+  let sessionToken: string | null = "admin-a";
+  let persistedToken: string | null = "admin-a";
+  let transportResets = 0;
+  const generationA = fence.activate();
+  const logout = () => {
+    fence.invalidate();
+    sessionToken = null;
+    persistedToken = null;
+    transportResets += 1;
+  };
+
+  logout();
+  sessionToken = "admin-b";
+  persistedToken = "admin-b";
+  const generationB = fence.activate();
+  const resetsBeforeLateFailure = transportResets;
+
+  assert.equal(fence.runIfCurrent(generationA, logout), false);
+  assert.equal(sessionToken, "admin-b");
+  assert.equal(persistedToken, "admin-b");
+  assert.equal(transportResets, resetsBeforeLateFailure);
+
+  assert.equal(fence.runIfCurrent(generationB, logout), true);
+  assert.equal(sessionToken, null);
+  assert.equal(persistedToken, null);
+  assert.equal(transportResets, resetsBeforeLateFailure + 1);
+});
+
+test("session generation, not token identity, fences a same-token relogin", () => {
+  const fence = new SessionAuthorityFence();
+  const firstGeneration = fence.activate();
+  fence.invalidate();
+  const secondGeneration = fence.activate();
+  let activeToken: string | null = "same-admin-token";
+
+  assert.notEqual(firstGeneration, secondGeneration);
+  assert.equal(
+    fence.runIfCurrent(firstGeneration, () => { activeToken = null; }),
+    false,
+  );
+  assert.equal(activeToken, "same-admin-token");
+  assert.equal(
+    fence.runIfCurrent(secondGeneration, () => { activeToken = null; }),
+    true,
+  );
+  assert.equal(activeToken, null);
+});
+
+test("App binds Admin auth failures to the current session authority generation", () => {
+  const appSource = readFileSync(new URL("../App.tsx", import.meta.url), "utf8");
+  const authenticated = appSource.slice(
+    appSource.indexOf("function handleAuthenticated"),
+    appSource.indexOf("function handleLogout"),
+  );
+  const logout = appSource.slice(
+    appSource.indexOf("function handleLogout"),
+    appSource.indexOf("if (restoringSession)"),
+  );
+
+  assert.match(appSource, /new SessionAuthorityFence\(\)/);
+  assert.match(authenticated, /sessionAuthority\.activate\(\)/);
+  assert.match(logout, /sessionAuthority\.invalidate\(\)/);
+  assert.match(appSource, /sessionAuthority\.runIfCurrent\(generation, handleLogout\)/);
+  assert.match(
+    appSource,
+    /onAuthenticationFailure=\{\(\) => handleSessionAuthenticationFailure\(sessionGeneration\)\}/,
+  );
 });

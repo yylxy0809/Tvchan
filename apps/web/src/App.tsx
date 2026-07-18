@@ -11,6 +11,7 @@ import {
 import { ChartWorkspace } from "./components/ChartWorkspace";
 import { AdminConsole } from "./components/AdminConsole";
 import { LoginPage } from "./components/LoginPage";
+import { SessionAuthorityFence } from "./auth/sessionAuthorityFence";
 
 type AppView = "chart" | "admin";
 
@@ -22,6 +23,7 @@ export default function App() {
   const [session, setSession] = useState<AuthSession | null>(null);
   const [restoringSession, setRestoringSession] = useState(Boolean(initialLoginToken));
   const [view, setView] = useState<AppView>("chart");
+  const [sessionAuthority] = useState(() => new SessionAuthorityFence());
 
   useEffect(() => {
     if (!initialLoginToken) return;
@@ -30,8 +32,7 @@ export default function App() {
     void loginWithToken(initialLoginToken)
       .then((next) => {
         if (!active) return;
-        persistSession(next);
-        setSession(next);
+        handleAuthenticated(next);
       })
       .catch((error: unknown) => {
         if (!active) return;
@@ -49,6 +50,7 @@ export default function App() {
   }, [initialLoginToken]);
 
   function handleAuthenticated(next: AuthSession) {
+    sessionAuthority.activate();
     chartDataManager.resetSession();
     persistSession(next);
     setLoginHint(next.token);
@@ -57,11 +59,16 @@ export default function App() {
   }
 
   function handleLogout() {
+    sessionAuthority.invalidate();
     chartDataManager.resetSession();
     clearSavedSessionMeta();
     setLoginHint("");
     setSession(null);
     setView("chart");
+  }
+
+  function handleSessionAuthenticationFailure(generation: number) {
+    sessionAuthority.runIfCurrent(generation, handleLogout);
   }
 
   if (restoringSession) {
@@ -86,6 +93,8 @@ export default function App() {
       />
     );
   }
+
+  const sessionGeneration = sessionAuthority.capture();
 
   return (
     <>
@@ -120,7 +129,7 @@ export default function App() {
           </header>
           <AdminConsole
             adminToken={session.token}
-            onAuthenticationFailure={handleLogout}
+            onAuthenticationFailure={() => handleSessionAuthenticationFailure(sessionGeneration)}
           />
         </main>
       ) : null}
