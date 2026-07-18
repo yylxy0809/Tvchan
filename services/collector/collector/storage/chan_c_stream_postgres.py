@@ -131,13 +131,16 @@ class PostgresChanCStreamStore:
                       and head.base_timeframe = head.chan_level
                       and head.chan_level = any($1::int[])
                       and head.mode = any($2::text[])
-                      and coalesce(
-                          case
-                              when head.chan_level in (10080, 43200) then closed_bar.target_bar_end
-                              else ingest.last_bar_end
-                          end,
-                          '-infinity'::timestamptz
-                      ) > head.base_to_bar_end
+                      and case
+                          when head.chan_level = 10080 then
+                              date_trunc('week', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
+                              > date_trunc('week', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                          when head.chan_level = 43200 then
+                              date_trunc('month', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
+                              > date_trunc('month', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                          else coalesce(ingest.last_bar_end, '-infinity'::timestamptz)
+                              > head.base_to_bar_end
+                      end
                       and (
                           $5::text[] is null
                           or (s.code || '.' || s.exchange) = any($5::text[])
@@ -258,7 +261,16 @@ class PostgresChanCStreamStore:
                     select
                         task.id,
                         head.base_to_bar_end,
-                        closed_bar.target_bar_end as normalized_target_bar_end
+                        closed_bar.target_bar_end as normalized_target_bar_end,
+                        case
+                            when task.chan_level = 10080 then
+                                date_trunc('week', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
+                                > date_trunc('week', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                            when task.chan_level = 43200 then
+                                date_trunc('month', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
+                                > date_trunc('month', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                            else false
+                        end as has_new_period
                     from scheme2_chan_c_tail_tasks task
                     join symbols s on s.id = task.symbol_id
                     join scheme2_chan_c_published_heads head
@@ -296,19 +308,16 @@ class PostgresChanCStreamStore:
                     update scheme2_chan_c_tail_tasks task
                     set target_bar_end = normalized.normalized_target_bar_end,
                         status = case
-                            when coalesce(normalized.normalized_target_bar_end, '-infinity'::timestamptz) <= normalized.base_to_bar_end
-                                then 'success'
-                            else 'pending'
+                            when normalized.has_new_period then 'pending'
+                            else 'success'
                         end,
                         next_run_at = case
-                            when coalesce(normalized.normalized_target_bar_end, '-infinity'::timestamptz) <= normalized.base_to_bar_end
-                                then now() + (task.schedule_interval_seconds * interval '1 second')
-                            else now()
+                            when normalized.has_new_period then now()
+                            else now() + (task.schedule_interval_seconds * interval '1 second')
                         end,
                         pending_since = case
-                            when coalesce(normalized.normalized_target_bar_end, '-infinity'::timestamptz) <= normalized.base_to_bar_end
-                                then task.pending_since
-                            else now()
+                            when normalized.has_new_period then now()
+                            else task.pending_since
                         end,
                         backoff_until = null,
                         claimed_target_bar_end = null,
@@ -320,9 +329,21 @@ class PostgresChanCStreamStore:
                         updated_at = now()
                     from normalized
                     where task.id = normalized.id
+                      and not (
+                          task.status = 'running'
+                          and coalesce(task.lease_until, '-infinity'::timestamptz) > now()
+                      )
                       and (
                           task.status = 'running'
                           or coalesce(task.target_bar_end, '-infinity'::timestamptz) is distinct from coalesce(normalized.normalized_target_bar_end, '-infinity'::timestamptz)
+                          or (
+                              not normalized.has_new_period
+                              and task.status <> 'success'
+                          )
+                          or (
+                              normalized.has_new_period
+                              and task.status = 'success'
+                          )
                       )
                     returning task.id
                 )
@@ -364,10 +385,21 @@ class PostgresChanCStreamStore:
                      and head.status = 'published'
                     where (
                           task.status in ('pending', 'failed', 'success')
-                          or (task.status = 'running' and task.lease_until <= now())
+                          or (
+                              task.status = 'running'
+                              and coalesce(task.lease_until, '-infinity'::timestamptz) <= now()
+                          )
                       )
                       and s.is_active = true
-                      and task.target_bar_end > head.base_to_bar_end
+                      and case
+                          when task.chan_level = 10080 then
+                              date_trunc('week', task.target_bar_end at time zone 'Asia/Shanghai')
+                              > date_trunc('week', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                          when task.chan_level = 43200 then
+                              date_trunc('month', task.target_bar_end at time zone 'Asia/Shanghai')
+                              > date_trunc('month', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                          else task.target_bar_end > head.base_to_bar_end
+                      end
                       and task.next_run_at <= now()
                       and coalesce(task.backoff_until, '-infinity'::timestamptz) <= now()
                       and (
@@ -432,7 +464,9 @@ class PostgresChanCStreamStore:
                     task.target_bar_end as last_bar_end,
                     task.expected_head_run_id,
                     task.expected_head_base_to_bar_end,
-                    task.claim_token
+                    task.claim_token,
+                    task.lease_version,
+                    task.claimed_target_bar_end
                 """,
                 max(1, limit),
                 worker_id,
@@ -502,6 +536,7 @@ class PostgresChanCStreamStore:
                     claimed_target_bar_end = null,
                     updated_at = now()
                 where id = $1
+                  and status = 'running'
                   and claim_token = $2
                 """,
                 task_id,

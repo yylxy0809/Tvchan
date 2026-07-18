@@ -24,6 +24,7 @@ from collector.realtime_publisher import publish_chan_head_update
 from collector.storage.chan_c_stream_postgres import PostgresChanCStreamStore
 from collector.storage.chan_postgres import MODULE_C_CHAN_TABLES, PostgresChanWriter
 from collector.storage.postgres import PostgresKlineWriter
+from trading_protocol import kline_logical_key
 from trading_protocol.timeframes import TIMEFRAMES
 
 DB_TO_TIMEFRAME = {value.minutes: code for code, value in TIMEFRAMES.items()}
@@ -268,20 +269,6 @@ async def process_tail_tasks(
                     context_bars=context_bars,
                     redis_url=redis_url,
                 )
-                bar_until = max(
-                    (
-                        job.get("last_bar_end")
-                        for job in jobs
-                        if job.get("last_bar_end")
-                    ),
-                    default=None,
-                )
-                for job in jobs:
-                    await task_store.complete_tail_task(
-                        task_id=int(job["id"]),
-                        claim_token=str(job["claim_token"]),
-                        bar_until=bar_until,
-                    )
                 return runs
             except Exception as exc:
                 for job in jobs:
@@ -322,7 +309,7 @@ async def process_symbol_tail(
                 level=level,
                 reason="missing_anchor",
             )
-            continue
+            raise RuntimeError(f"missing_tail_anchor: {symbol} {level}")
         tail_start = min(anchors)
         query_after_ts = tail_start - timedelta(
             minutes=TIMEFRAMES[level].minutes * context_bars
@@ -340,89 +327,100 @@ async def process_symbol_tail(
                 level=level,
                 reason="no_tail_bars",
             )
-            continue
+            raise RuntimeError(f"no_tail_bars: {symbol} {level}")
         latest_required = max(
             job.get("last_bar_end") or job["anchor_bar_end"] for job in level_jobs
         )
-        if bars[-1].ts < latest_required:
+        if kline_logical_key(level, bars[-1].ts) < kline_logical_key(
+            level, latest_required
+        ):
             raise RuntimeError(
                 "tail_bar_limit_exhausted: "
                 f"{symbol} {level} requires bars through {latest_required.isoformat()}, "
                 f"but only loaded through {bars[-1].ts.isoformat()} with limit {tail_bar_limit}"
             )
 
-        modes = sorted({str(job["mode"]) for job in level_jobs})
-        response = await compute_module_c_overlay(
-            symbol=symbol,
-            levels=[level],
-            modes=modes,
-            bars_by_level={level: bars},
-            chan_py_path=chan_py_path,
-        )
-        validate_module_c_response(
-            response=response,
-            symbol=symbol,
-            levels=[level],
-            bars_by_level={level: bars},
-        )
-        level_response = filter_chan_response_level(response, level)
-        for mode, mode_jobs in group_jobs_by_mode(level_jobs).items():
-            mode_anchors = [
-                job["anchor_bar_end"] for job in mode_jobs if job.get("anchor_bar_end")
-            ]
-            if not mode_anchors:
-                emit(
-                    "chan_c_stream_skipped",
-                    symbol=symbol,
-                    level=level,
-                    mode=mode,
-                    reason="missing_mode_anchor",
-                )
-                continue
-            anchor = min(mode_anchors)
-            counts = await chan_writer.replace_incremental_analysis(
-                symbol=symbol,
+        for claimed_target, target_jobs in group_jobs_by_claimed_target(
+            level_jobs
+        ).items():
+            target_bars, publication_bar_until = bars_through_claimed_period(
                 level=level,
-                modes=[mode],
-                anchor_bar_end=anchor,
-                bar_until=bars[-1].ts,
-                response=level_response,
-                expected_head_run_id=first_present(mode_jobs, "expected_head_run_id"),
-                expected_head_base_to_bar_end=first_present(
-                    mode_jobs, "expected_head_base_to_bar_end"
-                ),
-                publication_claim_token=first_present(mode_jobs, "claim_token"),
-            )
-            emit(
-                "chan_c_stream_published",
+                bars=bars,
+                claimed_target=claimed_target,
                 symbol=symbol,
-                level=level,
-                mode=mode,
-                anchor_bar_end=anchor.isoformat(),
-                bar_until=bars[-1].ts.isoformat(),
-                input_bars=len(bars),
-                **counts,
             )
-            if redis_url:
-                await publish_chan_head_update(
-                    redis_url=redis_url,
+            modes = sorted({str(job["mode"]) for job in target_jobs})
+            response = await compute_module_c_overlay(
+                symbol=symbol,
+                levels=[level],
+                modes=modes,
+                bars_by_level={level: target_bars},
+                chan_py_path=chan_py_path,
+            )
+            validate_module_c_response(
+                response=response,
+                symbol=symbol,
+                levels=[level],
+                bars_by_level={level: target_bars},
+            )
+            level_response = filter_chan_response_level(response, level)
+            for mode, mode_jobs in group_jobs_by_mode(target_jobs).items():
+                if len(mode_jobs) != 1:
+                    raise RuntimeError(
+                        "duplicate_tail_task_identity: "
+                        f"{symbol} {level} {mode} {claimed_target.isoformat()}"
+                    )
+                job = mode_jobs[0]
+                anchor = job.get("anchor_bar_end")
+                if anchor is None:
+                    emit(
+                        "chan_c_stream_skipped",
+                        symbol=symbol,
+                        level=level,
+                        mode=mode,
+                        reason="missing_mode_anchor",
+                    )
+                    raise RuntimeError(
+                        f"missing_tail_anchor: {symbol} {level} {mode}"
+                    )
+                counts = await chan_writer.replace_incremental_analysis(
                     symbol=symbol,
                     level=level,
                     modes=[mode],
-                    bar_until=bars[-1].ts,
-                    run_id=int(counts["run_id"]),
-                    snapshot_version=str(counts["snapshot_version"]),
+                    anchor_bar_end=anchor,
+                    bar_until=publication_bar_until,
+                    response=level_response,
+                    publication_task_id=int(job["id"]),
+                    publication_claim_token=str(job["claim_token"]),
+                    publication_lease_version=int(job["lease_version"]),
+                    publication_target_bar_end=claimed_target,
+                    expected_head_run_id=job.get("expected_head_run_id"),
+                    expected_head_base_to_bar_end=job.get(
+                        "expected_head_base_to_bar_end"
+                    ),
                 )
-            runs += 1
+                emit(
+                    "chan_c_stream_published",
+                    symbol=symbol,
+                    level=level,
+                    mode=mode,
+                    anchor_bar_end=anchor.isoformat(),
+                    bar_until=publication_bar_until.isoformat(),
+                    input_bars=len(target_bars),
+                    **counts,
+                )
+                if redis_url:
+                    await publish_chan_head_update(
+                        redis_url=redis_url,
+                        symbol=symbol,
+                        level=level,
+                        modes=[mode],
+                        bar_until=publication_bar_until,
+                        run_id=int(counts["run_id"]),
+                        snapshot_version=str(counts["snapshot_version"]),
+                    )
+                runs += 1
     return runs
-
-
-def first_present(items: list[dict[str, Any]], key: str) -> Any:
-    for item in items:
-        value = item.get(key)
-        if value is not None:
-            return value
-    return None
 
 
 def group_jobs_by_level(jobs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -437,6 +435,40 @@ def group_jobs_by_mode(jobs: list[dict[str, Any]]) -> dict[str, list[dict[str, A
     for job in jobs:
         grouped[str(job["mode"])].append(job)
     return dict(grouped)
+
+
+def group_jobs_by_claimed_target(
+    jobs: list[dict[str, Any]],
+) -> dict[datetime, list[dict[str, Any]]]:
+    grouped: dict[datetime, list[dict[str, Any]]] = defaultdict(list)
+    for job in jobs:
+        claimed_target = job.get("claimed_target_bar_end")
+        if not isinstance(claimed_target, datetime):
+            raise RuntimeError("Tail task is missing its frozen claimed target")
+        grouped[claimed_target].append(job)
+    return dict(grouped)
+
+
+def bars_through_claimed_period(
+    *,
+    level: str,
+    bars: list[Any],
+    claimed_target: datetime,
+    symbol: str,
+) -> tuple[list[Any], datetime]:
+    claimed_key = kline_logical_key(level, claimed_target)
+    target_bars = [
+        bar for bar in bars if kline_logical_key(level, bar.ts) <= claimed_key
+    ]
+    if (
+        not target_bars
+        or kline_logical_key(level, target_bars[-1].ts) != claimed_key
+    ):
+        raise RuntimeError(
+            "tail_claim_target_missing: "
+            f"{symbol} {level} requires claimed period {claimed_key[1].isoformat()}"
+        )
+    return target_bars, target_bars[-1].ts
 
 
 def emit(event: str, **payload: Any) -> None:

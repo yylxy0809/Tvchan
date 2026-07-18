@@ -7,6 +7,7 @@ from typing import Any
 
 from collector.historical_replay import lock_executable_replay_batch
 from collector.storage.postgres import price_to_x1000, timeframe_to_db_code
+from trading_protocol import kline_logical_key
 
 
 MODE_CODES = {
@@ -157,6 +158,10 @@ def _read_extra(extra: Any) -> dict[str, Any]:
 
 
 class StaleChanHeadError(RuntimeError):
+    pass
+
+
+class StaleTailTaskLeaseError(StaleChanHeadError):
     pass
 
 
@@ -640,11 +645,22 @@ class PostgresChanWriter:
         anchor_bar_end: datetime,
         bar_until: datetime,
         response: dict[str, Any],
-        expected_head_run_id: int | None = None,
-        expected_head_base_to_bar_end: datetime | None = None,
-        publication_claim_token: str | None = None,
+        publication_task_id: int,
+        publication_claim_token: str,
+        publication_lease_version: int,
+        publication_target_bar_end: datetime,
+        expected_head_run_id: int,
+        expected_head_base_to_bar_end: datetime,
     ) -> dict[str, Any]:
         assert self._pool is not None
+        if len(modes) != 1:
+            raise ValueError("Incremental publication requires exactly one mode task")
+        if kline_logical_key(level, bar_until) != kline_logical_key(
+            level, publication_target_bar_end
+        ):
+            raise StaleTailTaskLeaseError(
+                f"Tail publication target mismatch for {symbol} {level}"
+            )
         async with self._pool.acquire() as conn:
             symbol_id = await conn.fetchval(
                 """
@@ -741,41 +757,55 @@ class PostgresChanWriter:
                 modes=modes,
             )
 
-            run_id = await conn.fetchval(
-                f"""
-                insert into {runs_table} (
-                    symbol_id,
-                    chan_level,
-                    mode,
-                    input_signature,
-                    config_hash,
-                    bar_from,
-                    bar_until,
-                    bar_count,
-                    status,
-                    snapshot_version,
-                    computed_at,
-                    run_kind,
-                    run_group_id,
-                    cutoff_bar_end
-                )
-                values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6)
-                returning id
-                """,
-                symbol_id,
-                level_code,
-                f"{symbol}:{level}:tail:{int(anchor_bar_end.timestamp())}:{int(bar_until.timestamp())}",
-                self.tail_config_hash,
-                bar_from,
-                bar_until,
-                int(bar_count or 0),
-                snapshot_version,
-                self.run_kind,
-                self.run_group_id,
-            )
-
+            run_id: int | None = None
             try:
                 async with conn.transaction():
+                    await self._lock_tail_publication_task(
+                        conn,
+                        task_id=publication_task_id,
+                        claim_token=publication_claim_token,
+                        lease_version=publication_lease_version,
+                        symbol_id=symbol_id,
+                        level_code=level_code,
+                        mode=modes[0],
+                        base_timeframe_code=base_timeframe_code,
+                        anchor_bar_end=anchor_bar_end,
+                        claimed_target_bar_end=publication_target_bar_end,
+                        expected_head_run_id=expected_head_run_id,
+                        expected_head_base_to_bar_end=expected_head_base_to_bar_end,
+                    )
+                    run_id = await conn.fetchval(
+                        f"""
+                        insert into {runs_table} (
+                            symbol_id,
+                            chan_level,
+                            mode,
+                            input_signature,
+                            config_hash,
+                            bar_from,
+                            bar_until,
+                            bar_count,
+                            status,
+                            snapshot_version,
+                            computed_at,
+                            run_kind,
+                            run_group_id,
+                            cutoff_bar_end
+                        )
+                        values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6)
+                        returning id
+                        """,
+                        symbol_id,
+                        level_code,
+                        f"{symbol}:{level}:tail:{int(anchor_bar_end.timestamp())}:{int(bar_until.timestamp())}",
+                        self.tail_config_hash,
+                        bar_from,
+                        bar_until,
+                        int(bar_count or 0),
+                        snapshot_version,
+                        self.run_kind,
+                        self.run_group_id,
+                    )
                     stroke_count = await self._insert_stroke_like(
                         conn,
                         self.tables["strokes"],
@@ -842,28 +872,14 @@ class PostgresChanWriter:
                         dirty_from_bar_end=None,
                         last_error=None,
                     )
-            except Exception as exc:
-                await conn.execute(
-                    f"""
-                    update {runs_table}
-                    set status = 'failed',
-                        finished_at = now(),
-                        error_message = $2
-                    where id = $1
-                    """,
-                    run_id,
-                    str(exc)[:2000],
-                )
-                await self._upsert_recompute_watermarks(
-                    conn,
-                    symbol_id=symbol_id,
-                    level_code=level_code,
-                    modes=modes,
-                    base_timeframe_code=base_timeframe_code,
-                    last_computed_bar_end=None,
-                    dirty_from_bar_end=anchor_bar_end,
-                    last_error=str(exc)[:2000],
-                )
+                    await self._complete_tail_publication_task(
+                        conn,
+                        task_id=publication_task_id,
+                        claim_token=publication_claim_token,
+                        lease_version=publication_lease_version,
+                        bar_until=bar_until,
+                    )
+            except Exception:
                 raise
 
         return {
@@ -873,6 +889,134 @@ class PostgresChanWriter:
             "signals": signal_count,
             **committed_head,
         }
+
+    async def _lock_tail_publication_task(
+        self,
+        conn,
+        *,
+        task_id: int,
+        claim_token: str,
+        lease_version: int,
+        symbol_id: int,
+        level_code: int,
+        mode: str,
+        base_timeframe_code: int,
+        anchor_bar_end: datetime,
+        claimed_target_bar_end: datetime,
+        expected_head_run_id: int,
+        expected_head_base_to_bar_end: datetime,
+    ) -> None:
+        task = await conn.fetchrow(
+            """
+            select id,
+                   symbol_id,
+                   chan_level,
+                   mode,
+                   base_timeframe,
+                   status,
+                   claim_token,
+                   lease_version,
+                   lease_until,
+                   anchor_bar_end,
+                   claimed_target_bar_end,
+                   target_bar_end,
+                   expected_head_run_id,
+                   expected_head_base_to_bar_end
+            from scheme2_chan_c_tail_tasks
+            where id = $1
+            for update
+            """,
+            task_id,
+        )
+        checked_at = await conn.fetchval("select clock_timestamp()")
+        task_matches = task is not None and (
+            int(task["symbol_id"]) == symbol_id
+            and int(task["chan_level"]) == level_code
+            and str(task["mode"]) == mode
+            and int(task["base_timeframe"]) == base_timeframe_code
+            and str(task["status"]) == "running"
+            and str(task["claim_token"]) == claim_token
+            and int(task["lease_version"]) == lease_version
+            and task["lease_until"] is not None
+            and task["lease_until"] > checked_at
+            and task["anchor_bar_end"] == anchor_bar_end
+            and task["claimed_target_bar_end"] == claimed_target_bar_end
+            and task["target_bar_end"] is not None
+            and task["target_bar_end"] >= claimed_target_bar_end
+            and task["expected_head_run_id"] is not None
+            and int(task["expected_head_run_id"]) == expected_head_run_id
+            and task["expected_head_base_to_bar_end"]
+            == expected_head_base_to_bar_end
+        )
+        if not task_matches:
+            raise StaleTailTaskLeaseError(
+                f"Tail publication lease fence failed for task_id={task_id}"
+            )
+
+    async def _complete_tail_publication_task(
+        self,
+        conn,
+        *,
+        task_id: int,
+        claim_token: str,
+        lease_version: int,
+        bar_until: datetime,
+    ) -> None:
+        result = await conn.execute(
+            """
+            with completion as (
+                select id,
+                       case
+                           when chan_level = 10080 then
+                               date_trunc('week', target_bar_end at time zone 'Asia/Shanghai')
+                               > date_trunc('week', $4::timestamptz at time zone 'Asia/Shanghai')
+                           when chan_level = 43200 then
+                               date_trunc('month', target_bar_end at time zone 'Asia/Shanghai')
+                               > date_trunc('month', $4::timestamptz at time zone 'Asia/Shanghai')
+                           else target_bar_end > $4
+                       end as has_new_period
+                from scheme2_chan_c_tail_tasks
+                where id = $1
+                  and status = 'running'
+                  and claim_token = $2
+                  and lease_version = $3
+                for update
+            )
+            update scheme2_chan_c_tail_tasks task
+            set status = case
+                    when completion.has_new_period then 'pending'
+                    else 'success'
+                end,
+                last_success_bar_end = $4,
+                last_error = null,
+                consecutive_failures = 0,
+                backoff_until = null,
+                next_run_at = case
+                    when completion.has_new_period then now()
+                    else now() + (schedule_interval_seconds * interval '1 second')
+                end,
+                pending_since = case
+                    when completion.has_new_period then now()
+                    else pending_since
+                end,
+                lease_until = null,
+                lease_heartbeat_at = null,
+                worker_id = null,
+                claim_token = null,
+                claimed_target_bar_end = null,
+                updated_at = now()
+            from completion
+            where task.id = completion.id
+            """,
+            task_id,
+            claim_token,
+            lease_version,
+            bar_until,
+        )
+        if not result.endswith(" 1"):
+            raise StaleTailTaskLeaseError(
+                f"Tail publication completion fence failed for task_id={task_id}"
+            )
 
     async def _publish_historical_replay_heads(
         self,

@@ -10,6 +10,7 @@ from collector.storage.chan_postgres import (
     MODULE_C_CHAN_TABLES,
     PostgresChanWriter,
     StaleChanHeadError,
+    StaleTailTaskLeaseError,
 )
 
 
@@ -108,6 +109,185 @@ class FakePool:
 
     def acquire(self) -> FakeAcquire:
         return FakeAcquire(self.conn)
+
+
+def test_tail_publication_lock_requires_exact_live_task_identity() -> None:
+    class TailConn:
+        def __init__(self, row, checked_at) -> None:
+            self.row = row
+            self.checked_at = checked_at
+            self.calls = []
+
+        async def fetchrow(self, query, *args):
+            self.calls.append((query, args))
+            return self.row
+
+        async def fetchval(self, query, *args):
+            self.calls.append((query, args))
+            return self.checked_at
+
+    async def scenario() -> None:
+        writer = PostgresChanWriter("postgresql://unused")
+        checked_at = datetime.fromtimestamp(150, UTC)
+        anchor = datetime.fromtimestamp(100, UTC)
+        target = datetime.fromtimestamp(200, UTC)
+        task_row = {
+            "id": 17,
+            "symbol_id": 1,
+            "chan_level": 5,
+            "mode": "confirmed",
+            "base_timeframe": 5,
+            "status": "running",
+            "claim_token": "claim-7",
+            "lease_version": 7,
+            "lease_until": datetime.fromtimestamp(250, UTC),
+            "anchor_bar_end": anchor,
+            "claimed_target_bar_end": target,
+            "target_bar_end": target,
+            "expected_head_run_id": 11,
+            "expected_head_base_to_bar_end": anchor,
+        }
+        conn = TailConn(task_row, checked_at)
+
+        await writer._lock_tail_publication_task(
+            conn,
+            task_id=17,
+            claim_token="claim-7",
+            lease_version=7,
+            symbol_id=1,
+            level_code=5,
+            mode="confirmed",
+            base_timeframe_code=5,
+            anchor_bar_end=anchor,
+            claimed_target_bar_end=target,
+            expected_head_run_id=11,
+            expected_head_base_to_bar_end=anchor,
+        )
+
+        query, args = conn.calls[0]
+        lowered = query.lower()
+        assert "from scheme2_chan_c_tail_tasks" in lowered
+        assert "lease_until" in lowered
+        assert "claim_token" in lowered
+        assert "expected_head_run_id" in lowered
+        assert "for update" in lowered
+        assert args == (17,)
+        assert conn.calls[1] == ("select clock_timestamp()", ())
+
+        with pytest.raises(StaleTailTaskLeaseError, match="task_id=17"):
+            await writer._lock_tail_publication_task(
+                TailConn({**task_row, "lease_until": checked_at}, checked_at),
+                task_id=17,
+                claim_token="stale",
+                lease_version=6,
+                symbol_id=1,
+                level_code=5,
+                mode="confirmed",
+                base_timeframe_code=5,
+                anchor_bar_end=anchor,
+                claimed_target_bar_end=target,
+                expected_head_run_id=11,
+                expected_head_base_to_bar_end=anchor,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_tail_publication_rejects_target_drift_before_pool_acquire() -> None:
+    class NoAcquirePool:
+        def acquire(self):
+            raise AssertionError("target drift must fail before pool acquire")
+
+    writer = PostgresChanWriter("postgresql://unused")
+    writer._pool = NoAcquirePool()
+    target = datetime(2026, 7, 3, 6, 55, tzinfo=UTC)
+
+    with pytest.raises(StaleTailTaskLeaseError, match="target mismatch"):
+        asyncio.run(
+            writer.replace_incremental_analysis(
+                symbol="000001.SZ",
+                level="5f",
+                modes=["confirmed"],
+                anchor_bar_end=datetime(2026, 7, 3, 6, 50, tzinfo=UTC),
+                bar_until=datetime(2026, 7, 3, 7, 0, tzinfo=UTC),
+                response={"snapshot_version": "v1"},
+                publication_task_id=17,
+                publication_claim_token="claim-7",
+                publication_lease_version=7,
+                publication_target_bar_end=target,
+                expected_head_run_id=11,
+                expected_head_base_to_bar_end=datetime(
+                    2026, 7, 3, 6, 50, tzinfo=UTC
+                ),
+            )
+        )
+
+
+def test_tail_publication_accepts_same_week_canonical_bar_label() -> None:
+    class PoolReached(RuntimeError):
+        pass
+
+    class MarkerPool:
+        def acquire(self):
+            raise PoolReached("logical target accepted")
+
+    writer = PostgresChanWriter("postgresql://unused")
+    writer._pool = MarkerPool()
+    claimed_monday = datetime(2026, 7, 6, 7, tzinfo=UTC)
+    canonical_friday = datetime(2026, 7, 10, 7, tzinfo=UTC)
+
+    with pytest.raises(PoolReached, match="logical target accepted"):
+        asyncio.run(
+            writer.replace_incremental_analysis(
+                symbol="000001.SZ",
+                level="1w",
+                modes=["confirmed"],
+                anchor_bar_end=datetime(2026, 6, 29, 7, tzinfo=UTC),
+                bar_until=canonical_friday,
+                response={"snapshot_version": "v1"},
+                publication_task_id=17,
+                publication_claim_token="claim-7",
+                publication_lease_version=7,
+                publication_target_bar_end=claimed_monday,
+                expected_head_run_id=11,
+                expected_head_base_to_bar_end=datetime(
+                    2026, 7, 3, 7, tzinfo=UTC
+                ),
+            )
+        )
+
+
+def test_tail_completion_compares_new_work_to_published_endpoint() -> None:
+    class Conn:
+        def __init__(self):
+            self.call = None
+
+        async def execute(self, query, *args):
+            self.call = (query, args)
+            return "UPDATE 1"
+
+    async def scenario() -> None:
+        conn = Conn()
+        writer = PostgresChanWriter("postgresql://unused")
+        published_endpoint = datetime(2026, 7, 10, 7, tzinfo=UTC)
+
+        await writer._complete_tail_publication_task(
+            conn,
+            task_id=17,
+            claim_token="claim-7",
+            lease_version=7,
+            bar_until=published_endpoint,
+        )
+
+        query, args = conn.call
+        assert "completion.has_new_period" in query
+        assert "date_trunc('week', target_bar_end" in query
+        assert "date_trunc('month', target_bar_end" in query
+        assert "else target_bar_end > $4" in query
+        assert "target_bar_end > claimed_target_bar_end" not in query
+        assert args == (17, "claim-7", 7, published_endpoint)
+
+    asyncio.run(scenario())
 
 
 class FullRecomputeConn(FakeConn):
