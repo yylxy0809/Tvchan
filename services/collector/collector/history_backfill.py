@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import json
 import os
+import socket
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -14,7 +16,7 @@ from collector.market_fill import (
     select_symbols,
 )
 from collector.storage.backfill_postgres import PostgresBackfillTaskStore
-from collector.storage.postgres import PostgresKlineWriter
+from collector.storage.postgres import LostBackfillLease, PostgresKlineWriter
 from trading_protocol import Bar
 from trading_protocol.timeframes import TIMEFRAMES
 
@@ -34,6 +36,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeframes", default=os.getenv("HISTORY_BACKFILL_TIMEFRAMES", DEFAULT_TIMEFRAMES))
     parser.add_argument("--page-size", type=int, default=int(os.getenv("HISTORY_BACKFILL_PAGE_SIZE", "800")))
     parser.add_argument("--task-limit", type=int, default=int(os.getenv("HISTORY_BACKFILL_TASK_LIMIT", "3")))
+    parser.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=int(os.getenv("HISTORY_BACKFILL_LEASE_SECONDS", "300")),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=int(os.getenv("HISTORY_BACKFILL_MAX_ATTEMPTS", "5")),
+    )
+    parser.add_argument(
+        "--worker-id",
+        default=os.getenv("HISTORY_BACKFILL_WORKER_ID"),
+    )
     parser.add_argument(
         "--concurrency",
         type=int,
@@ -74,7 +90,17 @@ def parse_args() -> argparse.Namespace:
             "postgresql://trader:change-me-before-long-running@127.0.0.1:5432/tradingview_local",
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lease_seconds <= 0:
+        parser.error("--lease-seconds must be greater than zero")
+    if args.max_attempts <= 0:
+        parser.error("--max-attempts must be greater than zero")
+    args.worker_id = str(
+        args.worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+    ).strip()
+    if not args.worker_id or len(args.worker_id) > 160:
+        parser.error("--worker-id must contain between 1 and 160 characters")
+    return args
 
 
 async def main() -> None:
@@ -123,7 +149,13 @@ async def run_once(args: argparse.Namespace) -> None:
             if args.reset_running:
                 reset_count = await task_store.reset_running(provider=provider.name)
 
-            tasks = await task_store.claim_tasks(provider=provider.name, limit=args.task_limit)
+            tasks = await task_store.claim_tasks(
+                provider=provider.name,
+                limit=args.task_limit,
+                worker_id=args.worker_id,
+                lease_seconds=args.lease_seconds,
+                max_attempts=args.max_attempts,
+            )
             emit(
                 "history_tasks_claimed",
                 ensured=ensured,
@@ -140,6 +172,7 @@ async def run_once(args: argparse.Namespace) -> None:
                 concurrency=max(1, args.concurrency),
                 max_pages_per_task=args.max_pages_per_task,
                 sleep=args.sleep,
+                lease_seconds=args.lease_seconds,
             )
             emit(
                 "history_pass_finished",
@@ -158,6 +191,7 @@ async def process_tasks_concurrently(
     concurrency: int,
     max_pages_per_task: int,
     sleep: float,
+    lease_seconds: int,
 ) -> dict[str, int]:
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
@@ -170,6 +204,7 @@ async def process_tasks_concurrently(
                 task=task,
                 max_pages_per_task=max_pages_per_task,
                 sleep=sleep,
+                lease_seconds=lease_seconds,
             )
 
     results = await asyncio.gather(*(run_task(task) for task in tasks))
@@ -187,6 +222,7 @@ async def process_task(
     task: dict[str, Any],
     max_pages_per_task: int,
     sleep: float,
+    lease_seconds: int,
 ) -> dict[str, int]:
     symbol = str(task["symbol"])
     timeframe = DB_TO_TIMEFRAME[int(task["timeframe"])]
@@ -195,9 +231,35 @@ async def process_task(
     pages = 0
     total_bars = 0
     exhausted = False
+    lease_lost = asyncio.Event()
+    stop_heartbeat = asyncio.Event()
+
+    async def maintain_lease() -> None:
+        interval = max(0.1, lease_seconds / 3)
+        while not stop_heartbeat.is_set():
+            try:
+                await asyncio.wait_for(stop_heartbeat.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                try:
+                    renewed = await task_store.heartbeat(
+                        task_id=int(task["id"]),
+                        claim_token=str(task["claim_token"]),
+                        lease_version=int(task["lease_version"]),
+                        lease_seconds=lease_seconds,
+                    )
+                except Exception:
+                    renewed = False
+                if not renewed:
+                    lease_lost.set()
+                    return
+
+    heartbeat_task = asyncio.create_task(maintain_lease())
 
     try:
         while max_pages_per_task <= 0 or pages < max_pages_per_task:
+            if lease_lost.is_set():
+                raise LostBackfillLease(f"historical backfill task lease lost: {task['id']}")
             bars = await get_provider_page(
                 provider,
                 symbol=symbol,
@@ -205,20 +267,22 @@ async def process_task(
                 offset=offset,
                 limit=page_size,
             )
-            bars_written = await kline_writer.upsert_bars(bars)
+            if lease_lost.is_set():
+                raise LostBackfillLease(f"historical backfill task lease lost: {task['id']}")
             bars_read = len(bars)
             exhausted = bars_read < page_size
             next_offset = offset + bars_read
             oldest_ts = min((bar.ts for bar in bars), default=None)
             newest_ts = max((bar.ts for bar in bars), default=None)
-            await task_store.record_page_success(
-                task_id=int(task["id"]),
+            bars_written = await kline_writer.commit_history_backfill_page(
+                task=task,
+                expected_offset=offset,
                 next_offset=next_offset,
-                bars_read=bars_read,
-                bars_written=bars_written,
+                bars=bars,
                 oldest_ts=oldest_ts,
                 newest_ts=newest_ts,
                 exhausted=exhausted,
+                lease_seconds=lease_seconds,
             )
             emit(
                 "history_page_written",
@@ -237,15 +301,44 @@ async def process_task(
                 break
             await sleep_between_requests(sleep)
 
-    except Exception as exc:
-        await task_store.record_failure(task_id=int(task["id"]), error=str(exc))
+        if not exhausted:
+            stop_heartbeat.set()
+            await heartbeat_task
+            if not await task_store.yield_task(
+                task_id=int(task["id"]),
+                claim_token=str(task["claim_token"]),
+                lease_version=int(task["lease_version"]),
+            ):
+                raise LostBackfillLease(
+                    f"historical backfill task lease lost before yield: {task['id']}"
+                )
+
+    except LostBackfillLease as exc:
         emit(
-            "history_task_failed",
+            "history_task_lease_lost",
             symbol=symbol,
             timeframe=timeframe,
             offset=offset,
             error=str(exc)[:500],
         )
+    except Exception as exc:
+        recorded = await task_store.record_failure(
+            task_id=int(task["id"]),
+            claim_token=str(task["claim_token"]),
+            lease_version=int(task["lease_version"]),
+            error=str(exc),
+        )
+        emit(
+            "history_task_failed" if recorded else "history_task_lease_lost",
+            symbol=symbol,
+            timeframe=timeframe,
+            offset=offset,
+            error=str(exc)[:500],
+        )
+    finally:
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            await heartbeat_task
     return {"pages": pages, "bars": total_bars}
 
 
