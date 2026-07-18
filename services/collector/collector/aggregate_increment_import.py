@@ -552,6 +552,19 @@ def bind_quarantines_to_run(parsed: ParsedBatch, import_run_id: UUID) -> ParsedB
     )
 
 
+def _batch_timestamp_bounds(bars: list[tuple]) -> tuple[datetime, datetime]:
+    """Return static bounds used to prune hypertable chunks during verification."""
+    if not bars:
+        raise ValueError("staged K-line batch must not be empty")
+    timestamps = [row[3] for row in bars]
+    return min(timestamps), max(timestamps)
+
+
+async def _fetch_stage_mismatch(conn: Any, sql: str, bars: list[tuple]) -> Any:
+    batch_min_ts, batch_max_ts = _batch_timestamp_bounds(bars)
+    return await conn.fetchrow(sql, batch_min_ts, batch_max_ts)
+
+
 APPEND_ONLY_MISMATCH_SQL = """
 select symbol.code || '.' || symbol.exchange as symbol, stage.timeframe, stage.bar_end
   from _native_parquet_kline_stage stage
@@ -560,6 +573,7 @@ select symbol.code || '.' || symbol.exchange as symbol, stage.timeframe, stage.b
     on scope.symbol_id=symbol.id and scope.timeframe=stage.timeframe
   left join klines existing
     on existing.symbol_id=symbol.id and existing.timeframe=stage.timeframe and existing.ts=stage.bar_end
+   and existing.ts >= $1 and existing.ts <= $2
  where stage.bar_end <= scope.original_max
    and (
        existing.symbol_id is null
@@ -849,7 +863,7 @@ class AggregateIncrementWriter(NativeParquetWriter):
                  left join klines kline on kline.symbol_id=scope.symbol_id and kline.timeframe=scope.timeframe
                 group by scope.symbol_id,scope.timeframe"""
         )
-        mismatch = await conn.fetchrow(APPEND_ONLY_MISMATCH_SQL)
+        mismatch = await _fetch_stage_mismatch(conn, APPEND_ONLY_MISMATCH_SQL, bars)
         if mismatch is not None:
             raise RuntimeError(
                 f"append-only overlap mismatch for {mismatch['symbol']} timeframe={mismatch['timeframe']}"
@@ -857,7 +871,7 @@ class AggregateIncrementWriter(NativeParquetWriter):
         inserted = int(await conn.fetchval(INSERT_NEW_ROWS_SQL))
         # Recheck after ON CONFLICT so an unexpected concurrent writer cannot
         # turn a conflicting insert into a silent no-op.
-        mismatch = await conn.fetchrow(ALL_STAGE_MATCH_SQL)
+        mismatch = await _fetch_stage_mismatch(conn, ALL_STAGE_MATCH_SQL, bars)
         if mismatch is not None:
             raise RuntimeError("append-only post-insert verification failed")
         await register_source_coverage(conn)
