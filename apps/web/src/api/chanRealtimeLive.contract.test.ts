@@ -19,9 +19,10 @@ class FakeWebSocket {
   onclose: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
 
-  constructor(_url: string) {
+  constructor(readonly url: string) {
     FakeWebSocket.instances.push(this);
     queueMicrotask(() => {
+      if (this.readyState !== 0) return;
       this.readyState = FakeWebSocket.OPEN;
       this.onopen?.();
     });
@@ -33,6 +34,23 @@ class FakeWebSocket {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function installTokenStorage(): Storage {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem(key: string) { return values.get(key) ?? null; },
+    setItem(key: string, value: string) { values.set(key, value); },
+    removeItem(key: string) { values.delete(key); },
+    clear() { values.clear(); },
+    key(index: number) { return [...values.keys()][index] ?? null; },
+    get length() { return values.size; },
+  } satisfies Storage;
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: storage,
+  });
+  return storage;
+}
 
 test("bounded Chan subscription forwards envelopes, reports replay, and unsubscribes", async () => {
   const original = globalThis.WebSocket;
@@ -110,6 +128,107 @@ test("active Chan subscription source has no bundle or legacy snapshot handling"
     source.indexOf("async subscribeRealtimeBars"),
   );
   assert.doesNotMatch(active, /bundle|chan_snapshot|chan_delta|subscribe_chart_bundle/);
+});
+
+test("session reset closes old-token sockets before a new login subscribes", async (t) => {
+  const original = globalThis.WebSocket;
+  const localStorageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const storage = installTokenStorage();
+  (globalThis as { WebSocket?: typeof WebSocket }).WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  FakeWebSocket.instances = [];
+  const manager = new ChartDataManager();
+  t.after(() => {
+    manager.resetSession();
+    globalThis.WebSocket = original;
+    if (localStorageDescriptor) {
+      Object.defineProperty(globalThis, "localStorage", localStorageDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "localStorage");
+    }
+  });
+
+  storage.setItem("tv-a-share-login-token", "token-a");
+  const releaseA = await manager.subscribeChanOverlay({
+    symbol: "000001.SZ", timeframe: "5f", levels: ["5f", "30f", "1d"],
+    modes: ["confirmed", "predictive"], from: 100, to: 200, limit: 300,
+  }, () => {}, () => {});
+  await sleep(0);
+  const first = FakeWebSocket.instances[0];
+  assert.equal(new URL(first.url).searchParams.get("token"), "token-a");
+
+  manager.resetSession();
+  assert.equal(first.readyState, 3);
+  storage.setItem("tv-a-share-login-token", "token-b");
+  const releaseB = await manager.subscribeChanOverlay({
+    symbol: "000002.SZ", timeframe: "5f", levels: ["5f", "30f", "1d"],
+    modes: ["confirmed", "predictive"], from: 100, to: 200, limit: 300,
+  }, () => {}, () => {});
+  await sleep(0);
+  const second = FakeWebSocket.instances[1];
+  assert.ok(second);
+  assert.equal(new URL(second.url).searchParams.get("token"), "token-b");
+  await sleep(1_100);
+  assert.equal(FakeWebSocket.instances.length, 2);
+
+  releaseA();
+  releaseB();
+});
+
+test("session reset closes chart and realtime sockets still connecting", async (t) => {
+  const original = globalThis.WebSocket;
+  (globalThis as { WebSocket?: typeof WebSocket }).WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  FakeWebSocket.instances = [];
+  const manager = new ChartDataManager();
+  t.after(() => {
+    manager.resetSession();
+    globalThis.WebSocket = original;
+  });
+
+  const chartSubscription = manager.subscribeChanOverlay({
+    symbol: "000001.SZ", timeframe: "5f", levels: ["5f", "30f", "1d"],
+    modes: ["confirmed", "predictive"], from: 100, to: 200, limit: 300,
+  }, () => {}, () => {});
+  const realtimeSubscription = manager.subscribeRealtimeBars({
+    symbol: "000001.SZ", timeframe: "5f",
+  }, () => {}, () => {});
+  const [chartSocket, realtimeSocket] = FakeWebSocket.instances;
+
+  manager.resetSession();
+
+  assert.equal(chartSocket.readyState, 3);
+  assert.equal(realtimeSocket.readyState, 3);
+  (await chartSubscription)();
+  await assert.rejects(realtimeSubscription, /Authentication session changed/);
+});
+
+test("an open realtime socket error reconnects and fences late messages", async (t) => {
+  const original = globalThis.WebSocket;
+  (globalThis as { WebSocket?: typeof WebSocket }).WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  FakeWebSocket.instances = [];
+  const manager = new ChartDataManager();
+  t.after(() => {
+    manager.resetSession();
+    globalThis.WebSocket = original;
+  });
+  const messages: unknown[] = [];
+  const release = await manager.subscribeRealtimeBars({
+    symbol: "000001.SZ", timeframe: "5f",
+  }, (message) => messages.push(message), () => {});
+  const first = FakeWebSocket.instances[0];
+
+  first.onerror?.();
+  first.receive({
+    type: "bar_update", symbol: "000001.SZ", timeframe: "5f", bar: { close: 1 },
+  });
+  await sleep(1_100);
+
+  assert.equal(messages.length, 0);
+  assert.equal(first.readyState, 3);
+  assert.equal(FakeWebSocket.instances.length, 2);
+  assert.deepEqual(FakeWebSocket.instances[1].sent[0], {
+    type: "subscribe", id: "bar:000001.SZ:5f", symbol: "000001.SZ", timeframes: ["5f"],
+  });
+  release();
 });
 
 test("late widget subscription is disposed after StrictMode-style cleanup", async () => {

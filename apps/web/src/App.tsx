@@ -2,6 +2,7 @@ import { CandlestickChart, LogOut } from "lucide-react";
 import { useEffect, useState } from "react";
 import { type AuthSession, isCredentialRejection, loginWithToken } from "./auth/api";
 import { getApiToken } from "./config";
+import { chartDataManager } from "./api/chartDataManager";
 import {
   clearSavedSessionMeta,
   loadSavedToken,
@@ -24,6 +25,7 @@ export default function App() {
 
   useEffect(() => {
     if (!initialLoginToken) return;
+    chartDataManager.resetSession();
     let active = true;
     void loginWithToken(initialLoginToken)
       .then((next) => {
@@ -47,6 +49,7 @@ export default function App() {
   }, [initialLoginToken]);
 
   function handleAuthenticated(next: AuthSession) {
+    chartDataManager.resetSession();
     persistSession(next);
     setLoginHint(next.token);
     setSession(next);
@@ -54,6 +57,7 @@ export default function App() {
   }
 
   function handleLogout() {
+    chartDataManager.resetSession();
     clearSavedSessionMeta();
     setLoginHint("");
     setSession(null);
