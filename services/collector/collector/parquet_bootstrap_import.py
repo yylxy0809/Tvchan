@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib
 import io
 import json
 import os
 import re
+import socket
+import uuid
 import zipfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -18,6 +21,7 @@ from zoneinfo import ZoneInfo
 from collector.storage.scheme2_postgres import (
     PARQUET_5F_SOURCE,
     PARQUET_5F_TIMEFRAME,
+    LostScheme2MemberLease,
     PostgresScheme2KlineWriter,
     PostgresScheme2MemberCheckpointStore,
     Scheme2SourceMember,
@@ -65,6 +69,14 @@ FUND_PREFIXES = (
     "588",
 )
 CODE_RE = re.compile(r"(?P<code>\d{1,6})")
+_MEMBER_ROWS_END = object()
+
+
+def _next_member_rows(iterator: Iterator[list[dict[str, Any]]]):
+    try:
+        return next(iterator)
+    except StopIteration:
+        return _MEMBER_ROWS_END
 
 
 @dataclass
@@ -90,6 +102,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=int(os.getenv("PARQUET_5F_WRITE_CONCURRENCY", "1")),
     )
     parser.add_argument("--batch-size", type=int, default=int(os.getenv("PARQUET_5F_BATCH_SIZE", str(DEFAULT_BATCH_SIZE))))
+    parser.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=int(os.getenv("PARQUET_5F_LEASE_SECONDS", "300")),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=int(os.getenv("PARQUET_5F_MAX_ATTEMPTS", "5")),
+    )
+    parser.add_argument(
+        "--max-batches-per-member",
+        type=int,
+        default=int(os.getenv("PARQUET_5F_MAX_BATCHES_PER_MEMBER", "0")),
+    )
+    parser.add_argument("--worker-id", default=os.getenv("PARQUET_5F_WORKER_ID"))
     parser.add_argument("--reset", action="store_true", default=os.getenv("PARQUET_5F_RESET") == "1")
     parser.add_argument(
         "--reset-running",
@@ -110,7 +138,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "postgresql://trader:change-me-before-long-running@127.0.0.1:5432/tradingview_local",
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.lease_seconds <= 0:
+        parser.error("--lease-seconds must be greater than zero")
+    if args.max_attempts <= 0:
+        parser.error("--max-attempts must be greater than zero")
+    if args.max_batches_per_member < 0:
+        parser.error("--max-batches-per-member cannot be negative")
+    args.worker_id = str(
+        args.worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+    ).strip()
+    if not args.worker_id or len(args.worker_id) > 160:
+        parser.error("--worker-id must contain between 1 and 160 characters")
+    return args
 
 
 async def main(argv: list[str] | None = None) -> None:
@@ -149,7 +189,12 @@ async def run_once(args: argparse.Namespace) -> None:
         reset_running = 0
         if args.reset_running:
             reset_running = await checkpoint_store.reset_running()
-        tasks = await checkpoint_store.claim_member_checkpoints(limit=args.task_limit)
+        tasks = await checkpoint_store.claim_member_checkpoints(
+            limit=args.task_limit,
+            worker_id=args.worker_id,
+            lease_seconds=args.lease_seconds,
+            max_attempts=args.max_attempts,
+        )
         emit(
             "parquet_5f_tasks_claimed",
             ensured=ensured,
@@ -166,6 +211,8 @@ async def run_once(args: argparse.Namespace) -> None:
                 batch_size=max(1, args.batch_size),
                 concurrency=max(1, args.concurrency),
                 write_concurrency=max(1, args.write_concurrency),
+                lease_seconds=args.lease_seconds,
+                max_batches_per_member=args.max_batches_per_member,
             )
     emit("parquet_5f_import_finished", members=len(tasks), bars=result["bars"])
 
@@ -208,7 +255,8 @@ def discover_parquet_members(
     for parquet_path in sorted((root_path / "symbols").glob("**/*.parquet")):
         if not parquet_path.is_file():
             continue
-        stat = parquet_path.stat()
+        with parquet_path.open("rb") as source:
+            member_size_bytes, content_sha256 = _sha256_stream(source)
         members.append(
             Scheme2SourceMember(
                 root_path=str(root_path),
@@ -216,7 +264,8 @@ def discover_parquet_members(
                 zip_path=str(parquet_path.resolve()),
                 member_path="",
                 member_crc32=None,
-                member_size_bytes=stat.st_size,
+                member_size_bytes=member_size_bytes,
+                content_sha256=content_sha256,
                 timeframe=timeframe,
             )
         )
@@ -231,6 +280,8 @@ async def process_tasks_concurrently(
     batch_size: int,
     concurrency: int,
     write_concurrency: int = 1,
+    lease_seconds: int = 300,
+    max_batches_per_member: int = 0,
 ) -> dict[str, int]:
     read_semaphore = asyncio.Semaphore(max(1, concurrency))
     write_semaphore = asyncio.Semaphore(max(1, write_concurrency))
@@ -243,6 +294,8 @@ async def process_tasks_concurrently(
                 task=task,
                 batch_size=batch_size,
                 write_semaphore=write_semaphore,
+                lease_seconds=lease_seconds,
+                max_batches_per_member=max_batches_per_member,
             )
 
     results = await asyncio.gather(*(run_task(task) for task in tasks))
@@ -256,30 +309,126 @@ async def process_member_task(
     task: dict[str, Any],
     batch_size: int,
     write_semaphore: asyncio.Semaphore | None = None,
+    lease_seconds: int = 300,
+    max_batches_per_member: int = 0,
 ) -> dict[str, int]:
     checkpoint_id = int(task["id"])
     zip_path = str(task["zip_path"])
     member_path = str(task["member_path"])
     bars_written = 0
+    progress = int(task.get("imported_rows") or 0)
+    resume_rows = progress
+    batches_committed = 0
+    lease_lost = asyncio.Event()
+    stop_heartbeat = asyncio.Event()
+
+    async def maintain_lease() -> None:
+        interval = max(0.1, lease_seconds / 3)
+        while not stop_heartbeat.is_set():
+            try:
+                await asyncio.wait_for(stop_heartbeat.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                try:
+                    renewed = await checkpoint_store.heartbeat(
+                        checkpoint_id=checkpoint_id,
+                        claim_token=str(task["claim_token"]),
+                        lease_version=int(task["lease_version"]),
+                        lease_seconds=lease_seconds,
+                    )
+                except Exception:
+                    renewed = False
+                if not renewed:
+                    lease_lost.set()
+                    return
+
+    heartbeat_task = asyncio.create_task(maintain_lease())
     try:
-        for rows in _iter_member_rows(zip_path, member_path, batch_size=batch_size):
+        iterator = _iter_member_rows(
+            zip_path,
+            member_path,
+            batch_size=batch_size,
+            expected_member_crc32=task.get("member_crc32"),
+            expected_member_size_bytes=task.get("member_size_bytes"),
+            expected_content_sha256=task.get("content_sha256"),
+        )
+        while True:
+            if lease_lost.is_set():
+                raise LostScheme2MemberLease(
+                    f"Scheme 2 member lease lost: {checkpoint_id}"
+                )
+            rows = await asyncio.to_thread(_next_member_rows, iterator)
+            if rows is _MEMBER_ROWS_END:
+                break
+            if lease_lost.is_set():
+                raise LostScheme2MemberLease(
+                    f"Scheme 2 member lease lost: {checkpoint_id}"
+                )
+            if resume_rows:
+                if resume_rows >= len(rows):
+                    resume_rows -= len(rows)
+                    continue
+                rows = rows[resume_rows:]
+                resume_rows = 0
+            if max_batches_per_member > 0 and batches_committed >= max_batches_per_member:
+                stop_heartbeat.set()
+                await heartbeat_task
+                yielded = await checkpoint_store.yield_member(
+                    checkpoint_id=checkpoint_id,
+                    claim_token=str(task["claim_token"]),
+                    lease_version=int(task["lease_version"]),
+                    expected_imported_rows=progress,
+                )
+                if not yielded:
+                    raise LostScheme2MemberLease(
+                        f"Scheme 2 member lease lost before yield: {checkpoint_id}"
+                    )
+                emit(
+                    "parquet_5f_member_yielded",
+                    zip_path=zip_path,
+                    member_path=member_path,
+                    bars=bars_written,
+                    imported_rows=progress,
+                )
+                return {"bars": bars_written}
             parsed = parse_parquet_rows(rows)
             if parsed.bars:
                 if write_semaphore is None:
-                    bars_written += await writer.upsert_5f_bars(
+                    written = await writer.commit_member_batch(
+                        task=task,
+                        expected_imported_rows=progress,
                         symbols=parsed.symbols.values(),
                         bars=parsed.bars,
+                        lease_seconds=lease_seconds,
                     )
                 else:
                     async with write_semaphore:
-                        bars_written += await writer.upsert_5f_bars(
+                        written = await writer.commit_member_batch(
+                            task=task,
+                            expected_imported_rows=progress,
                             symbols=parsed.symbols.values(),
                             bars=parsed.bars,
+                            lease_seconds=lease_seconds,
                         )
-        await checkpoint_store.record_member_success(
+                bars_written += written
+                progress += written
+                batches_committed += 1
+        if resume_rows:
+            raise ValueError(
+                "Scheme 2 checkpoint progress exceeds the authoritative member row count"
+            )
+        stop_heartbeat.set()
+        await heartbeat_task
+        succeeded = await checkpoint_store.record_member_success(
             checkpoint_id=checkpoint_id,
-            imported_rows=bars_written,
+            claim_token=str(task["claim_token"]),
+            lease_version=int(task["lease_version"]),
+            expected_imported_rows=progress,
         )
+        if not succeeded:
+            raise LostScheme2MemberLease(
+                f"Scheme 2 member lease lost before success: {checkpoint_id}"
+            )
         emit(
             "parquet_5f_member_finished",
             zip_path=zip_path,
@@ -287,20 +436,35 @@ async def process_member_task(
             bars=bars_written,
         )
         return {"bars": bars_written}
-    except Exception as exc:
-        await checkpoint_store.record_member_failure(
-            checkpoint_id=checkpoint_id,
-            error=str(exc),
-            imported_rows=bars_written,
-        )
+    except LostScheme2MemberLease as exc:
         emit(
-            "parquet_5f_member_failed",
+            "parquet_5f_member_lease_lost",
             zip_path=zip_path,
             member_path=member_path,
             bars=bars_written,
             error=str(exc)[:500],
         )
         return {"bars": bars_written}
+    except Exception as exc:
+        recorded = await checkpoint_store.record_member_failure(
+            checkpoint_id=checkpoint_id,
+            claim_token=str(task["claim_token"]),
+            lease_version=int(task["lease_version"]),
+            error=str(exc),
+            expected_imported_rows=progress,
+        )
+        emit(
+            "parquet_5f_member_failed" if recorded else "parquet_5f_member_lease_lost",
+            zip_path=zip_path,
+            member_path=member_path,
+            bars=bars_written,
+            error=str(exc)[:500],
+        )
+        return {"bars": bars_written}
+    finally:
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            await heartbeat_task
 
 
 def parse_parquet_rows(rows: Iterable[dict[str, Any]]) -> ParsedParquetBatch:
@@ -393,15 +557,51 @@ def _iter_member_rows(
     member_path: str,
     *,
     batch_size: int,
+    expected_member_crc32: object = None,
+    expected_member_size_bytes: object = None,
+    expected_content_sha256: object = None,
 ) -> Iterator[list[dict[str, Any]]]:
-    parquet = _require_parquet_module()
     zip_path = Path(zip_path)
     if zip_path.suffix.lower() == ".parquet" and member_path == "":
-        parquet_file = parquet.ParquetFile(str(zip_path))
+        with zip_path.open("rb") as source:
+            actual_size, actual_sha256 = _sha256_stream(source)
+            if expected_member_crc32 is not None:
+                raise ValueError("Direct parquet checkpoint must not contain a member CRC")
+            _require_exact_member_value(
+                field="size",
+                expected=expected_member_size_bytes,
+                actual=actual_size,
+            )
+            _require_exact_content_sha256(
+                expected=expected_content_sha256,
+                actual=actual_sha256,
+            )
+            source.seek(0)
+            parquet = _require_parquet_module()
+            parquet_file = parquet.ParquetFile(source)
+            yield from _iter_parquet_rows(parquet_file, batch_size=batch_size)
     else:
+        if expected_content_sha256 is not None:
+            raise ValueError("ZIP member checkpoint must not contain a content SHA-256")
         with zipfile.ZipFile(zip_path) as archive:
-            payload = archive.read(member_path)
+            member = archive.getinfo(member_path)
+            _require_exact_member_value(
+                field="CRC32",
+                expected=expected_member_crc32,
+                actual=member.CRC,
+            )
+            _require_exact_member_value(
+                field="size",
+                expected=expected_member_size_bytes,
+                actual=member.file_size,
+            )
+            payload = archive.read(member)
+        parquet = _require_parquet_module()
         parquet_file = parquet.ParquetFile(io.BytesIO(payload))
+        yield from _iter_parquet_rows(parquet_file, batch_size=batch_size)
+
+
+def _iter_parquet_rows(parquet_file, *, batch_size: int) -> Iterator[list[dict[str, Any]]]:
     columns = [str(name) for name in parquet_file.schema_arrow.names]
     missing = [column for column in REQUIRED_COLUMNS if column not in columns]
     if missing:
@@ -411,6 +611,29 @@ def _iter_member_rows(
         columns=list(REQUIRED_COLUMNS),
     ):
         yield record_batch.to_pylist()
+
+
+def _sha256_stream(source, *, chunk_size: int = 1024 * 1024) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := source.read(chunk_size):
+        digest.update(chunk)
+        size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _require_exact_member_value(*, field: str, expected: object, actual: int) -> None:
+    if expected is None or int(expected) != actual:
+        raise ValueError(
+            f"Scheme 2 source member {field} does not match its claimed checkpoint"
+        )
+
+
+def _require_exact_content_sha256(*, expected: object, actual: str) -> None:
+    if expected is None or str(expected).lower() != actual:
+        raise ValueError(
+            "Scheme 2 direct parquet SHA-256 does not match its claimed checkpoint"
+        )
 
 
 def _require_parquet_module():

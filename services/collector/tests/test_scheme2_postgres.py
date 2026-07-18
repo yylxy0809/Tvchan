@@ -502,6 +502,8 @@ def test_checkpoint_store_resets_running_members() -> None:
     sql, args = conn.executes[0]
     assert "scheme2_source_member_checkpoints" in sql
     assert "status = 'running'" in sql
+    assert "lease_until <= clock_timestamp()" in sql
+    assert "attempts = attempts + 1" in sql
     assert args == ("parquet_5f",)
 
 
@@ -524,6 +526,7 @@ def test_checkpoint_store_ensures_members_with_reset_flag() -> None:
     assert result == 1
     sql, rows = conn.executemany_calls[0]
     assert "scheme2_source_member_checkpoints" in sql
+    assert "coalesce(content_sha256, '')" in sql
     assert rows == [
         (
             "D:/5f数据/5m_price",
@@ -532,10 +535,113 @@ def test_checkpoint_store_ensures_members_with_reset_flag() -> None:
             "20240102.parquet",
             123,
             456,
+            None,
             5,
             True,
         )
     ]
+
+
+def test_checkpoint_claim_and_terminal_operations_require_exact_owner_and_progress() -> None:
+    conn = FakeConnection()
+    store = PostgresScheme2MemberCheckpointStore("postgresql://example")
+    store._pool = FakePool(conn)
+
+    asyncio.run(store.claim_member_checkpoints(
+        limit=2,
+        worker_id="worker-a",
+        lease_seconds=90,
+        max_attempts=4,
+    ))
+    exhausted_sql, exhausted_args = conn.executes[0]
+    assert "set status = 'dead_letter'" in exhausted_sql
+    assert "attempts + 1 >= least(max_attempts, $3)" in exhausted_sql
+    assert "for update skip locked" in exhausted_sql.lower()
+    assert exhausted_args == ("parquet_5f", 5, 4, 2)
+    claim_sql, claim_args = conn.fetch_calls[0]
+    assert "set status = 'dead_letter'" not in claim_sql
+    assert "for update skip locked" in claim_sql.lower()
+    assert "lease_version = checkpoint.lease_version + 1" in claim_sql
+    assert "lease_until <= clock_timestamp()" in claim_sql
+    assert claim_args == ("parquet_5f", 5, 2, "worker-a", 90, 4)
+
+    assert asyncio.run(store.heartbeat(
+        checkpoint_id=7,
+        claim_token="claim-a",
+        lease_version=2,
+        lease_seconds=90,
+    ))
+    assert asyncio.run(store.record_member_success(
+        checkpoint_id=7,
+        claim_token="claim-a",
+        lease_version=2,
+        expected_imported_rows=100,
+    ))
+    assert asyncio.run(store.yield_member(
+        checkpoint_id=7,
+        claim_token="claim-a",
+        lease_version=2,
+        expected_imported_rows=100,
+    ))
+    assert asyncio.run(store.record_member_failure(
+        checkpoint_id=7,
+        claim_token="claim-a",
+        lease_version=2,
+        expected_imported_rows=100,
+        error="boom",
+    ))
+
+    terminal_sql = "\n".join(sql.lower() for sql, _args in conn.fetchrow_calls)
+    assert terminal_sql.count("claim_token = $2") == 4
+    assert terminal_sql.count("lease_version = $3") == 4
+    assert terminal_sql.count("lease_until > clock_timestamp()") == 4
+    assert terminal_sql.count("imported_rows = $4") == 3
+
+
+def test_scheme2_member_batch_fences_identity_and_progress_in_write_transaction(monkeypatch) -> None:
+    checkpoint = {
+        "id": 7,
+        "root_path": "D:/root",
+        "source_profile": "parquet_5f",
+        "zip_path": "D:/root/2024.zip",
+        "member_path": "20240102.parquet",
+        "member_crc32": 123,
+        "member_size_bytes": 456,
+        "content_sha256": None,
+        "timeframe": 5,
+        "claim_token": "claim-a",
+        "lease_version": 2,
+    }
+    conn = FakeConnection(checkpoint_row=checkpoint)
+    writer = PostgresScheme2KlineWriter("postgresql://example")
+    writer._pool = FakePool(conn)
+    recorded = []
+
+    async def record_scopes(_conn, *, scopes):
+        recorded.extend(scopes)
+        return len(scopes)
+
+    monkeypatch.setattr(scheme2_storage, "record_present_scopes", record_scopes)
+    bar_end = datetime(2026, 7, 10, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai"))
+    result = asyncio.run(writer.commit_member_batch(
+        task=checkpoint,
+        expected_imported_rows=0,
+        symbols=[SymbolInfo("000001.SZ", "000001", "SZ", "000001")],
+        bars=[Bar("000001.SZ", "5f", bar_end, 10, 11, 9, 10.5, 100)],
+        lease_seconds=90,
+    ))
+
+    assert result == 1
+    assert conn.events[0] == "begin"
+    assert "checkpoint-lock" in conn.events
+    assert "klines-upsert" in conn.events
+    assert conn.events[-1] == "commit"
+    lock_sql, _lock_args = conn.fetchrow_calls[0]
+    assert "lease_until > clock_timestamp()" in lock_sql
+    progress_sql, progress_args = conn.fetchrow_calls[-1]
+    assert "lease_until > clock_timestamp()" not in progress_sql
+    assert "imported_rows = $4" in progress_sql
+    assert progress_args[3:] == (0, 1, 90)
 
 
 class FakePool:
@@ -578,15 +684,18 @@ class FakeConnection:
         fetchval_result=True,
         symbol_rows=None,
         scope_rows=None,
+        checkpoint_row=None,
     ) -> None:
         self.execute_result = execute_result
         self.fetchval_result = fetchval_result
         self.symbol_rows = list(symbol_rows or [])
         self.scope_rows = list(scope_rows or [])
+        self.checkpoint_row = checkpoint_row
         self.executes = []
         self.copies = []
         self.executemany_calls = []
         self.fetch_calls = []
+        self.fetchrow_calls = []
         self.events = []
 
     def transaction(self):
@@ -620,8 +729,16 @@ class FakeConnection:
         return []
 
     async def fetchrow(self, sql, *args):
-        assert "kline_scope_catalog_control" in sql.lower()
-        assert "for share" in sql.lower()
+        self.fetchrow_calls.append((sql, args))
+        normalized = " ".join(sql.lower().split())
+        if "from scheme2_source_member_checkpoints" in normalized:
+            self.events.append("checkpoint-lock")
+            return self.checkpoint_row
+        if "update scheme2_source_member_checkpoints" in normalized:
+            self.events.append("checkpoint-update")
+            return {"id": args[0]}
+        assert "kline_scope_catalog_control" in normalized
+        assert "for share" in normalized
         return {"control_key": "active"}
 
     async def fetchval(self, sql, *args):
