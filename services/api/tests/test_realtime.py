@@ -263,6 +263,57 @@ def test_chart_ws_subscribe_chan_emits_snapshot_and_delta(monkeypatch) -> None:
         assert ws.receive_json() == {"type": "chan_unsubscribed", "id": "chan_sub_1"}
 
 
+def test_chart_ws_bounds_subscriptions_per_connection(monkeypatch) -> None:
+    overlay_calls = 0
+
+    async def unexpected_overlay(**_kwargs):
+        nonlocal overlay_calls
+        overlay_calls += 1
+        raise AssertionError("subscription admission must not build overlays")
+
+    async def idle_publisher(*_args):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(chart_ws, "build_chan_overlay", unexpected_overlay)
+    monkeypatch.setattr(chart_ws, "_publish_chan_updates", idle_publisher)
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v2/chart?token=dev-local-token") as ws:
+        def subscribe(subscription_id: str) -> dict:
+            ws.send_json(
+                {
+                    "type": "subscribe_chan",
+                    "id": subscription_id,
+                    "symbol": "000001.SZ",
+                    "timeframe": "5f",
+                    "from": 1_780_000_000,
+                    "to": 1_780_001_200,
+                }
+            )
+            return ws.receive_json()
+
+        for index in range(chart_ws.MAX_SUBSCRIPTIONS_PER_CONNECTION):
+            assert subscribe(f"sub_{index}")["type"] == "chan_subscribed"
+
+        # Replacing an existing id is allowed and does not consume another slot.
+        assert subscribe("sub_0")["type"] == "chan_subscribed"
+
+        rejected = subscribe("overflow")
+        assert rejected == {
+            "type": "error",
+            "request_id": "",
+            "error": (
+                "Too many subscriptions; maximum is "
+                f"{chart_ws.MAX_SUBSCRIPTIONS_PER_CONNECTION}"
+            ),
+        }
+
+        # The rejected id was not inserted, so releasing one real slot admits a new id.
+        ws.send_json({"type": "unsubscribe_chan", "id": "sub_1"})
+        assert ws.receive_json() == {"type": "chan_unsubscribed", "id": "sub_1"}
+        assert subscribe("after_release")["type"] == "chan_subscribed"
+        assert overlay_calls == 0
+
+
 def test_realtime_ping_and_subscribe() -> None:
     client = TestClient(create_app())
     with client.websocket_connect("/ws/v1/realtime?token=dev-local-token") as ws:
@@ -277,6 +328,118 @@ def test_realtime_ping_and_subscribe() -> None:
             }
         )
         assert ws.receive_json() == {"type": "subscribed", "id": "sub_1"}
+
+
+def test_realtime_bounds_subscriptions_per_connection(monkeypatch) -> None:
+    async def idle_producer(_websocket, _subscriptions):
+        return asyncio.create_task(asyncio.sleep(3600))
+
+    monkeypatch.setattr(realtime, "_create_producer_task", idle_producer)
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v1/realtime?token=dev-local-token") as ws:
+        def subscribe(subscription_id: str) -> dict:
+            ws.send_json(
+                {
+                    "type": "subscribe",
+                    "id": subscription_id,
+                    "symbol": "000001.SZ",
+                    "timeframes": ["5f"],
+                }
+            )
+            return ws.receive_json()
+
+        for index in range(realtime.MAX_SUBSCRIPTIONS_PER_CONNECTION):
+            assert subscribe(f"sub_{index}") == {
+                "type": "subscribed",
+                "id": f"sub_{index}",
+            }
+
+        assert subscribe("sub_0") == {"type": "subscribed", "id": "sub_0"}
+        assert subscribe("overflow") == {
+            "type": "error",
+            "message": (
+                "Too many subscriptions; maximum is "
+                f"{realtime.MAX_SUBSCRIPTIONS_PER_CONNECTION}"
+            ),
+        }
+
+        ws.send_json({"type": "unsubscribe", "id": "sub_1"})
+        assert ws.receive_json() == {"type": "unsubscribed", "id": "sub_1"}
+        assert subscribe("after_release") == {
+            "type": "subscribed",
+            "id": "after_release",
+        }
+
+
+def test_realtime_rejects_amplifying_timeframe_inputs(monkeypatch) -> None:
+    async def idle_producer(_websocket, _subscriptions):
+        return asyncio.create_task(asyncio.sleep(3600))
+
+    monkeypatch.setattr(realtime, "_create_producer_task", idle_producer)
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v1/realtime?token=dev-local-token") as ws:
+        invalid_inputs = [
+            "5f",
+            ["5f"] * 8,
+            ["unsupported"],
+        ]
+        for index, timeframes in enumerate(invalid_inputs):
+            ws.send_json(
+                {
+                    "type": "subscribe",
+                    "id": f"invalid_{index}",
+                    "symbol": "000001.SZ",
+                    "timeframes": timeframes,
+                }
+            )
+            assert ws.receive_json()["type"] == "error"
+
+        # Every protocol timeframe remains valid; aliases and duplicates are de-duplicated.
+        ws.send_json(
+            {
+                "type": "subscribe",
+                "id": "deduped",
+                "symbol": "000001.SZ",
+                "timeframes": ["5f", "5", "15f", "1h"],
+            }
+        )
+        assert ws.receive_json() == {"type": "subscribed", "id": "deduped"}
+
+        ws.send_json(
+            {
+                "type": "subscribe",
+                "id": "default_missing",
+                "symbol": "000001.SZ",
+            }
+        )
+        assert ws.receive_json() == {
+            "type": "subscribed",
+            "id": "default_missing",
+        }
+
+        for index, timeframes in enumerate((None, [], "")):
+            ws.send_json(
+                {
+                    "type": "subscribe",
+                    "id": f"default_{index}",
+                    "symbol": "000001.SZ",
+                    "timeframes": timeframes,
+                }
+            )
+            assert ws.receive_json() == {
+                "type": "subscribed",
+                "id": f"default_{index}",
+            }
+
+    assert realtime._normalize_subscription_timeframes(
+        ["5f", "5", "15f", "1h"]
+    ) == [
+        "5f",
+        "15f",
+        "1h",
+    ]
+    assert realtime._normalize_subscription_timeframes(None) == ["5f"]
+    assert realtime._normalize_subscription_timeframes([]) == ["5f"]
 
 
 def test_realtime_sends_bar_update(monkeypatch) -> None:
