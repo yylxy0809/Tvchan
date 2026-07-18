@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import secrets
+import threading
 import time
 import hashlib
 from dataclasses import dataclass, field
@@ -23,6 +24,52 @@ class WencaiConfigError(ValueError):
 
 class WencaiUpstreamError(RuntimeError):
     pass
+
+
+class WencaiPaginationError(WencaiConfigError):
+    pass
+
+
+class WencaiCapacityError(WencaiUpstreamError):
+    pass
+
+
+COOKIE_FETCH_MAX_CONCURRENCY = 4
+
+
+class _CookieFetchPermit:
+    def __init__(self, limiter: "_CookieFetchLimiter") -> None:
+        self._limiter = limiter
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._limiter._release()
+
+
+class _CookieFetchLimiter:
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> _CookieFetchPermit | None:
+        with self._lock:
+            if self._active >= self._limit:
+                return None
+            self._active += 1
+        return _CookieFetchPermit(self)
+
+    def _release(self) -> None:
+        with self._lock:
+            self._active -= 1
+
+
+_COOKIE_FETCH_LIMITER = _CookieFetchLimiter(COOKIE_FETCH_MAX_CONCURRENCY)
 
 
 @dataclass(frozen=True)
@@ -110,16 +157,17 @@ async def query_wencai(
     else:
         if not config.cookie.strip():
             raise WencaiConfigError("IWENCAI_API_KEY or WenCai cookie is required")
-        records = await asyncio.to_thread(
-            _fetch_all_records,
+        if page != 1:
+            raise WencaiPaginationError(
+                "WenCai cookie provider supports the first page only"
+            )
+        records = await _fetch_cookie_page(
             query=query,
+            page_size=page_size,
             config=config,
         )
         items = [_normalize_item(record) for record in records]
         total = len(items)
-        start = max(0, (page - 1) * page_size)
-        end = start + page_size
-        items = items[start:end]
     return WencaiQueryResult(
         query=query,
         total=total,
@@ -213,22 +261,47 @@ def _connectivity_error_class(exc: Exception) -> str:
     return "unavailable"
 
 
-def _fetch_all_records(*, query: str, config: WencaiConfig) -> list[dict[str, Any]]:
+async def _fetch_cookie_page(
+    *, query: str, page_size: int, config: WencaiConfig
+) -> list[dict[str, Any]]:
+    permit = _COOKIE_FETCH_LIMITER.try_acquire()
+    if permit is None:
+        raise WencaiCapacityError("WenCai cookie provider is busy")
+
+    try:
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                _fetch_cookie_page_sync,
+                query=query,
+                page_size=page_size,
+                config=config,
+            )
+        )
+    except BaseException:
+        permit.release()
+        raise
+    worker.add_done_callback(lambda _worker: permit.release())
+    return await asyncio.shield(worker)
+
+
+def _fetch_cookie_page_sync(
+    *, query: str, page_size: int, config: WencaiConfig
+) -> list[dict[str, Any]]:
     try:
         result = _call_pywencai_get(
             query=query,
             cookie=config.cookie.strip(),
             user_agent=config.user_agent or None,
             pro=config.pro,
-            loop=True,
-            perpage=100,
+            loop=False,
+            perpage=page_size,
             retry=1,
             no_detail=True,
             log=False,
         )
     except Exception as exc:
-        raise WencaiUpstreamError(f"问财请求失败：{exc}") from exc
-    return _records_from_result(result)
+        raise WencaiUpstreamError("WenCai cookie provider request failed") from exc
+    return _records_from_result(result, limit=page_size)
 
 
 def _fetch_openapi_page(
@@ -346,14 +419,18 @@ def _call_pywencai_get(**kwargs):
     return pywencai.get(**kwargs)
 
 
-def _records_from_result(value: Any) -> list[dict[str, Any]]:
+def _records_from_result(
+    value: Any, *, limit: int | None = None
+) -> list[dict[str, Any]]:
     if value is None:
         return []
     if isinstance(value, list):
-        return [dict(item) for item in value if isinstance(item, dict)]
+        source = value if limit is None else value[:limit]
+        return [dict(item) for item in source if isinstance(item, dict)]
     if hasattr(value, "to_dict"):
         try:
-            records = value.to_dict(orient="records")
+            source = value if limit is None else value.head(limit)
+            records = source.to_dict(orient="records")
             return [dict(item) for item in records if isinstance(item, dict)]
         except TypeError:
             pass
