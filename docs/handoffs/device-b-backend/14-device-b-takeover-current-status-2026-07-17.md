@@ -11,8 +11,8 @@
 当前已验收的主干基线：
 
 ```text
-origin/master = 3aa227cc1be076a8ff7be0b67ac9b4c4b844936b
-short SHA     = 3aa227c
+origin/master = 338a71a6783c60725962b60c6c93688d4951d43f
+short SHA     = 338a71a
 ```
 
 | PR | 交付层 | 状态 |
@@ -56,6 +56,9 @@ short SHA     = 3aa227c
 | #59 | 浏览器认证会话图表 WebSocket 隔离 | 已合入；恢复验证前、认证成功与登出均重置 singleton transport，旧 token 不跨会话重连或投递 |
 | #60 | History export 资源与所有权边界 | 已合入；流式请求、TTL、并发、记录/字节/chunk 配额和 credential owner 全部 fail-visible、有硬上限 |
 | #61 | Redis trading-day cache lease 原子释放 | 已合入；静态 Lua compare-delete 防止旧 owner 删除 successor lease，无非原子 fallback |
+| #62 | 设备 B 接管状态刷新 | 已合入；记录 PR #58-#61、验证归属与 canonical freshness 阻塞 |
+| #63 | protected WebSocket 订阅资源边界 | 已合入；realtime/chart 每连接最多 32 个订阅，七个协议 timeframe 有界去重且保留兼容默认 |
+| #64 | Lifecycle observer 管理状态请求围栏 | 已合入；latest-request 与 lifecycle generation 隔离乱序、卸载和 StrictMode 迟到响应 |
 
 三层 rebased 代码、合入后验收、v4/lifecycle 防火墙与 scope catalog 两阶段实现均已进入主干。旧 PR 和旧分支仅用于审计，不应再次合并、rebase 或强推。
 
@@ -128,8 +131,10 @@ short SHA     = 3aa227c
 14. **浏览器会话 transport 隔离**：PR #59 在 saved-session 验证前、认证成功和登出边界同步重置 chart/realtime WebSocket client，清理连接/重连计时器、订阅与 session generation，并以 socket identity 围栏迟到事件。
 15. **History export 资源与所有权边界**：PR #60 对实际请求流、bars、序列化/压缩体、chunk、并发、TTL、per-credential 与全局缓存施加硬上限；不同 credential、过期和未知 chunk 统一 404，容量与验证错误均脱敏、fail-visible。
 16. **Redis sidebar lease 原子释放**：PR #61 用参数化单键 Lua 对 owner token 做 compare-delete，关闭 GET 与 DELETE 之间 successor lease 被旧 owner 删除的竞态；Redis 故障继续传播且禁止回退到两条命令。
+17. **protected WebSocket 订阅资源边界**：PR #63 对 realtime 与 chart 两个受保护 WebSocket 分别施加每连接 32 个订阅的硬上限；同 ID 替换不增加占用，超限在插入和 DB/overlay 副作用前 fail-visible；realtime timeframe 输入按全部七个协议周期有界、规范化并去重，同时保留既有 falsy 默认 `5f` 语义。
+18. **Lifecycle observer 管理状态请求围栏**：PR #64 让并发状态刷新只接受最新普通响应，并以 active lifecycle generation 隔离卸载、重新挂载和 StrictMode 迟到响应；同一有效 lifecycle 内的 401/403 仍优先触发权威登出。
 
-组合验证基线：Web contract `133/133` 且 production build 通过；API `276 passed / 8 skipped`；Collector `671 passed / 3 skipped`，另有一个仅因本机缺少可选 `notte_core` 依赖的既有环境失败。strict-v2 producer/consumer 已通过 focused、全套及 disposable PostgreSQL/TimescaleDB 的迁移、并发、回滚和 fencing 验证。selection-v2 共享合同已通过 shared/API/Collector/Web 三层回归；PR #55-#61 均通过相应 focused/full、`compileall` 或 production build、diff/security 检查与独立 P0/P1 复审，其中 PR #56 另通过 disposable TimescaleDB 验证。PR #60 的 history export focused 为 `19/19`；PR #61 的 Redis lease/sidebar/runtime focused 为 `15/15`。上述后续工程验证均未连接或写入生产库。
+组合验证基线：Web contract `137/137` 且 production build 通过；API `279 passed / 8 skipped`；Collector `671 passed / 3 skipped`，另有一个仅因本机缺少可选 `notte_core` 依赖的既有环境失败。strict-v2 producer/consumer 已通过 focused、全套及 disposable PostgreSQL/TimescaleDB 的迁移、并发、回滚和 fencing 验证。selection-v2 共享合同已通过 shared/API/Collector/Web 三层回归；PR #55-#64 均通过相应 focused/full、`compileall` 或 production build、diff/security 检查与独立 P0/P1 复审，其中 PR #56 另通过 disposable TimescaleDB 验证。PR #60 的 history export focused 为 `19/19`；PR #61 的 Redis lease/sidebar/runtime focused 为 `15/15`；PR #63 的 WebSocket focused 为 `17/17`；PR #64 的 Admin Console focused 为 `19/19`。上述后续工程验证均未连接或写入生产库。
 
 生产 `kline_scope_catalog` generation `2188f14c-0b35-416d-9671-fd3d227d1f75` 已 complete/active，control revision 为 `1`，`scope_count=expected_scope_count=38738`，unknown/incomplete 为零；bootstrap worker 已移除。canonical K-line 指纹保持不变，outbox blocking 为零，observer 健康。
 
