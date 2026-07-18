@@ -15,7 +15,15 @@ from app.repositories.chan_screener import (
 from app.repositories import runtime_config as runtime_config_repository
 from app.services.llm_config import WENCAI_CONFIG_KEY, resolve_active_llm_provider
 from app.services.llm_client import parse_chan_query_with_llm
-from app.services.wencai_client import WencaiApiKey, WencaiConfig, WencaiConfigError, WencaiUpstreamError, query_wencai
+from app.services.wencai_client import (
+    WencaiApiKey,
+    WencaiCapacityError,
+    WencaiConfig,
+    WencaiConfigError,
+    WencaiPaginationError,
+    WencaiUpstreamError,
+    query_wencai,
+)
 
 router = APIRouter(prefix="/screener", tags=["screener"], dependencies=[Depends(require_token)])
 
@@ -39,6 +47,16 @@ async def wencai_screener(
             page_size=page_size,
             config=config,
         )
+    except WencaiPaginationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="WenCai cookie provider supports the first page only",
+        ) from exc
+    except WencaiCapacityError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="WenCai cookie provider is busy",
+        ) from exc
     except WencaiConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except WencaiUpstreamError as exc:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -139,7 +140,9 @@ def test_wencai_service_retries_timeout_once_before_switching_keys(monkeypatch: 
     assert attempted == ["first-secret", "first-secret", "second-secret"]
 
 
-def test_wencai_service_calls_live_provider_and_paginates(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wencai_service_cookie_provider_fetches_only_bounded_first_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from app.services import wencai_client
     from app.services.wencai_client import WencaiConfig, query_wencai
 
@@ -158,7 +161,7 @@ def test_wencai_service_calls_live_provider_and_paginates(monkeypatch: pytest.Mo
     result = asyncio.run(
         query_wencai(
             query="今日涨停",
-            page=2,
+            page=1,
             page_size=2,
             config=WencaiConfig(cookie="cookie=value", user_agent="ua", pro=True, timeout_seconds=6),
         )
@@ -168,10 +171,166 @@ def test_wencai_service_calls_live_provider_and_paginates(monkeypatch: pytest.Mo
     assert captured["cookie"] == "cookie=value"
     assert captured["user_agent"] == "ua"
     assert captured["pro"] is True
-    assert captured["loop"] is True
-    assert captured["perpage"] == 100
-    assert result.total == 3
-    assert [item.code for item in result.items] == ["300003"]
+    assert captured["loop"] is False
+    assert captured["perpage"] == 2
+    assert result.total == 2
+    assert [item.code for item in result.items] == ["600001", "000002"]
+
+
+def test_wencai_service_cookie_provider_rejects_later_pages_before_offload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import wencai_client
+    from app.services.wencai_client import (
+        WencaiConfig,
+        WencaiPaginationError,
+        query_wencai,
+    )
+
+    async def unexpected_to_thread(*_args, **_kwargs):
+        raise AssertionError("later pages must fail before creating an offload")
+
+    monkeypatch.setattr(wencai_client.asyncio, "to_thread", unexpected_to_thread)
+    with pytest.raises(WencaiPaginationError, match="first page"):
+        asyncio.run(
+            query_wencai(
+                query="今日涨停",
+                page=2,
+                page_size=20,
+                config=WencaiConfig(cookie="cookie=value"),
+            )
+        )
+
+
+def test_wencai_service_cookie_provider_bounds_concurrent_offloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import wencai_client
+    from app.services.wencai_client import (
+        WencaiCapacityError,
+        WencaiConfig,
+        query_wencai,
+    )
+
+    calls = 0
+    controls: dict[str, tuple[threading.Event, threading.Event]] = {}
+
+    def blocking_get(**kwargs):
+        nonlocal calls
+        calls += 1
+        started, release = controls[kwargs["query"]]
+        started.set()
+        release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr(wencai_client, "_call_pywencai_get", blocking_get)
+    monkeypatch.setattr(
+        wencai_client,
+        "_COOKIE_FETCH_LIMITER",
+        wencai_client._CookieFetchLimiter(1),
+    )
+
+    async def scenario(label: str) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        controls[label] = (started, release)
+        calls_before = calls
+        config = WencaiConfig(cookie="cookie=value")
+        first = asyncio.create_task(
+            query_wencai(query=label, page=1, page_size=20, config=config)
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            with pytest.raises(WencaiCapacityError, match="busy"):
+                await query_wencai(query="second", page=1, page_size=20, config=config)
+            assert calls == calls_before + 1
+        finally:
+            release.set()
+            await first
+
+    asyncio.run(scenario("first-loop"))
+    asyncio.run(scenario("second-loop"))
+    assert calls == 2
+
+
+def test_wencai_service_cookie_provider_holds_slot_until_cancelled_worker_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import wencai_client
+    from app.services.wencai_client import (
+        WencaiCapacityError,
+        WencaiConfig,
+        query_wencai,
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def blocking_get(**_kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr(wencai_client, "_call_pywencai_get", blocking_get)
+    monkeypatch.setattr(
+        wencai_client,
+        "_COOKIE_FETCH_LIMITER",
+        wencai_client._CookieFetchLimiter(1),
+    )
+
+    async def scenario() -> None:
+        config = WencaiConfig(cookie="cookie=value")
+        first = asyncio.create_task(
+            query_wencai(query="first", page=1, page_size=20, config=config)
+        )
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        with pytest.raises(WencaiCapacityError, match="busy"):
+            await query_wencai(query="still-busy", page=1, page_size=20, config=config)
+        assert calls == 1
+
+        release.set()
+        for _ in range(100):
+            try:
+                await query_wencai(query="after-release", page=1, page_size=20, config=config)
+                break
+            except WencaiCapacityError:
+                await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("slot was not released after the worker finished")
+        assert calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_wencai_service_cookie_provider_sanitizes_upstream_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import wencai_client
+    from app.services.wencai_client import WencaiConfig, WencaiUpstreamError, query_wencai
+
+    def failing_get(**_kwargs):
+        raise RuntimeError("cookie=private-value")
+
+    monkeypatch.setattr(wencai_client, "_call_pywencai_get", failing_get)
+    with pytest.raises(WencaiUpstreamError) as raised:
+        asyncio.run(
+            query_wencai(
+                query="test",
+                page=1,
+                page_size=20,
+                config=WencaiConfig(cookie="cookie=value"),
+            )
+        )
+    assert "private-value" not in str(raised.value)
 
 
 def test_wencai_screener_endpoint_reads_config_and_returns_page(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -209,6 +368,38 @@ def test_wencai_screener_endpoint_reads_config_and_returns_page(monkeypatch: pyt
     assert body["page"] == 1
     assert body["page_size"] == 50
     assert [item["code"] for item in body["items"]] == ["600001", "000002"]
+
+
+@pytest.mark.parametrize(
+    ("error_name", "status_code", "detail"),
+    [
+        ("WencaiPaginationError", 422, "WenCai cookie provider supports the first page only"),
+        ("WencaiCapacityError", 429, "WenCai cookie provider is busy"),
+    ],
+)
+def test_wencai_screener_maps_cookie_provider_bounds_without_leaking_details(
+    monkeypatch: pytest.MonkeyPatch,
+    error_name: str,
+    status_code: int,
+    detail: str,
+) -> None:
+    from app.routes import screener
+    from app.services import wencai_client
+
+    async def fail_query(**_kwargs):
+        raise getattr(wencai_client, error_name)("private cookie detail")
+
+    monkeypatch.setattr(screener, "query_wencai", fail_query)
+    client = _client(Settings(api_token="api-token", wencai_cookie="cookie=value"))
+    response = client.get(
+        "/api/v1/screener/wencai",
+        params={"q": "今日涨停", "page": 1, "page_size": 20},
+        headers={"Authorization": "Bearer api-token"},
+    )
+
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+    assert "private" not in response.text
 
 
 def test_wencai_admin_test_uses_submitted_config_without_saving(monkeypatch: pytest.MonkeyPatch) -> None:
