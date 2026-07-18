@@ -70,6 +70,11 @@ _WORKERS: dict[str, WorkerSpec] = {
         module="collector.parquet_bootstrap_audit",
         description="Scheme2 parquet bootstrap audit command.",
     ),
+    "aggregate-increment-import": WorkerSpec(
+        name="aggregate-increment-import",
+        module="collector.aggregate_increment_import",
+        description="Append approved aggregate 5f/30f/1d incremental Parquet files.",
+    ),
     "kline-scope-bootstrap": WorkerSpec(
         name="kline-scope-bootstrap",
         module="collector.kline_scope_catalog",
