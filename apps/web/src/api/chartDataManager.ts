@@ -151,6 +151,8 @@ type RealtimeBarState = {
 class ChartWebSocketClient {
   private socket: WebSocket | null = null;
   private connectPromise: Promise<WebSocket> | null = null;
+  private connectReject: ((error: Error) => void) | null = null;
+  private connectTimer: number | null = null;
   private pending = new Map<
     string,
     {
@@ -169,6 +171,29 @@ class ChartWebSocketClient {
     }
   >();
   private reconnectTimer: number | null = null;
+
+  reset(): void {
+    const error = new Error("Authentication session changed");
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.clearConnectTimer();
+    this.subscriptions.clear();
+    this.rejectPending(error);
+    this.connectReject?.(error);
+    this.connectReject = null;
+    this.connectPromise = null;
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      socket.onopen = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.onmessage = null;
+      if (socket.readyState < 2) socket.close();
+    }
+  }
 
   async request<T extends WebSocketReply>(
     payload: Omit<WebSocketRequest, "request_id"> & { type: string },
@@ -275,17 +300,20 @@ class ChartWebSocketClient {
       return this.connectPromise;
     }
     this.connectPromise = new Promise((resolve, reject) => {
+      this.connectReject = reject;
       const socket = createChartSocket();
       this.socket = socket;
-      const timer = window.setTimeout(() => {
+      this.connectTimer = window.setTimeout(() => {
         if (this.socket !== socket) return;
+        this.connectTimer = null;
         socket.close();
         reject(new Error("WebSocket chart transport connect timeout"));
       }, 4_000);
       socket.onopen = () => {
         if (this.socket !== socket) return;
-        window.clearTimeout(timer);
+        this.clearConnectTimer();
         this.connectPromise = null;
+        this.connectReject = null;
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
           this.reconnectTimer = null;
@@ -296,17 +324,25 @@ class ChartWebSocketClient {
       };
       socket.onerror = () => {
         if (this.socket !== socket) return;
-        window.clearTimeout(timer);
+        this.clearConnectTimer();
+        if (this.connectPromise === null) {
+          socket.close();
+          return;
+        }
         this.socket = null;
         this.connectPromise = null;
+        this.connectReject = null;
         reject(new Error("WebSocket chart transport failed"));
       };
       socket.onclose = () => {
         if (this.socket !== socket) return;
-        window.clearTimeout(timer);
+        this.clearConnectTimer();
         this.socket = null;
         this.connectPromise = null;
-        this.rejectPending(new Error("WebSocket chart transport closed"));
+        const error = new Error("WebSocket chart transport closed");
+        this.connectReject?.(error);
+        this.connectReject = null;
+        this.rejectPending(error);
         this.notifyTransport("disconnected");
         this.scheduleReconnect();
       };
@@ -316,6 +352,12 @@ class ChartWebSocketClient {
       };
     });
     return this.connectPromise;
+  }
+
+  private clearConnectTimer(): void {
+    if (this.connectTimer === null) return;
+    window.clearTimeout(this.connectTimer);
+    this.connectTimer = null;
   }
 
   private handleMessage(data: unknown): void {
@@ -417,6 +459,8 @@ class ChartWebSocketClient {
 class RealtimeBarSocketClient {
   private socket: WebSocket | null = null;
   private connectPromise: Promise<WebSocket> | null = null;
+  private connectReject: ((error: Error) => void) | null = null;
+  private connectTimer: number | null = null;
   private subscriptions = new Map<
     string,
     {
@@ -433,6 +477,29 @@ class RealtimeBarSocketClient {
   private reconnectTimer: number | null = null;
   private connectionGeneration = 0;
   private activeGeneration = 0;
+
+  reset(): void {
+    const error = new Error("Authentication session changed");
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.clearConnectTimer();
+    this.subscriptions.clear();
+    this.sidebarSubscriptions.clear();
+    this.connectReject?.(error);
+    this.connectReject = null;
+    this.connectPromise = null;
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      socket.onopen = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.onmessage = null;
+      if (socket.readyState < 2) socket.close();
+    }
+  }
 
   async subscribe(
     subscriptionId: string,
@@ -505,18 +572,23 @@ class RealtimeBarSocketClient {
       return this.connectPromise;
     }
     this.connectPromise = new Promise((resolve, reject) => {
+      this.connectReject = reject;
       const socket = createRealtimeSocket();
+      this.socket = socket;
       let socketGeneration = 0;
-      const timer = window.setTimeout(() => {
+      this.connectTimer = window.setTimeout(() => {
+        if (this.socket !== socket) return;
+        this.connectTimer = null;
         socket.close();
         reject(new Error("Realtime bar transport connect timeout"));
       }, 4_000);
       socket.onopen = () => {
-        window.clearTimeout(timer);
-        this.socket = socket;
+        if (this.socket !== socket) return;
+        this.clearConnectTimer();
         socketGeneration = ++this.connectionGeneration;
         this.activeGeneration = socketGeneration;
         this.connectPromise = null;
+        this.connectReject = null;
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
           this.reconnectTimer = null;
@@ -526,23 +598,38 @@ class RealtimeBarSocketClient {
         resolve(socket);
       };
       socket.onerror = () => {
-        window.clearTimeout(timer);
+        if (this.socket !== socket) return;
+        this.clearConnectTimer();
+        if (this.connectPromise === null) {
+          socket.close();
+          return;
+        }
+        this.socket = null;
         this.connectPromise = null;
+        this.connectReject = null;
         reject(new Error("Realtime bar transport failed"));
       };
       socket.onclose = () => {
-        window.clearTimeout(timer);
-        if (this.socket === socket) {
-          this.socket = null;
-          this.connectPromise = null;
-          this.scheduleReconnect();
-        }
+        if (this.socket !== socket) return;
+        this.clearConnectTimer();
+        this.socket = null;
+        this.connectPromise = null;
+        this.connectReject?.(new Error("Realtime bar transport closed"));
+        this.connectReject = null;
+        this.scheduleReconnect();
       };
       socket.onmessage = (event) => {
+        if (this.socket !== socket) return;
         this.handleMessage(event.data, socketGeneration);
       };
     });
     return this.connectPromise;
+  }
+
+  private clearConnectTimer(): void {
+    if (this.connectTimer === null) return;
+    window.clearTimeout(this.connectTimer);
+    this.connectTimer = null;
   }
 
   private handleMessage(data: unknown, sessionGeneration: number): void {
@@ -695,6 +782,17 @@ export class ChartDataManager {
 
   get transportMode(): string {
     return CHART_DATA_TRANSPORT;
+  }
+
+  resetSession(): void {
+    this.wsClient.reset();
+    this.realtimeClient.reset();
+    this.wsClient = new ChartWebSocketClient();
+    this.realtimeClient = new RealtimeBarSocketClient();
+    this.latestRealtimeVersions.clear();
+    this.realtimeBarStates.clear();
+    this.realtimeSessionGenerations.clear();
+    this.wsDisabledUntil = 0;
   }
 
   subscribeHistoryWindows(

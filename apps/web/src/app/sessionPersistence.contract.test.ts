@@ -96,3 +96,27 @@ test("App restores a saved credential through the backend before creating a sess
   assert.match(loginPageSource, /attemptFence\.current = fence/);
   assert.match(loginPageSource, /return \(\) => fence\.dispose\(\)/);
 });
+
+test("App resets chart transports at authentication session boundaries", () => {
+  const appSource = readFileSync(new URL("../App.tsx", import.meta.url), "utf8");
+  const restore = appSource.slice(
+    appSource.indexOf("useEffect(() =>"),
+    appSource.indexOf("function handleAuthenticated"),
+  );
+  const authenticated = appSource.slice(
+    appSource.indexOf("function handleAuthenticated"),
+    appSource.indexOf("function handleLogout"),
+  );
+  const logout = appSource.slice(
+    appSource.indexOf("function handleLogout"),
+    appSource.indexOf("if (restoringSession)"),
+  );
+
+  assert.match(appSource, /import \{ chartDataManager \} from "\.\/api\/chartDataManager"/);
+  assert.match(
+    restore,
+    /chartDataManager\.resetSession\(\);[\s\S]*loginWithToken\(initialLoginToken\)/,
+  );
+  assert.match(authenticated, /chartDataManager\.resetSession\(\)/);
+  assert.match(logout, /chartDataManager\.resetSession\(\)/);
+});
