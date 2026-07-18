@@ -13,6 +13,7 @@ KLINE_DML = re.compile(
 )
 
 EXPECTED_WRITERS = {
+    "aggregate_increment_import.py": ("record_present_scopes",),
     "aggregate_timeframes_from_daily.py": ("refresh_scopes_exact",),
     "kline_canonical_audit.py": ("invalidate_scopes",),
     "native_parquet_import.py": ("record_present_scopes",),
