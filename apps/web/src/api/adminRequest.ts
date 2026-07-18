@@ -60,7 +60,12 @@ function redactToken(message: string, token: string): string {
 }
 
 async function readResponseError(response: Response): Promise<string> {
-  const text = await response.text();
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    return `${response.status} ${response.statusText}`.trim();
+  }
   if (!text) {
     return `${response.status} ${response.statusText}`;
   }

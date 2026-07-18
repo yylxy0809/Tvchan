@@ -91,6 +91,33 @@ test("admin runtime requests preserve auth status without leaking the token", as
   }
 });
 
+test("admin auth rejection preserves status when the response body is unreadable", async () => {
+  const token = "admin-secret-token";
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const status of [401, 403]) {
+      globalThis.fetch = async () => ({
+        ok: false,
+        status,
+        statusText: "Rejected",
+        text: async () => {
+          throw new TypeError(`unreadable body for ${token}`);
+        },
+      }) as unknown as Response;
+
+      await assert.rejects(fetchAdminOpsStatus(token), (error: unknown) => {
+        assert.ok(error instanceof AdminRequestError);
+        assert.equal(error.status, status);
+        assert.equal(isAdminAuthFailure(error), true);
+        assert.doesNotMatch(error.message, new RegExp(token));
+        return true;
+      });
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("admin auth failures logout instead of fabricating observer health", () => {
   const source = readFileSync(new URL("./AdminConsole.tsx", import.meta.url), "utf8");
   const appSource = readFileSync(new URL("../App.tsx", import.meta.url), "utf8");
