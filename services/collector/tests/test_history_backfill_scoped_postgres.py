@@ -267,7 +267,7 @@ def test_scoped_run_is_durable_and_legacy_worker_cannot_claim_or_mutate_it() -> 
 
                 bar = Bar(
                     symbol=symbol, timeframe="5f",
-                    ts=datetime(2026, 7, 13, 7, tzinfo=UTC),
+                    ts=datetime(2026, 7, 17, 7, tzinfo=UTC),
                     open=1, high=1, low=1, close=1, volume=1, source="pytdx",
                 )
                 async with PostgresKlineWriter(TEST_DATABASE_URL) as writer:
@@ -313,13 +313,55 @@ def test_scoped_run_is_durable_and_legacy_worker_cannot_claim_or_mutate_it() -> 
                     assert await writer.commit_history_backfill_page(
                         task=task, expected_offset=0, next_offset=1,
                         bars=[bar], oldest_ts=bar.ts, newest_ts=bar.ts,
-                        exhausted=True, lease_seconds=30,
+                        exhausted=False, lease_seconds=30,
                         provider_newest_ts=cutoff.replace(day=17),
                     ) == 1
+                    assert await store.ensure_scoped_run_tasks(
+                        run_id=run_id, run_identity=run_identity,
+                        manifest_sha256=manifest_sha256,
+                        symbols=[symbol_info_from_symbol(symbol)], timeframes=["5f"],
+                        stop_at={"5f": cutoff},
+                        expected_through={"5f": cutoff.replace(day=17)},
+                        freshness_contract_sha256="a" * 64,
+                        provider="pytdx", page_size=10,
+                        endpoint="127.0.0.1:7709", source_policy="primary_failover",
+                    ) == scoped_ids
+                    assert await writer.commit_history_backfill_page(
+                        task=task, expected_offset=1, next_offset=1,
+                        bars=[], oldest_ts=None, newest_ts=None,
+                        exhausted=True, lease_seconds=30,
+                        provider_newest_ts=cutoff.replace(day=17),
+                    ) == 0
                 assert await setup.fetchval(
                     "select status from historical_backfill_tasks where id=$1",
                     task["id"],
                 ) == "success"
+                assert await store.ensure_scoped_run_tasks(
+                    run_id=run_id, run_identity=run_identity,
+                    manifest_sha256=manifest_sha256,
+                    symbols=[symbol_info_from_symbol(symbol)], timeframes=["5f"],
+                    stop_at={"5f": cutoff},
+                    expected_through={"5f": cutoff.replace(day=17)},
+                    freshness_contract_sha256="a" * 64,
+                    provider="pytdx", page_size=10,
+                    endpoint="127.0.0.1:7709", source_policy="primary_failover",
+                ) == scoped_ids
+                await setup.execute(
+                    """update kline_scope_catalog set max_ts=$1
+                       where generation_id=$2 and symbol_id=$3 and timeframe=5""",
+                    cutoff.replace(day=16), generation_id, symbol_id,
+                )
+                with pytest.raises(RuntimeError, match="catalog progress mismatch"):
+                    await store.ensure_scoped_run_tasks(
+                        run_id=run_id, run_identity=run_identity,
+                        manifest_sha256=manifest_sha256,
+                        symbols=[symbol_info_from_symbol(symbol)], timeframes=["5f"],
+                        stop_at={"5f": cutoff},
+                        expected_through={"5f": cutoff.replace(day=17)},
+                        freshness_contract_sha256="a" * 64,
+                        provider="pytdx", page_size=10,
+                        endpoint="127.0.0.1:7709", source_policy="primary_failover",
+                    )
         finally:
             await setup.close()
 

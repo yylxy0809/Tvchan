@@ -207,6 +207,31 @@ class PostgresBackfillTaskStore:
                 )
                 if control is None:
                     raise RuntimeError("active complete K-line scope catalog is unavailable")
+                existing_run = await conn.fetchrow(
+                    """
+                    select run_id
+                    from historical_backfill_scoped_runs
+                    where run_id = $1
+                    for share
+                    """,
+                    run_id,
+                )
+                task_rows = None
+                if existing_run is not None:
+                    task_rows = await conn.fetch(
+                        """
+                        select task.id, task.status, task.next_offset, task.pages_done,
+                               task.bars_written, task.provider_newest_ts, task.stop_at,
+                               task.expected_through, task.timeframe,
+                               symbol.code || '.' || symbol.exchange as symbol
+                        from historical_backfill_tasks task
+                        join symbols symbol on symbol.id = task.symbol_id
+                        where task.run_id = $1
+                        order by task.id
+                        for share of task, symbol
+                        """,
+                        run_id,
+                    )
                 authoritative = await conn.fetch(
                     """
                     select symbol.id, symbol.code || '.' || symbol.exchange as symbol,
@@ -221,6 +246,7 @@ class PostgresBackfillTaskStore:
                     where (symbol.code || '.' || symbol.exchange) = any($2::text[])
                       and symbol.is_active
                     order by symbol.id, catalog.timeframe
+                    for share of symbol, catalog
                     """,
                     control["active_generation_id"],
                     symbol_names,
@@ -249,7 +275,7 @@ class PostgresBackfillTaskStore:
                     for row in authoritative
                     if row["max_ts"] != stop_at_by_code[int(row["timeframe"])]
                 )
-                if mismatched_bounds:
+                if existing_run is None and mismatched_bounds:
                     raise RuntimeError(
                         "scoped backfill stop-at differs from pinned catalog max_ts: "
                         f"{mismatched_bounds[:10]}"
@@ -323,21 +349,71 @@ class PostgresBackfillTaskStore:
                         timeframe_code, provider, page_size,
                         symbol_names,
                     )
-                rows = await conn.fetch(
-                    """
-                    select task.id
-                    from historical_backfill_tasks task
-                    where task.run_id = $1
-                    order by task.id
-                    """,
-                    run_id,
-                )
+                rows = task_rows
+                if rows is None:
+                    rows = await conn.fetch(
+                        """
+                        select task.id, task.status, task.next_offset, task.pages_done,
+                               task.bars_written, task.provider_newest_ts, task.stop_at,
+                               task.expected_through, task.timeframe,
+                               symbol.code || '.' || symbol.exchange as symbol
+                        from historical_backfill_tasks task
+                        join symbols symbol on symbol.id = task.symbol_id
+                        where task.run_id = $1
+                        order by task.id
+                        for share of task, symbol
+                        """,
+                        run_id,
+                    )
                 task_ids = [int(row["id"]) for row in rows]
                 if len(task_ids) != expected_tasks:
                     raise RuntimeError(
                         "scoped backfill task cardinality mismatch: "
                         f"expected {expected_tasks}, got {len(task_ids)}"
                     )
+                if existing_run is not None:
+                    timeframe_by_code = {
+                        timeframe_to_db_code(timeframe): timeframe
+                        for timeframe in timeframe_names
+                    }
+                    catalog_max_by_scope = {
+                        (str(row["symbol"]), int(row["timeframe"])): row["max_ts"]
+                        for row in authoritative
+                    }
+                    progress_mismatches = []
+                    for row in rows:
+                        code = int(row["timeframe"])
+                        timeframe = timeframe_by_code.get(code)
+                        symbol = str(row["symbol"])
+                        if (
+                            timeframe is None
+                            or row["stop_at"] != stop_at.get(timeframe)
+                            or row["expected_through"] != expected_through.get(timeframe)
+                        ):
+                            raise RuntimeError(
+                                "scoped backfill durable task identity mismatch"
+                            )
+                        progressed = (
+                            int(row["next_offset"]) > 0
+                            or int(row["pages_done"]) > 0
+                            or int(row["bars_written"]) > 0
+                            or row["provider_newest_ts"] is not None
+                        )
+                        required_max = (
+                            expected_through[timeframe]
+                            if str(row["status"]) == "success" or progressed
+                            else stop_at[timeframe]
+                        )
+                        actual_max = catalog_max_by_scope.get((symbol, code))
+                        if actual_max != required_max:
+                            progress_mismatches.append(
+                                (symbol, code, str(row["status"]), actual_max, required_max)
+                            )
+                    if progress_mismatches:
+                        raise RuntimeError(
+                            "scoped backfill catalog progress mismatch: "
+                            f"{progress_mismatches[:10]}"
+                        )
                 return task_ids
 
     async def reset_running(
