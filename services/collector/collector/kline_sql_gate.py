@@ -14,6 +14,7 @@ import os
 import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Sequence
 
 import asyncpg
@@ -112,6 +113,25 @@ def _normalize_timeframes(timeframes: Sequence[int]) -> tuple[int, ...]:
     return TIMEFRAMES
 
 
+def _validated_freshness_contract(value: Any | None) -> Any | None:
+    if value is None:
+        return None
+    # Local import avoids the module_c_eligibility -> kline_sql_gate import
+    # cycle while making programmatic callers use the exact shared parser too.
+    from collector.module_c_eligibility import parse_freshness_contract
+
+    try:
+        validated = parse_freshness_contract(value.normalized)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("invalid authoritative freshness contract") from error
+    if (
+        value.contract_version != validated.contract_version
+        or value.sha256 != validated.sha256
+    ):
+        raise ValueError("authoritative freshness contract identity mismatch")
+    return validated
+
+
 def _advisory_lock_keys(run_id: uuid.UUID) -> tuple[int, int]:
     """Derive distinct claim and writer-fence keys for one audit UUID."""
     def derive(purpose: bytes) -> int:
@@ -129,10 +149,11 @@ async def _claim_audit_run(
     conn: Any,
     run_id: uuid.UUID,
     lock_owner_id: str,
+    freshness_contract: Any | None = None,
 ) -> None:
     """Claim or recover an incomplete run while its UUID advisory lock is held."""
     lock_owner_id = str(uuid.UUID(lock_owner_id))
-    pending = json.dumps({
+    pending_payload: dict[str, Any] = {
         "contract_version": EVIDENCE_CONTRACT_VERSION,
         "engine": "sql_gate",
         "apply_mode": False,
@@ -140,7 +161,11 @@ async def _claim_audit_run(
         "evidence_status": "pending",
         "lock_protocol_version": AUDIT_LOCK_PROTOCOL_VERSION,
         "lock_owner_id": lock_owner_id,
-    }, sort_keys=True)
+    }
+    if freshness_contract is not None:
+        pending_payload["freshness_contract_version"] = freshness_contract.contract_version
+        pending_payload["freshness_contract_sha256"] = freshness_contract.sha256
+    pending = json.dumps(pending_payload, sort_keys=True)
     async with conn.transaction():
         existing = await conn.fetchrow(
             "SELECT status,parameters FROM kline_audit_runs "
@@ -160,28 +185,37 @@ async def _claim_audit_run(
             raise AuditRunAlreadyClaimed(
                 f"canonical audit {run_id} is already {status}; use a new UUID"
             )
-        if status == "running":
-            raw_parameters = existing["parameters"]
-            if isinstance(raw_parameters, str):
-                try:
-                    decoded_parameters = json.loads(raw_parameters)
-                except json.JSONDecodeError:
-                    parameters = {}
-                else:
-                    parameters = (
-                        decoded_parameters
-                        if isinstance(decoded_parameters, dict)
-                        else {}
-                    )
-            elif isinstance(raw_parameters, dict):
-                parameters = raw_parameters
-            else:
+        raw_parameters = existing["parameters"]
+        if isinstance(raw_parameters, str):
+            try:
+                decoded_parameters = json.loads(raw_parameters)
+            except json.JSONDecodeError:
                 parameters = {}
+            else:
+                parameters = (
+                    decoded_parameters
+                    if isinstance(decoded_parameters, dict)
+                    else {}
+                )
+        elif isinstance(raw_parameters, dict):
+            parameters = raw_parameters
+        else:
+            parameters = {}
+        if status == "running":
             if parameters.get("lock_protocol_version") != AUDIT_LOCK_PROTOCOL_VERSION:
                 raise AuditRunAlreadyClaimed(
                     f"canonical audit {run_id} is legacy running evidence; "
                     "operator confirmation is required before recovery"
                 )
+        if (
+            parameters.get("freshness_contract_version")
+            != pending_payload.get("freshness_contract_version")
+            or parameters.get("freshness_contract_sha256")
+            != pending_payload.get("freshness_contract_sha256")
+        ):
+            raise AuditRunAlreadyClaimed(
+                f"canonical audit {run_id} freshness contract changed during recovery"
+            )
         if status not in {"running", "failed"}:
             raise AuditRunAlreadyClaimed(
                 f"canonical audit {run_id} has unsupported status {status}"
@@ -199,7 +233,10 @@ async def _claim_audit_run(
         )
 
 
-async def _capture_snapshot_evidence(conn: Any) -> dict[str, Any]:
+async def _capture_snapshot_evidence(
+    conn: Any,
+    freshness_contract: Any | None = None,
+) -> dict[str, Any]:
     """Capture strict audit evidence from the coordinator's exported snapshot."""
     clock = await conn.fetchrow(EVIDENCE_CLOCK_SQL)
     if (
@@ -209,6 +246,13 @@ async def _capture_snapshot_evidence(conn: Any) -> dict[str, Any]:
         or not clock["transaction_snapshot"]
     ):
         raise InvalidAuditEvidence("audit snapshot clock/LSN evidence is missing")
+    if (
+        freshness_contract is not None
+        and freshness_contract.as_of > clock["observed_at"]
+    ):
+        raise InvalidAuditEvidence(
+            "authoritative as-of cannot be after the audit snapshot observation time"
+        )
     universe_rows = await conn.fetch(ACTIVE_UNIVERSE_SQL)
     universe = [
         {
@@ -301,6 +345,14 @@ async def _capture_snapshot_evidence(conn: Any) -> dict[str, Any]:
         "catalog_required_scope_count": len(catalog),
         "catalog_manifest_sha256": _manifest_sha256(catalog),
     }
+    if freshness_contract is not None:
+        evidence.update({
+            "freshness_contract": freshness_contract.normalized,
+            "freshness_contract_version": freshness_contract.contract_version,
+            "freshness_contract_sha256": freshness_contract.sha256,
+            "trading_calendar_id": freshness_contract.trading_calendar_id,
+            "trading_calendar_sha256": freshness_contract.trading_calendar_sha256,
+        })
     evidence["evidence_sha256"] = _manifest_sha256([evidence])
     return evidence
 
@@ -369,15 +421,29 @@ def build_gate_sql(timeframe: int) -> str:
     FROM daily_ends d
     LEFT JOIN base b ON b.symbol_id=d.symbol_id
       AND date_trunc('{bucket}', b.lts)=d.period_key
-    WHERE d.period_key < date_trunc(
-        '{bucket}', (SELECT observed_at FROM evidence_context) AT TIME ZONE 'Asia/Shanghai'
+    WHERE (
+        (
+            $4::timestamptz IS NULL
+            AND d.period_key < date_trunc(
+                '{bucket}', (SELECT observed_at FROM evidence_context) AT TIME ZONE 'Asia/Shanghai'
+            )
+        ) OR (
+            $4::timestamptz IS NOT NULL
+            AND d.expected_ts <= $4::timestamptz
+        )
     )
       AND b.symbol_id IS NULL
     GROUP BY d.symbol_id
 )"""
         higher_join = "LEFT JOIN daily_ends d ON d.symbol_id = b.symbol_id AND d.period_key = date_trunc('%s', b.lts)" % bucket
         missing_higher_join = "LEFT JOIN missing_higher mh ON mh.symbol_id = b.symbol_id"
-        higher_metrics = f"""count(*) FILTER (WHERE date_trunc('{bucket}', b.lts) >= date_trunc('{bucket}', (SELECT observed_at FROM evidence_context) AT TIME ZONE 'Asia/Shanghai'))::bigint AS current_open_periods,
+        higher_metrics = f"""count(*) FILTER (WHERE (
+           $4::timestamptz IS NULL
+           AND date_trunc('{bucket}', b.lts) >= date_trunc('{bucket}', (SELECT observed_at FROM evidence_context) AT TIME ZONE 'Asia/Shanghai')
+       ) OR (
+           $4::timestamptz IS NOT NULL
+           AND d.expected_ts > $4::timestamptz
+       ))::bigint AS current_open_periods,
        count(*) FILTER (WHERE d.expected_ts IS NOT NULL AND b.ts IS DISTINCT FROM d.expected_ts)::bigint AS timestamp_mismatches,
        count(*) FILTER (WHERE d.expected_ts IS NULL)::bigint AS missing_daily_basis,
        coalesce(max(mh.missing_higher_periods),0)::bigint AS missing_higher_periods"""
@@ -622,6 +688,7 @@ async def _worker(
     timeframe: int,
     observed_at: datetime,
     generation_id: uuid.UUID,
+    closed_period_cutoff: datetime | None = None,
 ) -> None:
     if not _SNAPSHOT_RE.fullmatch(snapshot):
         raise ValueError("invalid PostgreSQL snapshot identifier")
@@ -635,6 +702,7 @@ async def _worker(
             uuid.UUID(run_id),
             observed_at,
             generation_id,
+            closed_period_cutoff,
             timeout=None,
         )
     except BaseException:
@@ -697,6 +765,7 @@ async def _run_claimed_gate(
     run_id: str,
     run_uuid: uuid.UUID,
     timeframes: Sequence[int],
+    freshness_contract: Any | None = None,
 ) -> tuple[str, dict[str, Any]]:
     coordinator: Any | None = None
     coordinator_tx: Any | None = None
@@ -708,7 +777,7 @@ async def _run_claimed_gate(
         await coordinator_tx.start()
         coordinator_open = True
         snapshot = await coordinator.fetchval("SELECT pg_export_snapshot()")
-        evidence = await _capture_snapshot_evidence(coordinator)
+        evidence = await _capture_snapshot_evidence(coordinator, freshness_contract)
         observed_at = datetime.fromisoformat(str(evidence["observed_at"]))
         generation_id = uuid.UUID(str(evidence["catalog_generation_id"]))
         async with asyncio.TaskGroup() as workers:
@@ -725,6 +794,13 @@ async def _run_claimed_gate(
                         timeframe,
                         observed_at,
                         generation_id,
+                        (
+                            freshness_contract.expected_closed_watermarks[
+                                "1w" if timeframe == 10080 else "1m"
+                            ]
+                            if freshness_contract is not None and timeframe in (10080, 43200)
+                            else None
+                        ),
                     )
                 )
         await coordinator_tx.commit()
@@ -794,6 +870,7 @@ async def _run_with_lock_watchdog(
     run_id: str,
     run_uuid: uuid.UUID,
     timeframes: Sequence[int],
+    freshness_contract: Any | None = None,
 ) -> tuple[str, dict[str, Any]]:
     stop = asyncio.Event()
     gate_task = asyncio.create_task(
@@ -804,6 +881,7 @@ async def _run_with_lock_watchdog(
             run_id,
             run_uuid,
             timeframes,
+            freshness_contract,
         )
     )
     watchdog_task = asyncio.create_task(_watch_lock_session(setup, stop))
@@ -839,8 +917,10 @@ async def run_gate(
     database_url: str,
     run_id: str | None = None,
     timeframes: Sequence[int] = TIMEFRAMES,
+    freshness_contract: Any | None = None,
 ) -> tuple[str, dict[str, Any]]:
     timeframes = _normalize_timeframes(timeframes)
+    freshness_contract = _validated_freshness_contract(freshness_contract)
     run_id = run_id or str(uuid.uuid4())
     run_uuid = uuid.UUID(run_id)
     claim_key, writer_fence_key = _advisory_lock_keys(run_uuid)
@@ -892,7 +972,7 @@ async def run_gate(
         primary_key = await setup.fetchrow(PRIMARY_KEY_SQL)
         if not primary_key or not primary_key["convalidated"] or "(symbol_id, timeframe, ts)" not in primary_key["definition"]:
             raise RuntimeError("klines canonical primary key is absent or unvalidated")
-        await _claim_audit_run(setup, run_uuid, lock_owner_id)
+        await _claim_audit_run(setup, run_uuid, lock_owner_id, freshness_contract)
         return await _run_with_lock_watchdog(
             setup,
             database_url,
@@ -901,6 +981,7 @@ async def run_gate(
             run_id,
             run_uuid,
             timeframes,
+            freshness_contract,
         )
     finally:
         cleanup_errors: list[BaseException] = []
@@ -956,6 +1037,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
     parser.add_argument("--audit-run-id")
     parser.add_argument("--timeframe", action="append", type=int, choices=TIMEFRAMES)
+    parser.add_argument("--freshness-contract", type=Path)
     args = parser.parse_args(argv)
     if not args.database_url:
         parser.error("--database-url or DATABASE_URL is required")
@@ -971,6 +1053,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             args.timeframe = list(_normalize_timeframes(args.timeframe))
         except ValueError as error:
             parser.error(str(error))
+    try:
+        if args.freshness_contract is not None:
+            # Local import avoids the module_c_eligibility -> kline_sql_gate
+            # import cycle while reusing the one authoritative parser.
+            from collector.module_c_eligibility import load_freshness_contract
+
+            args.freshness_contract = load_freshness_contract(args.freshness_contract)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
     return args
 
 
@@ -980,6 +1071,7 @@ async def _main(argv: Sequence[str] | None = None) -> None:
         args.database_url,
         args.audit_run_id,
         tuple(args.timeframe),
+        args.freshness_contract,
     )
     print(json.dumps({"audit_run_id": run_id, "summary": summary}, sort_keys=True))
     if not summary["gate_pass"]:
