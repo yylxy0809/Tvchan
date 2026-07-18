@@ -491,7 +491,8 @@ WITH base AS {base_materialization} (
      AND c.symbol_id=u.symbol_id
      AND c.timeframe={timeframe}
 ), evidence_context AS MATERIALIZED (
-    SELECT $2::timestamptz AS observed_at
+    SELECT $2::timestamptz AS observed_at,
+           $4::timestamptz AS closed_period_cutoff
 ){daily_ctes}{logical_duplicates_cte}, metrics AS (
     SELECT b.symbol_id, min(b.ts) AS shard_start, max(b.ts) AS shard_end,
        count(*)::bigint AS rows_scanned,

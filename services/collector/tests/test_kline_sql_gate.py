@@ -157,6 +157,53 @@ def test_worker_binds_captured_generation_to_snapshot_query() -> None:
     assert args == (run_id, observed_at, generation_id, None)
 
 
+def test_higher_timeframe_worker_binds_closed_period_cutoff() -> None:
+    class Transaction:
+        async def start(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    class Connection:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, tuple[object, ...]]] = []
+
+        def transaction(self, **_kwargs: object) -> Transaction:
+            return Transaction()
+
+        async def execute(self, sql: str, *args: object, **_kwargs: object) -> str:
+            self.executed.append((sql, args))
+            return "OK"
+
+    connection = Connection()
+    run_id = uuid4()
+    generation_id = uuid4()
+    observed_at = datetime(2026, 7, 18, 1, 2, 3, tzinfo=timezone.utc)
+    cutoff = datetime(2026, 6, 30, 7, 0, tzinfo=timezone.utc)
+
+    asyncio.run(gate._worker(
+        connection,
+        "00000003-0000001B-1",
+        str(run_id),
+        10080,
+        observed_at,
+        generation_id,
+        cutoff,
+    ))
+
+    _sql, args = connection.executed[-1]
+    assert args == (run_id, observed_at, generation_id, cutoff)
+
+
+def test_all_gate_sql_timeframes_bind_the_closed_period_placeholder() -> None:
+    for timeframe in gate.TIMEFRAMES:
+        assert "$4::timestamptz" in build_gate_sql(timeframe)
+
+
 def test_30_minute_session_contract_includes_opening_snapshot() -> None:
     sql = build_gate_sql(30)
     assert "= 570" in sql
