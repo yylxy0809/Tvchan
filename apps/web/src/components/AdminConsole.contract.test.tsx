@@ -3,13 +3,47 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
+  type AdminOpsStatus,
   AdminRequestError,
   fetchAdminOpsStatus,
   fetchModuleCExecution,
   handleAdminAuthenticationFailure,
   isAdminAuthFailure,
 } from "../api/adminRuntimeConfig";
-import { ModuleCBatchSelector, ModuleCSelectionEvidenceCard } from "./AdminConsole";
+import {
+  ModuleCBatchSelector,
+  ModuleCSelectionEvidenceCard,
+  runLatestAdminOpsStatusRequest,
+} from "./AdminConsole";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+const HEALTHY_OPS_STATUS: AdminOpsStatus = {
+  status: "ok",
+  lifecycle_observer: {
+    status: "healthy",
+    deployed: true,
+    expected_observer_name: "observer-v1",
+  },
+};
+
+const DEGRADED_OPS_STATUS: AdminOpsStatus = {
+  status: "degraded",
+  lifecycle_observer: {
+    status: "degraded",
+    deployed: true,
+    expected_observer_name: "observer-v1",
+    reason: "heartbeat_stale",
+  },
+};
 
 const PASS_SELECTION = {
   status: "pass" as const,
@@ -60,6 +94,136 @@ test("admin console exposes lifecycle observer health, backlog, and watermark", 
   assert.match(apiSource, /expected_observer_name/);
   assert.match(apiSource, /heartbeat_age_seconds/);
   assert.match(apiSource, /heartbeat_stale_after_seconds/);
+});
+
+test("a stale observer success cannot replace the latest completed status", async () => {
+  const epoch = { current: 0 };
+  const lifecycle = { active: true, generation: 1 };
+  const first = deferred<AdminOpsStatus>();
+  const second = deferred<AdminOpsStatus>();
+  let rendered: AdminOpsStatus | null = null;
+  const request = (load: () => Promise<AdminOpsStatus>) =>
+    runLatestAdminOpsStatusRequest(epoch, lifecycle, {
+      load,
+      apply: (status) => { rendered = status; },
+      degrade: () => { rendered = DEGRADED_OPS_STATUS; },
+      handleAuthenticationFailure: () => false,
+    });
+
+  const olderRequest = request(() => first.promise);
+  const latestRequest = request(() => second.promise);
+  second.resolve(DEGRADED_OPS_STATUS);
+  await latestRequest;
+  first.resolve(HEALTHY_OPS_STATUS);
+  await olderRequest;
+
+  assert.equal(rendered, DEGRADED_OPS_STATUS);
+});
+
+test("a stale observer 5xx cannot degrade a newer successful status", async () => {
+  const epoch = { current: 0 };
+  const lifecycle = { active: true, generation: 1 };
+  const first = deferred<AdminOpsStatus>();
+  const second = deferred<AdminOpsStatus>();
+  let rendered: AdminOpsStatus | null = null;
+  let degradations = 0;
+  const request = (load: () => Promise<AdminOpsStatus>) =>
+    runLatestAdminOpsStatusRequest(epoch, lifecycle, {
+      load,
+      apply: (status) => { rendered = status; },
+      degrade: () => {
+        degradations += 1;
+        rendered = DEGRADED_OPS_STATUS;
+      },
+      handleAuthenticationFailure: () => false,
+    });
+
+  const olderRequest = request(() => first.promise);
+  const latestRequest = request(() => second.promise);
+  second.resolve(HEALTHY_OPS_STATUS);
+  await latestRequest;
+  first.reject(new AdminRequestError(503, "service unavailable"));
+  await olderRequest;
+
+  assert.equal(rendered, HEALTHY_OPS_STATUS);
+  assert.equal(degradations, 0);
+});
+
+test("a stale observer authentication failure still triggers logout", async () => {
+  const epoch = { current: 0 };
+  const lifecycle = { active: true, generation: 1 };
+  const first = deferred<AdminOpsStatus>();
+  const second = deferred<AdminOpsStatus>();
+  let authenticationFailures = 0;
+  let rendered: AdminOpsStatus | null = null;
+  const request = (load: () => Promise<AdminOpsStatus>) =>
+    runLatestAdminOpsStatusRequest(epoch, lifecycle, {
+      load,
+      apply: (status) => { rendered = status; },
+      degrade: () => { rendered = DEGRADED_OPS_STATUS; },
+      handleAuthenticationFailure: (error) =>
+        handleAdminAuthenticationFailure(error, () => {
+          authenticationFailures += 1;
+        }),
+    });
+
+  const olderRequest = request(() => first.promise);
+  const latestRequest = request(() => second.promise);
+  second.resolve(HEALTHY_OPS_STATUS);
+  await latestRequest;
+  first.reject(new AdminRequestError(401, "expired"));
+  await olderRequest;
+
+  assert.equal(rendered, HEALTHY_OPS_STATUS);
+  assert.equal(authenticationFailures, 1);
+});
+
+test("an observer response from a cleaned-up lifecycle cannot affect the next setup", async () => {
+  const epoch = { current: 0 };
+  const lifecycle = { active: true, generation: 1 };
+  const first = deferred<AdminOpsStatus>();
+  const second = deferred<AdminOpsStatus>();
+  let authenticationFailures = 0;
+  let applications = 0;
+  let degradations = 0;
+  let rendered: AdminOpsStatus | null = null;
+  const request = (load: () => Promise<AdminOpsStatus>) =>
+    runLatestAdminOpsStatusRequest(epoch, lifecycle, {
+      load,
+      apply: (status) => {
+        applications += 1;
+        rendered = status;
+      },
+      degrade: () => {
+        degradations += 1;
+        rendered = DEGRADED_OPS_STATUS;
+      },
+      handleAuthenticationFailure: (error) =>
+        handleAdminAuthenticationFailure(error, () => {
+          authenticationFailures += 1;
+        }),
+    });
+
+  const oldLifecycleRequest = request(() => first.promise);
+  lifecycle.active = false;
+  epoch.current += 1;
+  lifecycle.generation += 1;
+  lifecycle.active = true;
+  const newLifecycleRequest = request(() => second.promise);
+  second.resolve(HEALTHY_OPS_STATUS);
+  await newLifecycleRequest;
+  first.reject(new AdminRequestError(401, "expired old lifecycle"));
+  await oldLifecycleRequest;
+
+  assert.equal(rendered, HEALTHY_OPS_STATUS);
+  assert.equal(applications, 1);
+  assert.equal(degradations, 0);
+  assert.equal(authenticationFailures, 0);
+
+  const source = readFileSync(new URL("./AdminConsole.tsx", import.meta.url), "utf8");
+  assert.match(source, /\+\+opsStatusLifecycle\.current\.generation/);
+  assert.match(source, /opsStatusLifecycle\.current\.active = false/);
+  assert.match(source, /opsStatusRequestEpoch\.current \+= 1/);
 });
 
 test("admin console passes its authenticated admin token to durable token CRUD", () => {

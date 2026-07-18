@@ -67,6 +67,20 @@ type ModuleCExecutionViewState = {
   error: string | null;
 };
 
+type RequestEpoch = { current: number };
+
+type RequestLifecycle = {
+  active: boolean;
+  generation: number;
+};
+
+type LatestAdminOpsStatusRequest = {
+  load(): Promise<AdminOpsStatus>;
+  apply(status: AdminOpsStatus): void;
+  degrade(error: unknown): void;
+  handleAuthenticationFailure(error: unknown): boolean;
+};
+
 const DEFAULT_WENCAI_CONFIG: WencaiAdminConfig = {
   base_url: "https://openapi.iwencai.com",
   api_key: "",
@@ -76,6 +90,27 @@ const DEFAULT_WENCAI_CONFIG: WencaiAdminConfig = {
   pro: false,
   timeout_seconds: 5,
 };
+
+export async function runLatestAdminOpsStatusRequest(
+  epoch: RequestEpoch,
+  lifecycle: RequestLifecycle,
+  request: LatestAdminOpsStatusRequest,
+): Promise<void> {
+  const requestEpoch = ++epoch.current;
+  const lifecycleGeneration = lifecycle.generation;
+  const lifecycleIsActive = () =>
+    lifecycle.active && lifecycle.generation === lifecycleGeneration;
+  try {
+    const status = await request.load();
+    if (!lifecycleIsActive() || requestEpoch !== epoch.current) return;
+    request.apply(status);
+  } catch (error) {
+    if (!lifecycleIsActive()) return;
+    if (request.handleAuthenticationFailure(error)) return;
+    if (requestEpoch !== epoch.current) return;
+    request.degrade(error);
+  }
+}
 
 export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
   const [tokens, setTokens] = useState<AdminToken[]>([]);
@@ -99,6 +134,8 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
     error: null,
   });
   const [selectedModuleCBatchId, setSelectedModuleCBatchId] = useState<string | undefined>();
+  const opsStatusRequestEpoch = useRef(0);
+  const opsStatusLifecycle = useRef<RequestLifecycle>({ active: false, generation: 0 });
   const moduleCRequestEpoch = useRef(0);
   const [label, setLabel] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -108,12 +145,20 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    const lifecycleGeneration = ++opsStatusLifecycle.current.generation;
+    opsStatusLifecycle.current.active = true;
     void refreshTokens();
     void refreshFeatureConfig();
     void refreshWencaiConfig();
     void refreshLlmProviders();
     void refreshOpsStatus();
     void refreshModuleCExecution();
+    return () => {
+      if (opsStatusLifecycle.current.generation === lifecycleGeneration) {
+        opsStatusLifecycle.current.active = false;
+        opsStatusRequestEpoch.current += 1;
+      }
+    };
   }, []);
 
   async function refreshTokens() {
@@ -165,11 +210,11 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
   }
 
   async function refreshOpsStatus() {
-    try {
-      setOpsStatus(await fetchAdminOpsStatus(adminToken));
-    } catch (nextError) {
-      if (handleAuthenticationFailure(nextError)) return;
-      setOpsStatus({
+    await runLatestAdminOpsStatusRequest(opsStatusRequestEpoch, opsStatusLifecycle.current, {
+      load: () => fetchAdminOpsStatus(adminToken),
+      apply: setOpsStatus,
+      handleAuthenticationFailure,
+      degrade: (nextError) => setOpsStatus({
         status: "degraded",
         lifecycle_observer: {
           status: "unavailable",
@@ -178,8 +223,8 @@ export function AdminConsole({ adminToken, onAuthenticationFailure }: Props) {
           reason: "request_failed",
           error: readError(nextError),
         },
-      });
-    }
+      }),
+    });
   }
 
   async function refreshModuleCExecution(batchId = selectedModuleCBatchId) {
