@@ -89,13 +89,15 @@ async def delete_token(pool, token_id: int) -> bool:
     return result.split()[-1] != "0"
 
 
-async def touch_token_last_used(pool, token_id: int) -> None:
-    await pool.execute(
+async def touch_token_last_used(pool, token_id: int) -> bool:
+    result = await pool.execute(
         """
         update user_api_tokens
         set last_used_at = now(),
             updated_at = now()
         where id = $1
+          and is_active = true
         """,
         token_id,
     )
+    return result.split()[-1] != "0"
