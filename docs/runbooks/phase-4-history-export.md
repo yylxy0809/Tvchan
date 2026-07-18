@@ -5,10 +5,10 @@
 Phase 4 adds a minimal history export loop for local development:
 
 - `POST /api/v1/history/export` accepts `bars`, optional `metadata`, and optional `chunk_size_bytes`.
-- The API serializes `{request_id, created_at, metadata, bars}` as JSON, gzip-compresses it, stores it in memory, and returns a manifest.
+- The API reads at most 16 MiB from the request stream, serializes `{request_id, created_at, metadata, bars}` as JSON, gzip-compresses it, stores it in bounded process memory, and returns a manifest.
 - `GET /api/v1/history/export/{request_id}/chunks/{index}` returns the gzip bytes for a manifest chunk.
 
-The current cache is process-local memory. Restarting the API clears previously created exports.
+The current cache is process-local memory. Restarting the API clears previously created exports. Exports are private to the authenticated credential and expire after 15 minutes.
 
 ## Example
 
@@ -55,4 +55,7 @@ curl -o chunk-0.json.gz \
 
 - Chunks are byte slices of a single gzip stream, so concatenate them in index order before decompressing.
 - `metadata` is intentionally open-ended for symbol, resolution, source, requested range, or other export context.
+- Requests are limited to 16 MiB and 100,000 bars. Both declared and streamed body bytes are checked, so chunked requests cannot bypass the limit.
+- Each export is limited to 16 MiB compressed/uncompressed, 1,024 chunks, and a 1 MiB chunk size. At most two builds run concurrently; each credential may retain four active exports. Process-wide storage is capped at 32 exports and 64 MiB.
+- Capacity failures are fail-visible: request/export size returns `413`, a busy or per-credential quota returns `429`, and process storage exhaustion returns `507`. Unknown, expired, or foreign chunks all return `404`.
 - This is a minimal closed loop, not durable storage. A later phase can replace the in-memory store with temp files, object storage, or database-backed export jobs without changing the manifest contract.
