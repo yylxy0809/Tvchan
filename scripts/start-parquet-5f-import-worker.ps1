@@ -4,6 +4,10 @@ param(
     [int]$Concurrency = 1,
     [int]$WriteConcurrency = 1,
     [int]$BatchSize = 50000,
+    [int]$LeaseSeconds = 300,
+    [int]$MaxAttempts = 5,
+    [int]$MaxBatchesPerMember = 0,
+    [string]$WorkerId = "",
     [switch]$Reset,
     [switch]$ResetRunning,
     [switch]$Loop,
@@ -34,9 +38,16 @@ $ArgsList = @(
     "--concurrency", $Concurrency,
     "--write-concurrency", $WriteConcurrency,
     "--batch-size", $BatchSize,
+    "--lease-seconds", $LeaseSeconds,
+    "--max-attempts", $MaxAttempts,
+    "--max-batches-per-member", $MaxBatchesPerMember,
     "--loop-interval", $LoopInterval,
     "--database-url", $DatabaseUrl
 )
+
+if (-not [string]::IsNullOrWhiteSpace($WorkerId)) {
+    $ArgsList += @("--worker-id", $WorkerId)
+}
 
 if ($Reset) {
     $ArgsList += "--reset"
