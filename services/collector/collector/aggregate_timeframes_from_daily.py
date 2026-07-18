@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -9,11 +10,14 @@ import sys
 import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from typing import Iterable
+from pathlib import Path
+from typing import Any, Awaitable, Iterable
 
 import asyncpg
 
+from collector.kline_sql_gate import _watch_lock_session
 from collector.kline_scope_catalog import refresh_scopes_exact
+from collector.module_c_eligibility import FreshnessContract, load_freshness_contract
 from collector.storage.postgres import source_priority_case
 
 
@@ -35,6 +39,11 @@ FROM symbols
 WHERE is_active = TRUE
 ORDER BY id
 """
+
+DATABASE_CLOCK_SQL = "SELECT transaction_timestamp() AS observed_at"
+AGGREGATE_WRITER_LOCK_PROTOCOL = "derived-1w-1m-global-writer-v1"
+TRY_AGGREGATE_WRITER_LOCK_SQL = "SELECT pg_try_advisory_lock($1::bigint)"
+UNLOCK_AGGREGATE_WRITER_SQL = "SELECT pg_advisory_unlock($1::bigint)"
 
 
 def _emit(event: str, **payload: object) -> None:
@@ -62,6 +71,92 @@ def _parse_timeframes(raw: str) -> list[str]:
 def _chunks(values: Sequence[int], size: int) -> Iterable[tuple[int, list[int]]]:
     for start in range(0, len(values), size):
         yield start // size + 1, list(values[start : start + size])
+
+
+def _aggregate_writer_lock_key(source_code: int) -> int:
+    payload = f"{AGGREGATE_WRITER_LOCK_PROTOCOL}:source={int(source_code)}".encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=True)
+
+
+async def _acquire_aggregate_writer_lock(
+    database_url: str,
+    source_code: int,
+) -> tuple[asyncpg.Connection, int]:
+    connection = await asyncpg.connect(database_url)
+    lock_key = _aggregate_writer_lock_key(source_code)
+    try:
+        acquired = await connection.fetchval(TRY_AGGREGATE_WRITER_LOCK_SQL, lock_key)
+        if acquired is not True:
+            raise RuntimeError(
+                f"another source={source_code} 1w/1m aggregate writer is active"
+            )
+        return connection, lock_key
+    except BaseException:
+        await connection.close()
+        raise
+
+
+async def _release_aggregate_writer_lock(
+    connection: asyncpg.Connection,
+    lock_key: int,
+) -> None:
+    try:
+        unlocked = await connection.fetchval(UNLOCK_AGGREGATE_WRITER_SQL, lock_key)
+        if unlocked is not True:
+            raise RuntimeError("aggregate writer lock ownership was lost")
+    finally:
+        await connection.close()
+
+
+async def _run_with_aggregate_lock_watchdog(
+    lock_session: asyncpg.Connection,
+    operation: Awaitable[Any],
+) -> Any:
+    stop = asyncio.Event()
+    aggregate_task = asyncio.create_task(operation)
+    watchdog_task = asyncio.create_task(_watch_lock_session(lock_session, stop))
+    try:
+        done, _pending = await asyncio.wait(
+            {aggregate_task, watchdog_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if watchdog_task in done:
+            watchdog_error = watchdog_task.exception()
+            if watchdog_error is not None:
+                aggregate_task.cancel()
+                await asyncio.gather(aggregate_task, return_exceptions=True)
+                raise watchdog_error
+            if not aggregate_task.done():
+                aggregate_task.cancel()
+                await asyncio.gather(aggregate_task, return_exceptions=True)
+                raise RuntimeError(
+                    "aggregate writer-lock watchdog stopped unexpectedly"
+                )
+        stop.set()
+        await watchdog_task
+        return await aggregate_task
+    finally:
+        stop.set()
+        for task in (aggregate_task, watchdog_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(aggregate_task, watchdog_task, return_exceptions=True)
+
+
+async def _validate_authoritative_clock(
+    conn: asyncpg.Connection,
+    contract: FreshnessContract | None,
+    statement_timeout: float | None,
+) -> None:
+    if contract is None:
+        return
+    observed_at = await conn.fetchval(DATABASE_CLOCK_SQL, timeout=statement_timeout)
+    if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
+        raise RuntimeError("database observation clock is missing or timezone-naive")
+    if contract.as_of > observed_at:
+        raise RuntimeError(
+            "authoritative as-of cannot be after the aggregate database observation time"
+        )
 
 
 def _build_aggregate_sql(bucket_expr: str, *, repair_stale_periods: bool = True) -> str:
@@ -142,8 +237,14 @@ agg AS (
         MAX(revision) AS revision,
         bucket
     FROM daily
-    WHERE bucket < date_trunc('{period}', now() AT TIME ZONE 'Asia/Shanghai')
     GROUP BY symbol_id, bucket
+    HAVING (
+        $5::timestamptz IS NULL
+        AND bucket < date_trunc('{period}', now() AT TIME ZONE 'Asia/Shanghai')
+    ) OR (
+        $5::timestamptz IS NOT NULL
+        AND MAX(ts) <= $5::timestamptz
+    )
 ){delete_stale_periods}
 INSERT INTO klines (
     symbol_id,
@@ -279,6 +380,58 @@ WHERE wm.last_bar_end = target.max_ts
   AND target.max_revision >= daily.max_revision
 """
 
+FUTURE_DERIVED_ROWS_SQL = """
+SELECT EXISTS (
+    SELECT 1
+    FROM klines
+    WHERE timeframe = $1::integer
+      AND source = $2::smallint
+      AND symbol_id >= $3::integer
+      AND symbol_id <= $4::integer
+      AND ts > $5::timestamptz
+    LIMIT 1
+)
+"""
+
+FUTURE_DERIVED_PREFLIGHT_SQL = """
+SELECT EXISTS (
+    SELECT 1
+    FROM klines
+    WHERE source = $1::smallint
+      AND timeframe = $2::integer
+      AND symbol_id = ANY($3::integer[])
+      AND ts > $4::timestamptz
+    LIMIT 1
+)
+"""
+
+
+async def _validate_no_future_derived_rows(
+    conn: asyncpg.Connection,
+    *,
+    timeframes: Sequence[str],
+    source_code: int,
+    symbol_ids: Sequence[int],
+    freshness_contract: FreshnessContract | None,
+    statement_timeout: float | None,
+) -> None:
+    if freshness_contract is None:
+        return
+    for timeframe in timeframes:
+        future_exists = await conn.fetchval(
+            FUTURE_DERIVED_PREFLIGHT_SQL,
+            source_code,
+            TIMEFRAME_CODES[timeframe],
+            list(symbol_ids),
+            freshness_contract.expected_closed_watermarks[timeframe],
+            timeout=statement_timeout,
+        )
+        if future_exists is not False:
+            raise RuntimeError(
+                f"{timeframe} source={source_code} contains derived rows after "
+                "the authoritative freshness cutoff"
+            )
+
 
 async def _aggregate_one(
     pool: asyncpg.Pool,
@@ -290,7 +443,12 @@ async def _aggregate_one(
     concurrency: int,
     skip_complete_batches: bool,
     repair_stale_periods: bool,
+    closed_period_cutoff: datetime | None = None,
 ) -> None:
+    if closed_period_cutoff is not None and skip_complete_batches:
+        raise ValueError(
+            "skip-complete-batches cannot be used with an authoritative closed-period cutoff"
+        )
     target_code = TIMEFRAME_CODES[name]
     sql = _build_aggregate_sql(BUCKET_EXPRESSIONS[name], repair_stale_periods=repair_stale_periods)
 
@@ -347,12 +505,28 @@ async def _aggregate_one(
 
             async with pool.acquire() as conn:
                 async with conn.transaction():
+                    if closed_period_cutoff is not None:
+                        future_exists = await conn.fetchval(
+                            FUTURE_DERIVED_ROWS_SQL,
+                            target_code,
+                            source_code,
+                            symbol_id_min,
+                            symbol_id_max,
+                            closed_period_cutoff,
+                            timeout=statement_timeout,
+                        )
+                        if future_exists is not False:
+                            raise RuntimeError(
+                                f"{name} source={source_code} contains derived rows after "
+                                "the authoritative closed-period cutoff"
+                            )
                     status = await conn.execute(
                         sql,
                         target_code,
                         source_code,
                         symbol_id_min,
                         symbol_id_max,
+                        closed_period_cutoff,
                         timeout=statement_timeout,
                     )
                     rows = _parse_status_count(status) or 0
@@ -448,11 +622,27 @@ async def _main(argv: Iterable[str]) -> int:
         action="store_true",
         help="First-build optimization: skip deleting old derived bars; only safe when no target source rows exist.",
     )
+    parser.add_argument(
+        "--freshness-contract",
+        type=Path,
+        help="Authoritative module-c-authoritative-freshness-v1 exact-five contract.",
+    )
     args = parser.parse_args(list(argv))
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     if args.concurrency <= 0:
         parser.error("--concurrency must be positive")
+    try:
+        freshness_contract = (
+            load_freshness_contract(args.freshness_contract)
+            if args.freshness_contract is not None else None
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    if freshness_contract is not None and args.skip_complete_batches:
+        parser.error(
+            "--skip-complete-batches is incompatible with an authoritative freshness contract"
+        )
 
     _emit(
         "aggregate_from_daily_started",
@@ -461,32 +651,92 @@ async def _main(argv: Iterable[str]) -> int:
         batch_size=args.batch_size,
         concurrency=args.concurrency,
         skip_complete_batches=args.skip_complete_batches,
+        freshness_contract=(
+            freshness_contract.normalized if freshness_contract is not None else None
+        ),
+        freshness_contract_version=(
+            freshness_contract.contract_version if freshness_contract is not None else None
+        ),
+        freshness_contract_sha256=(
+            freshness_contract.sha256 if freshness_contract is not None else None
+        ),
     )
 
-    pool = await asyncpg.create_pool(
-        args.database_url,
-        min_size=1,
-        max_size=args.concurrency,
-        command_timeout=args.statement_timeout,
-    )
+    async def aggregate_operation() -> None:
+        pool = await asyncpg.create_pool(
+            args.database_url,
+            min_size=1,
+            max_size=args.concurrency,
+            command_timeout=args.statement_timeout,
+        )
+        try:
+            async with pool.acquire() as conn:
+                await _validate_authoritative_clock(
+                    conn,
+                    freshness_contract,
+                    args.statement_timeout,
+                )
+                symbol_ids = [
+                    row["id"] for row in await conn.fetch(ACTIVE_SYMBOL_IDS_SQL)
+                ]
+                await _validate_no_future_derived_rows(
+                    conn,
+                    timeframes=args.timeframes,
+                    source_code=args.source_code,
+                    symbol_ids=symbol_ids,
+                    freshness_contract=freshness_contract,
+                    statement_timeout=args.statement_timeout,
+                )
+            _emit("aggregate_active_symbols_loaded", active_symbols=len(symbol_ids))
+            for timeframe in args.timeframes:
+                await _aggregate_one(
+                    pool,
+                    timeframe,
+                    args.source_code,
+                    args.statement_timeout,
+                    symbol_ids,
+                    args.batch_size,
+                    args.concurrency,
+                    args.skip_complete_batches,
+                    not args.skip_stale_period_delete,
+                    (
+                        freshness_contract.expected_closed_watermarks[timeframe]
+                        if freshness_contract is not None else None
+                    ),
+                )
+        finally:
+            await pool.close()
+
+    lock_session: asyncpg.Connection | None = None
+    lock_key: int | None = None
+    operation_error: BaseException | None = None
     try:
-        async with pool.acquire() as conn:
-            symbol_ids = [row["id"] for row in await conn.fetch(ACTIVE_SYMBOL_IDS_SQL)]
-        _emit("aggregate_active_symbols_loaded", active_symbols=len(symbol_ids))
-        for timeframe in args.timeframes:
-            await _aggregate_one(
-                pool,
-                timeframe,
+        if freshness_contract is None:
+            await aggregate_operation()
+        else:
+            lock_session, lock_key = await _acquire_aggregate_writer_lock(
+                args.database_url,
                 args.source_code,
-                args.statement_timeout,
-                symbol_ids,
-                args.batch_size,
-                args.concurrency,
-                args.skip_complete_batches,
-                not args.skip_stale_period_delete,
             )
+            _emit(
+                "aggregate_writer_lock_acquired",
+                protocol=AGGREGATE_WRITER_LOCK_PROTOCOL,
+                source_code=args.source_code,
+            )
+            await _run_with_aggregate_lock_watchdog(
+                lock_session,
+                aggregate_operation(),
+            )
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        await pool.close()
+        if lock_session is not None and lock_key is not None:
+            try:
+                await _release_aggregate_writer_lock(lock_session, lock_key)
+            except BaseException:
+                if operation_error is None:
+                    raise
 
     _emit("aggregate_from_daily_finished", timeframes=args.timeframes)
     return 0

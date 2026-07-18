@@ -21,6 +21,25 @@ from collector.kline_sql_gate import (
     parse_args,
     summarize,
 )
+from collector.module_c_eligibility import (
+    FRESHNESS_CONTRACT_VERSION,
+    parse_freshness_contract,
+)
+
+
+def _freshness_contract(*, as_of: str = "2026-07-18T08:00:00+08:00"):
+    return parse_freshness_contract({
+        "contract_version": FRESHNESS_CONTRACT_VERSION,
+        "as_of": as_of,
+        "trading_calendar": {"id": "sse-szse-2026-v1", "sha256": "a" * 64},
+        "expected_closed_watermarks": {
+            "5f": "2026-07-17T15:00:00+08:00",
+            "30f": "2026-07-17T15:00:00+08:00",
+            "1d": "2026-07-17T15:00:00+08:00",
+            "1w": "2026-07-17T15:00:00+08:00",
+            "1m": "2026-06-30T15:00:00+08:00",
+        },
+    })
 
 
 def test_gate_has_five_database_side_checkpoint_workers() -> None:
@@ -135,7 +154,7 @@ def test_worker_binds_captured_generation_to_snapshot_query() -> None:
 
     sql, args = connection.executed[-1]
     assert "c.generation_id=$3::uuid" in sql
-    assert args == (run_id, observed_at, generation_id)
+    assert args == (run_id, observed_at, generation_id, None)
 
 
 def test_30_minute_session_contract_includes_opening_snapshot() -> None:
@@ -161,6 +180,17 @@ def test_higher_periods_require_closed_daily_basis_and_source_8() -> None:
         assert "d.expected_ts is null" in sql
         assert "source not in (8)" in sql
         assert "not b.is_complete" in sql
+
+
+def test_higher_periods_share_explicit_closed_cutoff_contract_with_aggregator() -> None:
+    for timeframe in (10080, 43200):
+        sql = " ".join(build_gate_sql(timeframe).lower().split())
+
+        assert "$4::timestamptz is null" in sql
+        assert "d.expected_ts <= $4::timestamptz" in sql
+        assert "d.expected_ts > $4::timestamptz" in sql
+        assert ") and b.symbol_id is null" in sql
+        assert "max(ts) from klines" not in sql
 
 
 def test_summary_completes_scan_and_reports_gate_result() -> None:
@@ -220,6 +250,45 @@ def test_cli_requires_the_exact_five_level_contract() -> None:
             "--database-url", "postgresql://audit",
             "--timeframe", "5", "--timeframe", "30",
         ])
+
+
+def test_cli_accepts_exact_authoritative_freshness_contract(tmp_path) -> None:
+    contract_path = tmp_path / "freshness.json"
+    contract_path.write_text(
+        json.dumps(_freshness_contract().normalized),
+        encoding="utf-8",
+    )
+    args = parse_args([
+        "--database-url", "postgresql://audit",
+        "--freshness-contract", str(contract_path),
+    ])
+
+    assert args.freshness_contract.expected_closed_watermarks["1w"] == datetime(
+        2026, 7, 17, 7, tzinfo=timezone.utc,
+    )
+    assert args.freshness_contract.contract_version == FRESHNESS_CONTRACT_VERSION
+
+
+def test_cli_rejects_non_exact_freshness_contract(tmp_path) -> None:
+    payload = _freshness_contract().normalized
+    payload["expected_closed_watermarks"].pop("1m")
+    contract_path = tmp_path / "freshness.json"
+    contract_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--database-url", "postgresql://audit",
+            "--freshness-contract", str(contract_path),
+        ])
+
+
+def test_programmatic_gate_rejects_unvalidated_freshness_object_before_db() -> None:
+    class Forged:
+        normalized = {"contract_version": FRESHNESS_CONTRACT_VERSION}
+        contract_version = FRESHNESS_CONTRACT_VERSION
+        sha256 = "0" * 64
+
+    with pytest.raises(ValueError, match="invalid authoritative freshness"):
+        asyncio.run(gate.run_gate("postgresql://audit", freshness_contract=Forged()))
 
 
 class EvidenceConnection:
@@ -285,6 +354,25 @@ def test_snapshot_evidence_is_exact_ordered_and_complete() -> None:
     assert evidence["catalog_required_scope_count"] == 10
     assert len(evidence["catalog_manifest_sha256"]) == 64
     assert len(evidence["evidence_sha256"]) == 64
+
+
+def test_snapshot_evidence_binds_authoritative_freshness_contract() -> None:
+    contract = _freshness_contract()
+
+    evidence = asyncio.run(_capture_snapshot_evidence(EvidenceConnection(), contract))
+
+    assert evidence["freshness_contract"] == contract.normalized
+    assert evidence["freshness_contract_version"] == FRESHNESS_CONTRACT_VERSION
+    assert evidence["freshness_contract_sha256"] == contract.sha256
+    assert evidence["trading_calendar_id"] == "sse-szse-2026-v1"
+    assert evidence["trading_calendar_sha256"] == "a" * 64
+
+
+def test_snapshot_evidence_rejects_future_authoritative_as_of() -> None:
+    contract = _freshness_contract(as_of="2026-07-18T10:00:00+08:00")
+
+    with pytest.raises(InvalidAuditEvidence, match="after the audit snapshot"):
+        asyncio.run(_capture_snapshot_evidence(EvidenceConnection(), contract))
 
 
 def test_snapshot_evidence_rejects_incomplete_active_catalog() -> None:
@@ -363,6 +451,22 @@ def test_locked_claim_recovers_incomplete_run_after_clearing_checkpoints(
     pending = json.loads(connection.executed[1][1][1])
     assert pending["lock_protocol_version"] == gate.AUDIT_LOCK_PROTOCOL_VERSION
     assert pending["lock_owner_id"] == owner_id
+
+
+@pytest.mark.parametrize("status", ["running", "failed"])
+def test_recovery_rejects_changed_freshness_contract(status: str) -> None:
+    contract = _freshness_contract()
+    parameters = {
+        "lock_protocol_version": gate.AUDIT_LOCK_PROTOCOL_VERSION,
+        "freshness_contract_version": FRESHNESS_CONTRACT_VERSION,
+        "freshness_contract_sha256": "0" * 64,
+    }
+    connection = ClaimConnection(status, parameters)
+
+    with pytest.raises(AuditRunAlreadyClaimed, match="freshness contract changed"):
+        asyncio.run(_claim_audit_run(connection, uuid4(), str(uuid4()), contract))
+
+    assert connection.executed == []
 
 
 @pytest.mark.parametrize("parameters", [None, {}, {"lock_protocol_version": "legacy"}])

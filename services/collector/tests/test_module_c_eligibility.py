@@ -26,6 +26,18 @@ from collector.kline_sql_gate import ANOMALY_FIELDS, _json_value, _manifest_sha2
 NOW = datetime(2026, 7, 3, 7, tzinfo=timezone.utc)
 
 
+def _freshness_payload() -> dict[str, object]:
+    return {
+        "contract_version": FRESHNESS_CONTRACT_VERSION,
+        "as_of": "2026-07-03T07:00:00+00:00",
+        "trading_calendar": {"id": "calendar", "sha256": "a" * 64},
+        "expected_closed_watermarks": {
+            timeframe: "2026-07-03T07:00:00+00:00"
+            for timeframe in ("5f", "30f", "1d", "1w", "1m")
+        },
+    }
+
+
 def _coverage(symbol_id: int) -> dict[tuple[int, str], datetime]:
     return {(symbol_id, timeframe): NOW for timeframe in ("5f", "30f", "1d", "1w", "1m")}
 
@@ -232,6 +244,7 @@ class StrictInputConnection:
                 "timeframes": [5, 30, 1440, 10080, 43200],
             }
         if "from kline_audit_runs" in normalized:
+            freshness = parse_freshness_contract(_freshness_payload())
             parameters = {
                 "contract_version": "module-c-strict-audit-v2",
                 "engine": "sql_gate",
@@ -252,6 +265,11 @@ class StrictInputConnection:
                     self.catalog_manifest_sha256_override
                     or self.catalog_manifest_sha256()
                 ),
+                "freshness_contract": freshness.normalized,
+                "freshness_contract_version": freshness.contract_version,
+                "freshness_contract_sha256": freshness.sha256,
+                "trading_calendar_id": freshness.trading_calendar_id,
+                "trading_calendar_sha256": freshness.trading_calendar_sha256,
             }
             parameters["evidence_sha256"] = _manifest_sha256([parameters])
             summary = {
@@ -306,15 +324,7 @@ class StrictInputConnection:
 
 
 def _freshness_fixture(tmp_path: Path) -> Path:
-    payload = {
-        "contract_version": FRESHNESS_CONTRACT_VERSION,
-        "as_of": "2026-07-03T07:00:00+00:00",
-        "trading_calendar": {"id": "calendar", "sha256": "a" * 64},
-        "expected_closed_watermarks": {
-            timeframe: "2026-07-03T07:00:00+00:00"
-            for timeframe in ("5f", "30f", "1d", "1w", "1m")
-        },
-    }
+    payload = _freshness_payload()
     path = tmp_path / "freshness.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
@@ -458,6 +468,29 @@ def test_strict_input_recomputes_producer_evidence_hash(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(connection, "fetchrow", fetchrow)
     with pytest.raises(RuntimeError, match="evidence_sha256"):
+        asyncio.run(_load_strict_inputs(connection, str(UUID(int=1)), freshness))
+
+
+def test_strict_input_rejects_audit_freshness_contract_drift(
+    tmp_path, monkeypatch
+) -> None:
+    freshness = load_freshness_contract(_freshness_fixture(tmp_path))
+    connection = StrictInputConnection()
+    producer_hash = _manifest_sha256([{"symbol_id": 1, "symbol": "600000.SH"}])
+    original = connection.fetchrow
+
+    async def fetchrow(sql: str, *args):
+        row = _bind_producer_hash(await original(sql, *args), producer_hash)
+        if "parameters" in row:
+            parameters = row["parameters"]
+            parameters["freshness_contract_sha256"] = "b" * 64
+            parameters.pop("evidence_sha256", None)
+            parameters["evidence_sha256"] = _manifest_sha256([parameters])
+            row["summary"]["evidence_sha256"] = parameters["evidence_sha256"]
+        return row
+
+    monkeypatch.setattr(connection, "fetchrow", fetchrow)
+    with pytest.raises(RuntimeError, match="freshness contract drifted"):
         asyncio.run(_load_strict_inputs(connection, str(UUID(int=1)), freshness))
 
 

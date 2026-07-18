@@ -447,6 +447,20 @@ async def _load_strict_inputs(
         raise RuntimeError("canonical audit evidence_sha256 is invalid")
     if parameters.get("timeframes") != list(TIMEFRAME_CODES.values()):
         raise RuntimeError("canonical audit does not bind the exact five levels")
+    try:
+        audit_freshness = parse_freshness_contract(parameters["freshness_contract"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "canonical audit authoritative freshness provenance is incomplete"
+        ) from error
+    if (
+        parameters.get("freshness_contract_version") != freshness.contract_version
+        or parameters.get("freshness_contract_sha256") != freshness.sha256
+        or audit_freshness.sha256 != freshness.sha256
+        or parameters.get("trading_calendar_id") != freshness.trading_calendar_id
+        or parameters.get("trading_calendar_sha256") != freshness.trading_calendar_sha256
+    ):
+        raise RuntimeError("canonical audit authoritative freshness contract drifted")
     active_count = int(parameters.get("active_universe_count") or 0)
     active_sha256 = str(parameters.get("active_universe_sha256") or "")
     catalog_sha256 = str(parameters.get("catalog_manifest_sha256") or "")
