@@ -159,6 +159,8 @@ def test_scoped_history_backfill_dry_run_never_opens_database(
             "--symbols-file", str(symbols_file),
             "--timeframes", "5f",
             "--stop-at", "5f=2026-07-10T07:00:00Z",
+            "--expected-through", "5f=2026-07-17T07:00:00Z",
+            "--freshness-contract-sha256", "a" * 64,
             "--dry-run",
         ]
     )
@@ -185,6 +187,66 @@ def test_scoped_cli_requires_stop_at_and_explicit_endpoint(tmp_path) -> None:
                 "--timeframes", "5f", "--stop-at", "5f=2026-07-10T07:00:00Z",
             ]
         )
+
+    with pytest.raises(SystemExit):
+        history_backfill.parse_args(
+            [
+                "--provider", "pytdx", "--tdx-host", "127.0.0.1",
+                "--symbols-file", str(symbols_file), "--timeframes", "5f",
+                "--stop-at", "5f=2026-07-10T07:00:00Z",
+            ]
+        )
+
+    with pytest.raises(SystemExit):
+        history_backfill.parse_args(
+            [
+                "--provider", "pytdx", "--tdx-host", "127.0.0.1",
+                "--symbols-file", str(symbols_file), "--timeframes", "5f",
+                "--stop-at", "5f=2026-07-10T07:00:00Z",
+                "--expected-through", "5f=2026-07-17T07:00:00Z",
+            ]
+        )
+
+    args = history_backfill.parse_args(
+        [
+            "--provider", "pytdx", "--tdx-host", "127.0.0.1",
+            "--symbols-file", str(symbols_file), "--timeframes", "5f",
+            "--stop-at", "5f=2026-07-10T07:00:00Z",
+            "--expected-through", "5f=2026-07-17T07:00:00Z",
+            "--freshness-contract-sha256", "a" * 64,
+        ]
+    )
+    assert args.expected_through == "5f=2026-07-17T07:00:00Z"
+
+
+def test_scoped_run_identity_binds_expected_watermark_and_freshness_contract() -> None:
+    common = {
+        "provider": "pytdx",
+        "manifest_sha256": "b" * 64,
+        "symbols": ["000001.SZ"],
+        "timeframes": ["5f"],
+        "stop_at": {"5f": history_backfill.parse_stop_at(
+            "5f=2026-07-10T07:00:00Z", ["5f"], canonical_tail_labels=True
+        )["5f"]},
+        "page_size": 260,
+        "endpoint": "127.0.0.1:7709",
+        "source_policy": "primary_failover",
+    }
+    first = history_backfill.scoped_run_identity(
+        **common,
+        expected_through={"5f": history_backfill.parse_stop_at(
+            "5f=2026-07-17T07:00:00Z", ["5f"], canonical_tail_labels=True
+        )["5f"]},
+        freshness_contract_sha256="c" * 64,
+    )
+    changed = history_backfill.scoped_run_identity(
+        **common,
+        expected_through={"5f": history_backfill.parse_stop_at(
+            "5f=2026-07-16T07:00:00Z", ["5f"], canonical_tail_labels=True
+        )["5f"]},
+        freshness_contract_sha256="d" * 64,
+    )
+    assert first != changed
 
 
 def test_scoped_history_backfill_never_upserts_symbol_master(
@@ -225,6 +287,9 @@ def test_scoped_history_backfill_never_upserts_symbol_master(
             assert kwargs["run_id"] is not None
             return []
 
+        async def summarize_scoped_run(self, _run_id):
+            return {"success": 1}
+
     monkeypatch.setattr(history_backfill, "PostgresKlineWriter", _Writer)
     monkeypatch.setattr(history_backfill, "PostgresBackfillTaskStore", _Store)
     args = history_backfill.parse_args(
@@ -232,10 +297,53 @@ def test_scoped_history_backfill_never_upserts_symbol_master(
             "--provider", "pytdx", "--tdx-host", "127.0.0.1",
             "--symbols-file", str(symbols_file), "--timeframes", "5f",
             "--stop-at", "5f=2026-07-10T07:00:00Z",
+            "--expected-through", "5f=2026-07-17T07:00:00Z",
+            "--freshness-contract-sha256", "a" * 64,
         ]
     )
 
     asyncio.run(history_backfill.run_once(args))
+
+
+def test_scoped_zero_claims_with_failed_durable_task_is_not_success(
+    tmp_path, monkeypatch
+) -> None:
+    symbols_file = tmp_path / "symbols.txt"
+    symbols_file.write_text("000001.SZ\n", encoding="utf-8")
+
+    class _Context:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Store(_Context):
+        async def ensure_scoped_run_tasks(self, **_kwargs):
+            return [101]
+
+        async def claim_tasks(self, **_kwargs):
+            return []
+
+        async def summarize_scoped_run(self, _run_id):
+            return {"dead_letter": 1}
+
+    monkeypatch.setattr(history_backfill, "PostgresKlineWriter", _Context)
+    monkeypatch.setattr(history_backfill, "PostgresBackfillTaskStore", _Store)
+    args = history_backfill.parse_args(
+        [
+            "--provider", "pytdx", "--tdx-host", "127.0.0.1",
+            "--symbols-file", str(symbols_file), "--timeframes", "5f",
+            "--stop-at", "5f=2026-07-10T07:00:00Z",
+            "--expected-through", "5f=2026-07-17T07:00:00Z",
+            "--freshness-contract-sha256", "a" * 64,
+        ]
+    )
+    with pytest.raises(RuntimeError, match="did not complete cleanly"):
+        asyncio.run(history_backfill.run_once(args))
 
 
 def test_migration_046_isolates_legacy_workers_and_scoped_identity() -> None:
@@ -248,5 +356,17 @@ def test_migration_046_isolates_legacy_workers_and_scoped_identity() -> None:
     assert "where run_id is not null" in migration
     assert "tvchan.history_backfill_scoped_run_id" in migration
     assert "before insert or update or delete" in migration
+
+
+def test_migration_047_binds_scoped_freshness_evidence() -> None:
+    migration = (
+        Path(__file__).parents[3]
+        / "db/sql/047_history_backfill_scoped_freshness.sql"
+    ).read_text(encoding="utf-8")
+    assert "expected_through jsonb" in migration
+    assert "freshness_contract_sha256 char(64)" in migration
+    assert "provider_newest_ts timestamptz" in migration
+    assert "old.expected_through is distinct from new.expected_through" in migration
+    assert "legacy scoped historical backfill run cannot change task status" in migration
     assert "scoped historical backfill insert requires exact session run fence" in migration
     assert "scoped historical backfill task identity is immutable" in migration

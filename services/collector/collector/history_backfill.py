@@ -53,6 +53,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "they reach the boundary; only newer bars are written."
         ),
     )
+    parser.add_argument(
+        "--expected-through",
+        default=os.getenv("HISTORY_BACKFILL_EXPECTED_THROUGH"),
+        help="Authoritative inclusive upper freshness watermark for each scoped timeframe.",
+    )
+    parser.add_argument(
+        "--freshness-contract-sha256",
+        default=os.getenv("HISTORY_BACKFILL_FRESHNESS_CONTRACT_SHA256"),
+        help="SHA-256 of the authoritative freshness contract used by a scoped run.",
+    )
     parser.add_argument("--page-size", type=int, default=int(os.getenv("HISTORY_BACKFILL_PAGE_SIZE", "800")))
     parser.add_argument("--task-limit", type=int, default=int(os.getenv("HISTORY_BACKFILL_TASK_LIMIT", "3")))
     parser.add_argument(
@@ -114,8 +124,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--symbols and --symbols-file are mutually exclusive")
     if args.symbols_file and not args.stop_at:
         parser.error("--symbols-file requires --stop-at")
+    if args.symbols_file and not args.expected_through:
+        parser.error("--symbols-file requires --expected-through")
+    if args.symbols_file and not re.fullmatch(
+        r"[0-9a-f]{64}", str(args.freshness_contract_sha256 or "")
+    ):
+        parser.error("--symbols-file requires lowercase --freshness-contract-sha256")
     if args.stop_at and not args.symbols_file:
         parser.error("--stop-at is only supported with --symbols-file")
+    if args.expected_through and not args.symbols_file:
+        parser.error("--expected-through is only supported with --symbols-file")
     if args.symbols_file and args.provider != "pytdx":
         parser.error("--symbols-file scoped tail mode requires --provider pytdx")
     if args.symbols_file and (not args.tdx_host or "," in args.tdx_host):
@@ -151,6 +169,19 @@ async def run_once(args: argparse.Namespace) -> None:
         stop_at_by_timeframe = parse_stop_at(
             args.stop_at, timeframes, canonical_tail_labels=scoped
         )
+        expected_through_by_timeframe = parse_stop_at(
+            args.expected_through, timeframes, canonical_tail_labels=scoped
+        )
+        invalid_bounds = [
+            timeframe for timeframe in timeframes
+            if scoped
+            and expected_through_by_timeframe[timeframe] <= stop_at_by_timeframe[timeframe]
+        ]
+        if invalid_bounds:
+            raise ValueError(
+                "scoped expected-through must be later than stop-at: "
+                + ",".join(invalid_bounds)
+            )
         symbols = (
             load_symbols_file(args.symbols_file)
             if args.symbols_file
@@ -167,6 +198,8 @@ async def run_once(args: argparse.Namespace) -> None:
             symbols=[item.symbol for item in symbols],
             timeframes=timeframes,
             stop_at=stop_at_by_timeframe,
+            expected_through=expected_through_by_timeframe,
+            freshness_contract_sha256=args.freshness_contract_sha256,
             page_size=args.page_size,
             endpoint=endpoint,
             source_policy=args.source_policy,
@@ -185,6 +218,10 @@ async def run_once(args: argparse.Namespace) -> None:
         max_pages_per_task=args.max_pages_per_task,
         dry_run=args.dry_run,
         stop_at={key: value.isoformat() for key, value in stop_at_by_timeframe.items()},
+        expected_through={
+            key: value.isoformat() for key, value in expected_through_by_timeframe.items()
+        },
+        freshness_contract_sha256=args.freshness_contract_sha256,
         run_id=None if run_id is None else str(run_id),
         run_identity=run_identity,
         manifest_sha256=manifest_sha256,
@@ -207,6 +244,8 @@ async def run_once(args: argparse.Namespace) -> None:
                     symbols=symbols,
                     timeframes=timeframes,
                     stop_at=stop_at_by_timeframe,
+                    expected_through=expected_through_by_timeframe,
+                    freshness_contract_sha256=args.freshness_contract_sha256,
                     provider=provider.name,
                     page_size=args.page_size,
                     endpoint=endpoint,
@@ -258,6 +297,7 @@ async def run_once(args: argparse.Namespace) -> None:
                 sleep=args.sleep,
                 lease_seconds=args.lease_seconds,
                 stop_at_by_timeframe=stop_at_by_timeframe,
+                expected_through_by_timeframe=expected_through_by_timeframe,
                 run_id=run_id,
             )
             emit(
@@ -265,7 +305,29 @@ async def run_once(args: argparse.Namespace) -> None:
                 tasks=len(tasks),
                 pages=result["pages"],
                 bars=result["bars"],
+                failed=result.get("failed", 0),
+                lease_lost=result.get("lease_lost", 0),
             )
+            durable_states = (
+                await task_store.summarize_scoped_run(run_id) if scoped else {}
+            )
+            if scoped:
+                emit("history_scoped_run_status", run_id=str(run_id), states=durable_states)
+            incomplete = sum(
+                count for status, count in durable_states.items() if status != "success"
+            )
+            if scoped and (
+                result.get("failed", 0)
+                or result.get("lease_lost", 0)
+                or incomplete
+                or durable_states.get("success", 0) != len(task_ids)
+            ):
+                raise RuntimeError(
+                    "scoped historical backfill did not complete cleanly: "
+                    f"failed={result.get('failed', 0)} "
+                    f"lease_lost={result.get('lease_lost', 0)} "
+                    f"states={durable_states}"
+                )
 
 
 async def process_tasks_concurrently(
@@ -279,6 +341,7 @@ async def process_tasks_concurrently(
     sleep: float,
     lease_seconds: int,
     stop_at_by_timeframe: dict[str, datetime] | None = None,
+    expected_through_by_timeframe: dict[str, datetime] | None = None,
     run_id: UUID | None = None,
 ) -> dict[str, int]:
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -289,7 +352,13 @@ async def process_tasks_concurrently(
             durable_run_id = task.get("run_id")
             durable_stop_at = task.get("stop_at")
             expected_stop_at = (stop_at_by_timeframe or {}).get(timeframe)
-            if durable_run_id != run_id or durable_stop_at != expected_stop_at:
+            durable_expected_through = task.get("expected_through")
+            expected_through = (expected_through_by_timeframe or {}).get(timeframe)
+            if (
+                durable_run_id != run_id
+                or durable_stop_at != expected_stop_at
+                or durable_expected_through != expected_through
+            ):
                 raise RuntimeError("claimed scoped backfill identity drift")
             return await process_task(
                 provider=provider_factory(),
@@ -300,14 +369,20 @@ async def process_tasks_concurrently(
                 sleep=sleep,
                 lease_seconds=lease_seconds,
                 stop_at=durable_stop_at,
+                expected_through=durable_expected_through,
                 run_id=durable_run_id,
             )
 
     results = await asyncio.gather(*(run_task(task) for task in tasks))
-    return {
+    summary = {
         "pages": sum(item["pages"] for item in results),
         "bars": sum(item["bars"] for item in results),
     }
+    failed = sum(item.get("failed", 0) for item in results)
+    lease_lost = sum(item.get("lease_lost", 0) for item in results)
+    if run_id is not None or failed or lease_lost:
+        summary.update(failed=failed, lease_lost=lease_lost)
+    return summary
 
 
 async def process_task(
@@ -320,6 +395,7 @@ async def process_task(
     sleep: float,
     lease_seconds: int,
     stop_at: datetime | None = None,
+    expected_through: datetime | None = None,
     run_id: UUID | None = None,
 ) -> dict[str, int]:
     symbol = str(task["symbol"])
@@ -328,6 +404,8 @@ async def process_task(
     offset = int(task["next_offset"])
     pages = 0
     total_bars = 0
+    failed = 0
+    lost = 0
     exhausted = False
     lease_lost = asyncio.Event()
     stop_heartbeat = asyncio.Event()
@@ -373,10 +451,30 @@ async def process_task(
                 raise LostBackfillLease(f"historical backfill task lease lost: {task['id']}")
             provider_exhausted = raw_rows_read < page_size
             next_offset = offset + raw_rows_read
+            provider_page_newest = max((bar.ts for bar in bars), default=None)
+            durable_provider_newest = task.get("provider_newest_ts")
+            provider_newest = max(
+                (value for value in (durable_provider_newest, provider_page_newest) if value is not None),
+                default=None,
+            )
+            if run_id is not None and expected_through is None:
+                raise RuntimeError("scoped task is missing expected-through evidence")
+            if (
+                run_id is not None
+                and provider_newest is not None
+                and provider_newest < expected_through
+            ):
+                raise RuntimeError("provider newest bar is earlier than expected-through")
+            if run_id is not None and provider_newest is None:
+                raise RuntimeError("provider returned no bars to prove expected-through")
             stop_reached = stop_at is not None and any(bar.ts <= stop_at for bar in bars)
+            if run_id is not None and provider_exhausted and not stop_reached:
+                raise RuntimeError("provider exhausted before stop-at boundary")
+            if expected_through is not None:
+                bars = [bar for bar in bars if bar.ts <= expected_through]
             if stop_at is not None:
                 bars = [bar for bar in bars if bar.ts > stop_at]
-            exhausted = provider_exhausted or stop_reached
+            exhausted = stop_reached if run_id is not None else provider_exhausted or stop_reached
             bars_read = len(bars)
             oldest_ts = min((bar.ts for bar in bars), default=None)
             newest_ts = max((bar.ts for bar in bars), default=None)
@@ -389,6 +487,7 @@ async def process_task(
                 newest_ts=newest_ts,
                 exhausted=exhausted,
                 lease_seconds=lease_seconds,
+                provider_newest_ts=provider_newest,
             )
             emit(
                 "history_page_written",
@@ -422,6 +521,7 @@ async def process_task(
                 )
 
     except LostBackfillLease as exc:
+        lost = 1
         emit(
             "history_task_lease_lost",
             symbol=symbol,
@@ -444,11 +544,18 @@ async def process_task(
             offset=offset,
             error=str(exc)[:500],
         )
+        if recorded:
+            failed = 1
+        else:
+            lost = 1
     finally:
         stop_heartbeat.set()
         if not heartbeat_task.done():
             await heartbeat_task
-    return {"pages": pages, "bars": total_bars}
+    result = {"pages": pages, "bars": total_bars}
+    if run_id is not None or failed or lost:
+        result.update(failed=failed, lease_lost=lost)
+    return result
 
 
 async def get_provider_page(
@@ -605,6 +712,8 @@ def scoped_run_identity(
     symbols: list[str],
     timeframes: list[str],
     stop_at: dict[str, datetime],
+    expected_through: dict[str, datetime],
+    freshness_contract_sha256: str,
     page_size: int,
     endpoint: str,
     source_policy: str,
@@ -615,6 +724,10 @@ def scoped_run_identity(
         "symbols": sorted(symbols),
         "timeframes": sorted(timeframes),
         "stop_at": {key: value.isoformat() for key, value in sorted(stop_at.items())},
+        "expected_through": {
+            key: value.isoformat() for key, value in sorted(expected_through.items())
+        },
+        "freshness_contract_sha256": freshness_contract_sha256,
         "page_size": int(page_size),
         "endpoint": endpoint,
         "source_policy": source_policy,

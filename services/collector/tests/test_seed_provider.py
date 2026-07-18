@@ -1017,6 +1017,84 @@ def test_history_backfill_stop_at_yields_until_page_reaches_boundary() -> None:
     ]
 
 
+def test_scoped_history_backfill_empty_first_page_fails_before_kline_write() -> None:
+    cutoff = datetime(2026, 7, 10, 7, tzinfo=UTC)
+    target = datetime(2026, 7, 17, 7, tzinfo=UTC)
+
+    class FakeProvider:
+        async def get_bars_page_with_raw_count(self, *_args, **_kwargs):
+            return [], 0
+
+    class FakeWriter:
+        async def commit_history_backfill_page(self, **_kwargs):
+            raise AssertionError("unproven scoped source must not write K-lines")
+
+    class FakeStore:
+        def __init__(self):
+            self.failures = []
+
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def record_failure(self, **kwargs):
+            self.failures.append(kwargs)
+            return True
+
+    store = FakeStore()
+    result = asyncio.run(process_history_task(
+        provider=FakeProvider(), kline_writer=FakeWriter(), task_store=store,
+        task={
+            "id": 14, "symbol": "000001.SZ", "timeframe": 5,
+            "page_size": 260, "next_offset": 0, "claim_token": "empty",
+            "lease_version": 1, "run_id": "run-a", "stop_at": cutoff,
+            "expected_through": target, "provider_newest_ts": None,
+        },
+        max_pages_per_task=1, sleep=0, lease_seconds=300,
+        stop_at=cutoff, expected_through=target, run_id="run-a",
+    ))
+    assert result == {"pages": 0, "bars": 0, "failed": 1, "lease_lost": 0}
+    assert "expected-through" in store.failures[0]["error"]
+
+
+def test_scoped_history_backfill_provider_exhaustion_before_stop_fails() -> None:
+    cutoff = datetime(2026, 7, 10, 7, tzinfo=UTC)
+    target = datetime(2026, 7, 17, 7, tzinfo=UTC)
+
+    class FakeProvider:
+        async def get_bars_page_with_raw_count(self, symbol, timeframe, **_kwargs):
+            return [_fake_bar_at(symbol, timeframe, target)], 1
+
+    class FakeWriter:
+        async def commit_history_backfill_page(self, **_kwargs):
+            raise AssertionError("incomplete scoped history must not commit completion")
+
+    class FakeStore:
+        def __init__(self):
+            self.failures = []
+
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def record_failure(self, **kwargs):
+            self.failures.append(kwargs)
+            return True
+
+    store = FakeStore()
+    result = asyncio.run(process_history_task(
+        provider=FakeProvider(), kline_writer=FakeWriter(), task_store=store,
+        task={
+            "id": 15, "symbol": "000001.SZ", "timeframe": 5,
+            "page_size": 260, "next_offset": 0, "claim_token": "short",
+            "lease_version": 1, "run_id": "run-b", "stop_at": cutoff,
+            "expected_through": target, "provider_newest_ts": None,
+        },
+        max_pages_per_task=1, sleep=0, lease_seconds=300,
+        stop_at=cutoff, expected_through=target, run_id="run-b",
+    ))
+    assert result["failed"] == 1
+    assert "before stop-at" in store.failures[0]["error"]
+
+
 def _fake_bar(symbol: str, timeframe: str, index: int) -> Bar:
     return Bar(
         symbol=symbol,
