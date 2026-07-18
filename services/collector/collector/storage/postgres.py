@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -74,6 +74,10 @@ def bar_to_db_values(bar: Bar) -> tuple:
         bar.revision,
         source_to_code(bar.source),
     )
+
+
+class LostBackfillLease(RuntimeError):
+    pass
 
 
 class PostgresKlineWriter:
@@ -176,6 +180,132 @@ class PostgresKlineWriter:
                     return 0, False
                 await self._upsert_bars_rows(conn, rows)
         return len(rows), True
+
+    async def commit_history_backfill_page(
+        self,
+        *,
+        task: Mapping[str, object],
+        expected_offset: int,
+        next_offset: int,
+        bars: Iterable[Bar],
+        oldest_ts: datetime | None,
+        newest_ts: datetime | None,
+        exhausted: bool,
+        lease_seconds: int,
+    ) -> int:
+        """Atomically fence ownership, write one page, and advance its checkpoint."""
+        assert self._pool is not None
+        rows = [bar_to_db_values(bar) for bar in bars]
+        task_id = int(task["id"])
+        claim_token = str(task["claim_token"])
+        lease_version = int(task["lease_version"])
+        if next_offset < expected_offset:
+            raise ValueError("historical backfill next_offset cannot move backwards")
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                owned = await conn.fetchrow(
+                    """
+                    select task.id,
+                           task.timeframe,
+                           symbol.code || '.' || symbol.exchange as symbol
+                      from historical_backfill_tasks task
+                      join symbols symbol on symbol.id = task.symbol_id
+                     where task.id = $1
+                       and task.status = 'running'
+                       and task.claim_token = $2
+                       and task.lease_version = $3
+                       and task.lease_until > clock_timestamp()
+                       and task.next_offset = $4
+                     for update of task, symbol
+                    """,
+                    task_id,
+                    claim_token,
+                    lease_version,
+                    expected_offset,
+                )
+                if owned is None:
+                    raise LostBackfillLease(
+                        f"historical backfill task lease lost before page write: {task_id}"
+                    )
+                authoritative_symbol = str(owned["symbol"])
+                authoritative_timeframe = int(owned["timeframe"])
+                if (
+                    str(task.get("symbol") or "") != authoritative_symbol
+                    or int(task.get("timeframe") or -1) != authoritative_timeframe
+                ):
+                    raise ValueError(
+                        f"historical backfill claimed scope mismatch for task {task_id}"
+                    )
+                if any(
+                    str(row[0]) != authoritative_symbol
+                    or int(row[1]) != authoritative_timeframe
+                    for row in rows
+                ):
+                    raise ValueError(
+                        f"historical backfill page scope mismatch for task {task_id}"
+                    )
+                if rows:
+                    await self._upsert_bars_rows(conn, rows)
+                updated = await conn.fetchrow(
+                    """
+                    update historical_backfill_tasks
+                       set next_offset = $4,
+                           status = case when $9 then 'success' else 'running' end,
+                           pages_done = pages_done + 1,
+                           bars_read = bars_read + $5,
+                           bars_written = bars_written + $6,
+                           attempts = 0,
+                           oldest_ts = case
+                               when oldest_ts is null then $7::timestamptz
+                               when $7::timestamptz is null then oldest_ts
+                               when $7::timestamptz < oldest_ts then $7::timestamptz
+                               else oldest_ts
+                           end,
+                           newest_ts = case
+                               when newest_ts is null then $8::timestamptz
+                               when $8::timestamptz is null then newest_ts
+                               when $8::timestamptz > newest_ts then $8::timestamptz
+                               else newest_ts
+                           end,
+                           worker_id = case when $9 then null else worker_id end,
+                           claim_token = case when $9 then null else claim_token end,
+                           lease_until = case
+                               when $9 then null
+                               else clock_timestamp() + ($10::integer * interval '1 second')
+                           end,
+                           lease_heartbeat_at = case
+                               when $9 then null else clock_timestamp()
+                           end,
+                           finished_at = case when $9 then clock_timestamp() else finished_at end,
+                           last_run_at = clock_timestamp(),
+                           last_error = null,
+                           updated_at = clock_timestamp()
+                     where id = $1
+                       and status = 'running'
+                       and claim_token = $2
+                       and lease_version = $3
+                       and lease_until > clock_timestamp()
+                       and next_offset = $11
+                    returning id
+                    """,
+                    task_id,
+                    claim_token,
+                    lease_version,
+                    next_offset,
+                    len(rows),
+                    len(rows),
+                    oldest_ts,
+                    newest_ts,
+                    exhausted,
+                    max(1, lease_seconds),
+                    expected_offset,
+                )
+                if updated is None:
+                    raise LostBackfillLease(
+                        f"historical backfill task lease lost during page write: {task_id}"
+                    )
+        return len(rows)
 
     async def _upsert_bars_rows(self, conn, rows: list[tuple]) -> None:
         await self._register_source_coverage(conn, rows)

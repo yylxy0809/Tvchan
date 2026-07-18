@@ -535,17 +535,24 @@ def test_history_backfill_process_task_advances_offsets_until_exhausted() -> Non
     class FakeKlineWriter:
         def __init__(self) -> None:
             self.written = []
+            self.records = []
 
-        async def upsert_bars(self, bars):
+        async def commit_history_backfill_page(self, **kwargs):
+            bars = kwargs["bars"]
             self.written.extend(bars)
+            self.records.append(kwargs)
             return len(bars)
 
     class FakeTaskStore:
         def __init__(self) -> None:
-            self.records = []
+            self.yields = []
 
-        async def record_page_success(self, **kwargs):
-            self.records.append(kwargs)
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def yield_task(self, **kwargs):
+            self.yields.append(kwargs)
+            return True
 
         async def record_failure(self, **kwargs):
             raise AssertionError(f"unexpected failure: {kwargs}")
@@ -563,15 +570,19 @@ def test_history_backfill_process_task_advances_offsets_until_exhausted() -> Non
                 "timeframe": 5,
                 "page_size": 3,
                 "next_offset": 0,
+                "claim_token": "claim-a",
+                "lease_version": 1,
             },
             max_pages_per_task=0,
             sleep=0,
+            lease_seconds=300,
         )
     )
     assert result == {"pages": 2, "bars": 4}
     assert len(writer.written) == 4
-    assert [item["next_offset"] for item in task_store.records] == [3, 4]
-    assert [item["exhausted"] for item in task_store.records] == [False, True]
+    assert [item["next_offset"] for item in writer.records] == [3, 4]
+    assert [item["exhausted"] for item in writer.records] == [False, True]
+    assert task_store.yields == []
 
 
 def test_history_backfill_processes_tasks_with_bounded_concurrency() -> None:
@@ -592,15 +603,20 @@ def test_history_backfill_processes_tasks_with_bounded_concurrency() -> None:
             return [_fake_bar(symbol, timeframe, offset)]
 
     class FakeKlineWriter:
-        async def upsert_bars(self, bars):
+        async def commit_history_backfill_page(self, **kwargs):
+            bars = kwargs["bars"]
             return len(bars)
 
     class FakeTaskStore:
         def __init__(self) -> None:
-            self.records = []
+            self.yields = []
 
-        async def record_page_success(self, **kwargs):
-            self.records.append(kwargs)
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def yield_task(self, **kwargs):
+            self.yields.append(kwargs)
+            return True
 
         async def record_failure(self, **kwargs):
             raise AssertionError(f"unexpected failure: {kwargs}")
@@ -613,6 +629,8 @@ def test_history_backfill_processes_tasks_with_bounded_concurrency() -> None:
             "timeframe": 5,
             "page_size": 2,
             "next_offset": 0,
+            "claim_token": f"claim-{index}",
+            "lease_version": 1,
         }
         for index in range(3)
     ]
@@ -625,12 +643,68 @@ def test_history_backfill_processes_tasks_with_bounded_concurrency() -> None:
             concurrency=2,
             max_pages_per_task=1,
             sleep=0,
+            lease_seconds=300,
         )
     )
     assert result == {"pages": 3, "bars": 3}
     assert Monitor.created == 3
     assert Monitor.max_active == 2
-    assert len(task_store.records) == 3
+    assert task_store.yields == []
+
+
+def test_history_backfill_keeps_ownership_until_an_explicit_yield() -> None:
+    class FakeProvider:
+        async def get_bars_page(self, symbol, timeframe, *, offset, limit):
+            return [_fake_bar(symbol, timeframe, offset)]
+
+    class FakeKlineWriter:
+        def __init__(self) -> None:
+            self.statuses = []
+
+        async def commit_history_backfill_page(self, **kwargs):
+            self.statuses.append((kwargs["expected_offset"], kwargs["exhausted"]))
+            return len(kwargs["bars"])
+
+    class FakeTaskStore:
+        def __init__(self) -> None:
+            self.yields = []
+
+        async def heartbeat(self, **_kwargs):
+            return True
+
+        async def yield_task(self, **kwargs):
+            self.yields.append(kwargs)
+            return True
+
+        async def record_failure(self, **kwargs):
+            raise AssertionError(f"unexpected failure: {kwargs}")
+
+    writer = FakeKlineWriter()
+    store = FakeTaskStore()
+    result = asyncio.run(
+        process_history_task(
+            provider=FakeProvider(),
+            kline_writer=writer,
+            task_store=store,
+            task={
+                "id": 9,
+                "symbol": "000009.SZ",
+                "timeframe": 5,
+                "page_size": 1,
+                "next_offset": 0,
+                "claim_token": "claim-yield",
+                "lease_version": 4,
+            },
+            max_pages_per_task=2,
+            sleep=0,
+            lease_seconds=300,
+        )
+    )
+    assert result == {"pages": 2, "bars": 2}
+    assert writer.statuses == [(0, False), (1, False)]
+    assert store.yields == [
+        {"task_id": 9, "claim_token": "claim-yield", "lease_version": 4}
+    ]
 
 
 def _fake_bar(symbol: str, timeframe: str, index: int) -> Bar:
