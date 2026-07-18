@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -13,6 +14,7 @@ from collector.aggregate_increment_import import (
     AggregateTask,
     ALL_STAGE_MATCH_SQL,
     _batch_timestamp_bounds,
+    _create_scope_original,
     _fetch_stage_mismatch,
     bind_quarantines_to_run,
     discover_tasks,
@@ -223,7 +225,9 @@ def test_task_batch_is_bounded_to_requested_offset(tmp_path: Path) -> None:
 def test_append_only_sql_contract_is_present() -> None:
     from collector.aggregate_increment_import import (
         APPEND_ONLY_MISMATCH_SQL,
+        CREATE_SCOPE_ORIGINAL_SQL,
         INSERT_NEW_ROWS_SQL,
+        INVALID_SCOPE_ORIGINAL_SQL,
         LOCK_ACTIVE_SYMBOLS_SQL,
     )
 
@@ -240,6 +244,16 @@ def test_append_only_sql_contract_is_present() -> None:
     locked = " ".join(LOCK_ACTIVE_SYMBOLS_SQL.lower().split())
     assert "symbol.is_active is true" in locked
     assert "for share of symbol" in locked
+    frozen = " ".join(CREATE_SCOPE_ORIGINAL_SQL.lower().split())
+    assert "kline_scope_catalog" in frozen
+    assert "catalog.generation_id=$1" in frozen
+    assert "catalog.bounds_complete is true" in frozen
+    assert "catalog.state='present'" in frozen
+    assert "catalog.state='empty'" in frozen
+    assert "max(kline.ts)" not in frozen
+    invalid = " ".join(INVALID_SCOPE_ORIGINAL_SQL.lower().split())
+    assert "catalog_rows <> 1" in invalid
+    assert "not catalog_valid" in invalid
 
 
 def test_batch_timestamp_bounds_cover_every_staged_bar() -> None:
@@ -256,6 +270,22 @@ def test_batch_timestamp_bounds_cover_every_staged_bar() -> None:
     conn = AsyncMock()
     asyncio.run(_fetch_stage_mismatch(conn, ALL_STAGE_MATCH_SQL, bars))
     conn.fetchrow.assert_awaited_once_with(ALL_STAGE_MATCH_SQL, early, late)
+
+
+def test_scope_original_rejects_invalid_catalog_evidence() -> None:
+    generation_id = uuid4()
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {
+        "symbol_id": 7,
+        "timeframe": 1440,
+        "catalog_rows": 0,
+        "catalog_valid": False,
+    }
+
+    with pytest.raises(RuntimeError, match="missing or incomplete"):
+        asyncio.run(_create_scope_original(conn, generation_id))
+
+    conn.execute.assert_awaited_once()
 
 
 def test_run_identity_binds_canary_selection_and_exchange_policy(tmp_path: Path) -> None:
