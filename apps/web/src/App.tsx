@@ -1,6 +1,6 @@
 import { CandlestickChart, LogOut } from "lucide-react";
 import { useEffect, useState } from "react";
-import { AuthenticationError, type AuthSession, loginWithToken } from "./auth/api";
+import { type AuthSession, isCredentialRejection, loginWithToken } from "./auth/api";
 import { getApiToken } from "./config";
 import {
   clearSavedSessionMeta,
@@ -33,10 +33,7 @@ export default function App() {
       })
       .catch((error: unknown) => {
         if (!active) return;
-        if (
-          error instanceof AuthenticationError &&
-          (error.status === 401 || error.status === 403)
-        ) {
+        if (isCredentialRejection(error)) {
           clearSavedSessionMeta();
           setLoginHint("");
         }

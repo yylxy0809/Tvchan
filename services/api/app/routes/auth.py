@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.core.config import Settings, get_settings
-from app.core.security import authenticate_token_value
+from app.core.security import authenticate_token_value, static_token_principal
 from app.models import LoginRequest, LoginResponse
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+_AUTHENTICATION_SERVICE_UNAVAILABLE = "Authentication service unavailable"
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -15,11 +17,21 @@ async def login(
     http_request: Request,
     settings: Settings = Depends(get_settings),
 ) -> LoginResponse:
-    principal = await authenticate_token_value(
-        request.token,
-        getattr(http_request.app.state, "db_pool", None),
-        settings,
-    )
+    principal = static_token_principal(request.token, settings)
+    if principal is None:
+        pool = getattr(http_request.app.state, "db_pool", None)
+        if pool is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_AUTHENTICATION_SERVICE_UNAVAILABLE,
+            )
+        try:
+            principal = await authenticate_token_value(request.token, pool, settings)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_AUTHENTICATION_SERVICE_UNAVAILABLE,
+            ) from exc
     if principal is None:
         return LoginResponse(valid=False)
     return LoginResponse(

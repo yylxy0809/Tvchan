@@ -89,7 +89,7 @@ test("App restores a saved credential through the backend before creating a sess
   assert.doesNotMatch(persistenceSource, /loadSavedRole/);
   assert.doesNotMatch(persistenceSource, /isFrontendAdminToken/);
   assert.match(appSource, /onAuthenticationFailure=\{handleLogout\}/);
-  assert.match(loginPageSource, /nextError\.status === 401 \|\| nextError\.status === 403/);
+  assert.match(loginPageSource, /isCredentialRejection\(nextError\)/);
   assert.match(loginPageSource, /setToken\(""\)/);
   assert.match(loginPageSource, /onAuthenticationFailure\?\.\(\)/);
   assert.match(loginPageSource, /fence\.isCurrent\(attempt\)/);

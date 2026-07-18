@@ -80,6 +80,22 @@ class FakeTokenPool:
         raise AssertionError(f"unexpected execute query: {query}")
 
 
+class FailingTokenPool(FakeTokenPool):
+    async def fetchrow(self, query: str, *args):
+        normalized = " ".join(query.lower().split())
+        if "where token_hash = $1" in normalized:
+            raise RuntimeError("database lookup failed for should-not-leak")
+        return await super().fetchrow(query, *args)
+
+
+class FailingTouchTokenPool(FakeTokenPool):
+    async def execute(self, query: str, *args):
+        normalized = " ".join(query.lower().split())
+        if normalized.startswith("update user_api_tokens set last_used_at"):
+            raise RuntimeError("database touch failed for should-not-leak")
+        return await super().execute(query, *args)
+
+
 def _client(settings: Settings, pool: FakeTokenPool | None = None) -> TestClient:
     api_app = create_app()
     api_app.dependency_overrides[get_settings] = lambda: settings
@@ -125,6 +141,96 @@ def test_login_distinguishes_admin_token_from_compatible_api_token() -> None:
     assert admin_response.json()["role"] == "admin"
     assert api_response.json()["role"] == "user"
     assert api_response.json()["valid"] is True
+
+
+def test_static_login_does_not_consult_a_broken_durable_store() -> None:
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        FailingTokenPool(),
+    )
+
+    api_response = client.post("/api/v1/auth/login", json={"token": "api-token"})
+    admin_response = client.post("/api/v1/auth/login", json={"token": "admin-token"})
+
+    assert api_response.status_code == 200
+    assert api_response.json()["role"] == "user"
+    assert admin_response.status_code == 200
+    assert admin_response.json()["role"] == "admin"
+
+
+def test_login_returns_503_for_non_static_token_when_store_is_missing() -> None:
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"))
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"token": "durable-or-invalid-token"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Authentication service unavailable"}
+
+
+def test_login_returns_503_when_durable_store_lookup_fails_without_leaking_token() -> None:
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        FailingTokenPool(),
+    )
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"token": "should-not-leak"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Authentication service unavailable"}
+    assert "should-not-leak" not in response.text
+
+
+def test_login_returns_503_when_durable_token_usage_cannot_be_recorded() -> None:
+    pool = FailingTouchTokenPool()
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        pool,
+    )
+    created = client.post(
+        "/api/v1/admin/tokens",
+        json={"label": "desk-1"},
+        headers={"Authorization": "Bearer admin-token"},
+    ).json()
+
+    response = client.post("/api/v1/auth/login", json={"token": created["token"]})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Authentication service unavailable"}
+    assert created["token"] not in response.text
+    assert pool.touched == []
+
+
+def test_invalid_durable_token_remains_invalid_when_store_is_available() -> None:
+    pool = FakeTokenPool()
+    client = _client(
+        Settings(api_token="api-token", admin_api_token="admin-token"),
+        pool,
+    )
+
+    response = client.post("/api/v1/auth/login", json={"token": "not-issued"})
+
+    assert response.status_code == 200
+    assert response.json()["valid"] is False
+    assert pool.touched == []
+
+
+def test_protected_routes_keep_existing_invalid_token_semantics_without_store() -> None:
+    client = _client(Settings(api_token="api-token", admin_api_token="admin-token"))
+
+    response = client.get(
+        "/api/v1/symbols",
+        params={"keyword": "000001"},
+        headers={"Authorization": "Bearer durable-or-invalid-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Invalid bearer token"}
 
 
 def test_api_token_still_accesses_existing_data_routes_when_admin_token_is_configured() -> None:

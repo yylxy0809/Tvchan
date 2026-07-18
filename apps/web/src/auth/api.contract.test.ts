@@ -6,6 +6,7 @@ import {
   createAdminToken,
   deleteAdminToken,
   disableAdminToken,
+  isCredentialRejection,
   listAdminTokens,
   loginWithToken,
 } from "./api";
@@ -215,7 +216,7 @@ test("login failures never probe public health or fabricate a session", async (t
     length: 0,
   });
 
-  for (const status of [401, 403, 404, 405, 500]) {
+  for (const status of [401, 403, 404, 405, 500, 503]) {
     const calls: string[] = [];
     globalThis.fetch = async (input) => {
       calls.push(String(input));
@@ -226,6 +227,7 @@ test("login failures never probe public health or fabricate a session", async (t
       (error: unknown) => {
         assert.ok(error instanceof AuthenticationError);
         assert.equal(error.status, status);
+        assert.equal(isCredentialRejection(error), status === 401 || status === 403);
         assert.doesNotMatch(error.message, new RegExp(`super-secret-${status}`));
         return true;
       },
@@ -242,6 +244,39 @@ test("login failures never probe public health or fabricate a session", async (t
   await assert.rejects(loginWithToken("network-token"), /Authentication service unavailable/);
   assert.equal(calls.length, 1);
   assert.match(calls[0]!, /\/api\/v1\/auth\/login$/);
+});
+
+test("credential rejection keeps its status when the response body is unreadable", async (t) => {
+  t.after(restoreGlobals);
+  installWindow({
+    getItem() { return null; },
+    setItem() {},
+    removeItem() {},
+    clear() {},
+    key() { return null; },
+    length: 0,
+  });
+
+  for (const status of [401, 403]) {
+    globalThis.fetch = async () => ({
+      ok: false,
+      status,
+      statusText: "Rejected",
+      text: async () => {
+        throw new TypeError("body stream unavailable for body-secret");
+      },
+    }) as unknown as Response;
+
+    await assert.rejects(
+      loginWithToken("credential-secret"),
+      (error: unknown) => {
+        assert.ok(error instanceof AuthenticationError);
+        assert.equal(error.status, status);
+        assert.doesNotMatch(error.message, /credential-secret|body-secret/);
+        return true;
+      },
+    );
+  }
 });
 
 test("login accepts only authoritative user or admin roles", async (t) => {
