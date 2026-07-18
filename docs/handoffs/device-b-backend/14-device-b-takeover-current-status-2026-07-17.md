@@ -11,8 +11,8 @@
 当前已验收的主干基线：
 
 ```text
-origin/master = 1d2a6f5027125822e62c20d1e33279526509d41d
-short SHA     = 1d2a6f5
+origin/master = 5595cca7e5d86ec5741b29fc19acdc281cc744e6
+short SHA     = 5595cca
 ```
 
 | PR | 交付层 | 状态 |
@@ -48,6 +48,10 @@ short SHA     = 1d2a6f5
 | #51 | Module C 活动批次只读可观测性 | 已合入；确定排序的 running batch IDs、bigint 字符串与前端请求 epoch fence |
 | #52 | 浏览器登录权威收口 | 已合入；删除 frontend/local/public-health 伪认证，登录只接受后端权威响应 |
 | #53 | durable 登录可用性语义 | 已合入；durable authority 不可用统一脱敏 503，static token 与既有 protected HTTP/WS 合同不变 |
+| #54 | 设备 B 接管状态刷新 | 已合入；记录管理认证、浏览器登录与 durable 登录可用性收口 |
+| #55 | Admin 认证错误正文故障隔离 | 已合入；401/403 正文不可读仍保留 status 并执行权威登出，5xx/network 保持局部降级 |
+| #56 | 在线 Module C tail lease/publication fencing | 已合入；active lease 不被 normalize 撤销，publication 与 task completion 在同一事务内按 running/running、claim token/version、anchor/target/head identity fail-closed |
+| #57 | protected HTTP/WebSocket durable authority 可用性 | 已合入；HTTP authority 故障脱敏 503，WebSocket 区分 1013/1008，conditional active touch 阻断 lookup 后 revoke/delete 竞态 |
 
 三层 rebased 代码、合入后验收、v4/lifecycle 防火墙与 scope catalog 两阶段实现均已进入主干。旧 PR 和旧分支仅用于审计，不应再次合并、rebase 或强推。
 
@@ -114,8 +118,11 @@ short SHA     = 1d2a6f5
 8. **deterministic canary selection-v2**：PR #46-#49 固定四板块各 5 标与每板块低/中/高活动边界 2/1/2，冻结完整 selection manifest/hash，并由 Collector/API 共享同一无数据库纯合同。
 9. **管理与浏览器认证收口**：PR #50-#52 统一 Admin 401/403 失效边界，移除所有浏览器伪认证路径，并保持迟到登录不能覆盖最新会话。
 10. **durable 登录可用性**：PR #53 将 token store 缺失、lookup 或 usage touch 失败统一映射为不泄露凭据/数据库细节的 503；健康 authority 下的 invalid/disabled 仍为 `valid=false`，static token 不依赖数据库池。
+11. **Admin 认证错误正文隔离**：PR #55 保证 401/403 的响应正文即使不可读取也不会丢失 status 或绕过登出；500/503/network 仍只局部降级，不伪造认证状态。
+12. **在线 tail lease/publication fencing**：PR #56 统一 5f/30f/1d exact 与 1w/1m logical-period 状态机，禁止 normalize 撤销未过期 lease，并让旧 owner 在任何 run/structures/head/history/outbox/watermark/task completion 副作用前按 claim 与发布 identity fail-closed。
+13. **protected durable authority 可用性**：PR #57 将非 static token 的 store/pool 缺失、lookup 与 usage touch 故障在 protected HTTP 映射为脱敏 503；WebSocket 在业务处理前用 1013 表达可重试故障、以 1008 保留 invalid/disabled 语义；active conditional touch 关闭查询后撤销竞态。
 
-组合验证基线：Web contract `128/128` 且 production build 通过；API `244 passed / 8 skipped`；Collector `658 passed / 2 skipped`，另有一个仅因本机缺少可选 `notte_core` 依赖的既有环境失败。strict-v2 producer/consumer 已通过 focused、全套及 disposable PostgreSQL/TimescaleDB 的迁移、并发、回滚和 fencing 验证。selection-v2 共享合同已通过 shared/API/Collector/Web 三层回归；PR #53 的三路独立 P0/P1 复审确认 static/durable 登录分流、503 脱敏、前端 401/403 清凭据以及 protected HTTP/WS 兼容性。上述后续工程验证均未连接或写入生产库。
+组合验证基线：Web contract `129/129` 且 production build 通过；API `259 passed / 8 skipped`；Collector `668 passed / 3 skipped`，另有一个仅因本机缺少可选 `notte_core` 依赖的既有环境失败。strict-v2 producer/consumer 已通过 focused、全套及 disposable PostgreSQL/TimescaleDB 的迁移、并发、回滚和 fencing 验证。selection-v2 共享合同已通过 shared/API/Collector/Web 三层回归；PR #55 通过 Web focused/full、production build、diff 检查与独立 P0/P1 复审；PR #56-#57 通过各自 focused/full、`compileall`、diff/security 检查与三路独立 P0/P1 复审，其中 PR #56 另通过 disposable TimescaleDB 验证。上述后续工程验证均未连接或写入生产库。
 
 生产 `kline_scope_catalog` generation `2188f14c-0b35-416d-9671-fd3d227d1f75` 已 complete/active，control revision 为 `1`，`scope_count=expected_scope_count=38738`，unknown/incomplete 为零；bootstrap worker 已移除。canonical K-line 指纹保持不变，outbox blocking 为零，observer 健康。
 
@@ -136,7 +143,7 @@ short SHA     = 1d2a6f5
 ## 8. 下一次接管冷启动
 
 ```text
-1. git fetch origin --prune，记录最新 origin/master；不要把 1d2a6f5 当作永久固定 SHA。
+1. git fetch origin --prune，记录最新 origin/master；不要把 5595cca 当作永久固定 SHA。
 2. 阅读 AGENTS.md、本文及新增任务单/审查意见。
 3. 确认工作树干净，确认禁止项和 official NO_GO 未变化。
 4. 从最新 master 建立单一范围分支；不得重跑 13 中已经完成的三层重建。
