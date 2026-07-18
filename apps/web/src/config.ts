@@ -4,7 +4,6 @@ type RuntimeAppConfig = {
   chanStudy?: boolean | string;
   chartV2Fallback?: boolean | string;
   chartDataTransport?: string;
-  frontendAdminToken?: string;
   tvDebug?: boolean | string;
 };
 
@@ -33,11 +32,6 @@ export const API_BASE_MODE = API_BASE_URL ? "absolute" : "same-origin";
 
 export const API_TOKEN_STORAGE_KEY = "tv-a-share-api-token";
 export const LOGIN_TOKEN_STORAGE_KEY = "tv-a-share-login-token";
-
-export const FRONTEND_ADMIN_TOKEN =
-  runtimeConfig.frontendAdminToken ??
-  viteEnv.VITE_FRONTEND_ADMIN_TOKEN ??
-  "";
 
 export const DEFAULT_API_TOKEN =
   runtimeConfig.apiToken ??
@@ -102,7 +96,7 @@ export function getApiToken(): string {
     }
     const saved = window.localStorage.getItem(API_TOKEN_STORAGE_KEY);
     const normalized = saved?.trim() ?? "";
-    if (!normalized || isFrontendLoginToken(normalized)) {
+    if (!normalized) {
       return DEFAULT_API_TOKEN;
     }
     return normalized;
@@ -167,14 +161,6 @@ function readTransport(value: unknown): ChartDataTransport {
     return "auto";
   }
   return "http";
-}
-
-export function isFrontendAdminToken(value: string): boolean {
-  return Boolean(FRONTEND_ADMIN_TOKEN) && value === FRONTEND_ADMIN_TOKEN;
-}
-
-export function isFrontendLoginToken(value: string): boolean {
-  return isFrontendAdminToken(value) || value.startsWith("tv_");
 }
 
 function normalizeApiBaseUrl(value: unknown): string {

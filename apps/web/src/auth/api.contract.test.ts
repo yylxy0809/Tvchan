@@ -2,12 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  AuthenticationError,
   createAdminToken,
   deleteAdminToken,
   disableAdminToken,
   listAdminTokens,
+  loginWithToken,
 } from "./api";
 import { buildAdminHeaders } from "../api/adminRequest";
+import { LoginAttemptFence } from "./loginAttemptFence";
 
 type FetchCall = {
   input: string;
@@ -160,4 +163,120 @@ test("admin request headers preserve standard HeadersInit forms without overridi
   assert.equal(headers.get("content-type"), "text/plain");
   assert.equal(tuples.get("x-tuple"), "kept");
   assert.equal(tuples.get("content-type"), "application/json");
+});
+
+test("login always uses the durable backend even when localStorage contains a forged token", async (t) => {
+  t.after(restoreGlobals);
+  installWindow({
+    getItem(key: string) {
+      if (key === "tv-a-share-local-issued-tokens") {
+        return JSON.stringify([
+          { id: 1, label: "forged", role: "user", is_active: true, token: "forged-token" },
+        ]);
+      }
+      return null;
+    },
+    setItem() {},
+    removeItem() {},
+    clear() {},
+    key() { return null; },
+    length: 0,
+  });
+
+  const calls: FetchCall[] = [];
+  globalThis.fetch = async (input, init) => {
+    calls.push({ input: String(input), init });
+    return responseJson({
+      valid: true,
+      role: "admin",
+      display_name: "Server Admin",
+      label: "durable",
+    });
+  };
+
+  const session = await loginWithToken(" forged-token ");
+
+  assert.equal(session.role, "admin");
+  assert.equal(session.displayName, "Server Admin");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!.input, /\/api\/v1\/auth\/login$/);
+  assert.equal(new Headers(calls[0]!.init?.headers).get("Authorization"), "Bearer forged-token");
+  assert.deepEqual(JSON.parse(String(calls[0]!.init?.body)), { token: "forged-token" });
+});
+
+test("login failures never probe public health or fabricate a session", async (t) => {
+  t.after(restoreGlobals);
+  installWindow({
+    getItem() { return null; },
+    setItem() {},
+    removeItem() {},
+    clear() {},
+    key() { return null; },
+    length: 0,
+  });
+
+  for (const status of [401, 403, 404, 405, 500]) {
+    const calls: string[] = [];
+    globalThis.fetch = async (input) => {
+      calls.push(String(input));
+      return responseJson({ detail: `login failed for super-secret-${status}` }, status);
+    };
+    await assert.rejects(
+      loginWithToken(`super-secret-${status}`),
+      (error: unknown) => {
+        assert.ok(error instanceof AuthenticationError);
+        assert.equal(error.status, status);
+        assert.doesNotMatch(error.message, new RegExp(`super-secret-${status}`));
+        return true;
+      },
+    );
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]!, /\/api\/v1\/auth\/login$/);
+  }
+
+  const calls: string[] = [];
+  globalThis.fetch = async (input) => {
+    calls.push(String(input));
+    throw new TypeError("network unavailable");
+  };
+  await assert.rejects(loginWithToken("network-token"), /Authentication service unavailable/);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!, /\/api\/v1\/auth\/login$/);
+});
+
+test("login accepts only authoritative user or admin roles", async (t) => {
+  t.after(restoreGlobals);
+  installWindow({
+    getItem() { return null; },
+    setItem() {},
+    removeItem() {},
+    clear() {},
+    key() { return null; },
+    length: 0,
+  });
+
+  for (const valid of [false, undefined, "false"]) {
+    globalThis.fetch = async () => responseJson({ valid, role: "user" });
+    await assert.rejects(
+      loginWithToken("invalid-token"),
+      (error: unknown) => error instanceof AuthenticationError && error.status === 403,
+    );
+  }
+
+  for (const role of [undefined, null, "owner", "ADMINISTRATOR"]) {
+    globalThis.fetch = async () => responseJson({ valid: true, role });
+    await assert.rejects(loginWithToken("contract-drift"), /invalid role/i);
+  }
+});
+
+test("login attempt fence makes the latest attempt win and invalidates unmounted work", () => {
+  const fence = new LoginAttemptFence();
+  const first = fence.begin();
+  const second = fence.begin();
+
+  assert.equal(fence.isCurrent(first), false);
+  assert.equal(fence.isCurrent(second), true);
+
+  fence.dispose();
+  assert.equal(fence.isCurrent(second), false);
 });

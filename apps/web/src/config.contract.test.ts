@@ -18,3 +18,12 @@ test("authenticated API clients prefer the persisted login token", () => {
     "the authenticated session token must take precedence over the legacy API token",
   );
 });
+
+test("frontend configuration cannot mint authenticated sessions", () => {
+  const source = readFileSync(new URL("./config.ts", import.meta.url), "utf8");
+
+  assert.doesNotMatch(source, /frontendAdminToken/);
+  assert.doesNotMatch(source, /VITE_FRONTEND_ADMIN_TOKEN/);
+  assert.doesNotMatch(source, /isFrontendAdminToken/);
+  assert.doesNotMatch(source, /isFrontendLoginToken/);
+});

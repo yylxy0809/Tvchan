@@ -1,28 +1,55 @@
 import { AlertCircle, KeyRound } from "lucide-react";
-import { type FormEvent, useState } from "react";
-import { type AuthSession, loginWithToken } from "../auth/api";
+import { type FormEvent, useEffect, useRef, useState } from "react";
+import { AuthenticationError, type AuthSession, loginWithToken } from "../auth/api";
+import { LoginAttemptFence } from "../auth/loginAttemptFence";
 
 type Props = {
   initialToken: string;
   onAuthenticated(session: AuthSession): void;
+  onAuthenticationFailure?(): void;
 };
 
-export function LoginPage({ initialToken, onAuthenticated }: Props) {
+export function LoginPage({
+  initialToken,
+  onAuthenticated,
+  onAuthenticationFailure,
+}: Props) {
   const [token, setToken] = useState(initialToken);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const attemptFence = useRef<LoginAttemptFence | null>(null);
+  if (!attemptFence.current) {
+    attemptFence.current = new LoginAttemptFence();
+  }
+
+  useEffect(() => {
+    const fence = new LoginAttemptFence();
+    attemptFence.current = fence;
+    return () => fence.dispose();
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const fence = attemptFence.current!;
+    const attempt = fence.begin();
     setSubmitting(true);
     setError(null);
     try {
       const session = await loginWithToken(token);
+      if (!fence.isCurrent(attempt)) return;
       onAuthenticated(session);
     } catch (nextError) {
+      if (!fence.isCurrent(attempt)) return;
+      if (
+        nextError instanceof AuthenticationError &&
+        (nextError.status === 401 || nextError.status === 403)
+      ) {
+        setToken("");
+        onAuthenticationFailure?.();
+      }
       setError(nextError instanceof Error ? nextError.message : String(nextError));
     } finally {
-      setSubmitting(false);
+      if (fence.isCurrent(attempt)) setSubmitting(false);
     }
   }
 

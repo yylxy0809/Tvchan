@@ -1,10 +1,9 @@
 import { CandlestickChart, LogOut } from "lucide-react";
-import { useState } from "react";
-import { type AuthSession } from "./auth/api";
+import { useEffect, useState } from "react";
+import { AuthenticationError, type AuthSession, loginWithToken } from "./auth/api";
 import { getApiToken } from "./config";
 import {
   clearSavedSessionMeta,
-  loadSavedSession,
   loadSavedToken,
   persistSession,
 } from "./app/sessionPersistence";
@@ -15,26 +14,74 @@ import { LoginPage } from "./components/LoginPage";
 type AppView = "chart" | "admin";
 
 export default function App() {
-  const [session, setSession] = useState<AuthSession | null>(loadSavedSession);
+  const [initialLoginToken] = useState(loadSavedToken);
+  const [loginHint, setLoginHint] = useState(
+    () => initialLoginToken || getApiToken(),
+  );
+  const [session, setSession] = useState<AuthSession | null>(null);
+  const [restoringSession, setRestoringSession] = useState(Boolean(initialLoginToken));
   const [view, setView] = useState<AppView>("chart");
+
+  useEffect(() => {
+    if (!initialLoginToken) return;
+    let active = true;
+    void loginWithToken(initialLoginToken)
+      .then((next) => {
+        if (!active) return;
+        persistSession(next);
+        setSession(next);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        if (
+          error instanceof AuthenticationError &&
+          (error.status === 401 || error.status === 403)
+        ) {
+          clearSavedSessionMeta();
+          setLoginHint("");
+        }
+      })
+      .finally(() => {
+        if (active) setRestoringSession(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [initialLoginToken]);
 
   function handleAuthenticated(next: AuthSession) {
     persistSession(next);
+    setLoginHint(next.token);
     setSession(next);
     setView("chart");
   }
 
   function handleLogout() {
     clearSavedSessionMeta();
+    setLoginHint("");
     setSession(null);
     setView("chart");
+  }
+
+  if (restoringSession) {
+    return (
+      <main className="login-shell">
+        <section className="login-panel" aria-label="Session verification">
+          <div className="login-status" role="status">
+            <span />
+            <strong>Verifying saved session</strong>
+          </div>
+        </section>
+      </main>
+    );
   }
 
   if (!session) {
     return (
       <LoginPage
-        initialToken={loadSavedToken() || getApiToken()}
+        initialToken={loginHint}
         onAuthenticated={handleAuthenticated}
+        onAuthenticationFailure={handleLogout}
       />
     );
   }

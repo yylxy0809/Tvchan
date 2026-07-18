@@ -1,4 +1,4 @@
-import { apiUrl, isFrontendAdminToken } from "../config";
+import { apiUrl } from "../config";
 import { requestAdmin } from "../api/adminRequest";
 
 export type UserRole = "user" | "admin";
@@ -34,33 +34,20 @@ type AdminTokenListResponse = {
   items?: AdminToken[];
 };
 
-const LOCAL_TOKEN_STORAGE_KEY = "tv-a-share-local-issued-tokens";
+export class AuthenticationError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+    this.name = "AuthenticationError";
+  }
+}
 
 export async function loginWithToken(token: string): Promise<AuthSession> {
   const normalized = token.trim();
   if (!normalized) {
     throw new Error("Please enter an access token.");
-  }
-
-  if (isFrontendAdminToken(normalized)) {
-    return {
-      token: normalized,
-      role: "admin",
-      displayName: "Administrator",
-      label: "frontend-admin",
-    };
-  }
-
-  const localToken = readLocalTokens().find(
-    (item) => item.is_active && item.token === normalized,
-  );
-  if (localToken) {
-    return {
-      token: normalized,
-      role: "user",
-      displayName: localToken.display_name,
-      label: localToken.label,
-    };
   }
 
   try {
@@ -72,25 +59,35 @@ export async function loginWithToken(token: string): Promise<AuthSession> {
       },
       body: JSON.stringify({ token: normalized }),
     });
-    if (response.status === 404 || response.status === 405) {
-      return loginViaHealthFallback(normalized);
-    }
     if (!response.ok) {
-      throw new Error(await readResponseError(response));
+      throw new AuthenticationError(
+        await readResponseError(response, normalized),
+        response.status,
+      );
     }
     const data = (await response.json()) as LoginResponse;
-    if (!data.valid) {
-      throw new Error("Invalid access token.");
+    if (data.valid !== true) {
+      throw new AuthenticationError("Invalid access token.", 403);
+    }
+    const role = parseRole(data.role);
+    if (!role) {
+      throw new AuthenticationError(
+        "Authentication service returned an invalid role.",
+        502,
+      );
     }
     return {
       token: normalized,
-      role: normalizeRole(data.role),
+      role,
       displayName: data.display_name,
       label: data.label,
     };
   } catch (error) {
-    if (isNetworkFailure(error)) {
-      return loginViaHealthFallback(normalized);
+    if (error instanceof AuthenticationError) {
+      throw error;
+    }
+    if (error instanceof TypeError) {
+      throw new AuthenticationError("Authentication service unavailable.");
     }
     throw error;
   }
@@ -133,71 +130,23 @@ export async function deleteAdminToken(adminToken: string, id: number): Promise<
   );
 }
 
-async function loginViaHealthFallback(token: string): Promise<AuthSession> {
-  const response = await fetch(apiUrl("/api/v1/health"), {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
-  if (!response.ok) {
-    throw new Error(await readResponseError(response));
-  }
-  return {
-    token,
-    role: isFrontendAdminToken(token) ? "admin" : "user",
-    displayName: "Legacy API token",
-    label: "legacy",
-  };
+function parseRole(value: unknown): UserRole | null {
+  return value === "admin" || value === "user" ? value : null;
 }
 
-function readLocalTokens(): AdminToken[] {
-  if (typeof window === "undefined") {
-    return [];
-  }
-  try {
-    const raw = window.localStorage.getItem(LOCAL_TOKEN_STORAGE_KEY);
-    if (!raw) {
-      return [];
-    }
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    return parsed.filter(isAdminToken);
-  } catch {
-    return [];
-  }
-}
-
-function isAdminToken(value: unknown): value is AdminToken {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const record = value as Partial<AdminToken>;
-  return (
-    typeof record.id === "number" &&
-    typeof record.label === "string" &&
-    typeof record.is_active === "boolean"
-  );
-}
-
-function normalizeRole(value: unknown): UserRole {
-  return String(value).toLowerCase() === "admin" ? "admin" : "user";
-}
-
-async function readResponseError(response: Response): Promise<string> {
+async function readResponseError(response: Response, token: string): Promise<string> {
   const text = await response.text();
   if (!text) {
     return `${response.status} ${response.statusText}`;
   }
   try {
     const data = JSON.parse(text) as { detail?: unknown; message?: unknown };
-    return String(data.detail ?? data.message ?? text);
+    return redactToken(String(data.detail ?? data.message ?? text), token);
   } catch {
-    return `${response.status} ${response.statusText}: ${text}`;
+    return redactToken(`${response.status} ${response.statusText}: ${text}`, token);
   }
 }
 
-function isNetworkFailure(error: unknown): boolean {
-  return error instanceof TypeError;
+function redactToken(message: string, token: string): string {
+  return message.split(token).join("[redacted]");
 }
