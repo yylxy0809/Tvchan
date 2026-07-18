@@ -7,6 +7,12 @@ from typing import Any,Protocol
 from zoneinfo import ZoneInfo
 from .contracts import Freshness,MarketDataMetadata,MarketDataResult,ProviderError
 SHANGHAI=ZoneInfo("Asia/Shanghai"); RETENTION_SECONDS=16*86400; UNAVAILABLE_RETENTION_SECONDS=60; LEASE_SECONDS=120
+RELEASE_LEASE_SCRIPT='''
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+'''
 class TradingCalendar(Protocol):
     def trading_day(self,now:datetime|None=None)->date:...
     def is_trading_day(self,now:datetime|None=None)->bool:...
@@ -47,8 +53,7 @@ class RedisTradingDayCache:
     async def acquire(self,key):
         token=secrets.token_hex(16); ok=await self._redis.set(key.lease_key(),token,nx=True,ex=LEASE_SECONDS);return token if ok else None
     async def release(self,key,token):
-        current=await self._redis.get(key.lease_key())
-        if current==token:await self._redis.delete(key.lease_key())
+        await self._redis.eval(RELEASE_LEASE_SCRIPT,1,key.lease_key(),token)
 def wire_payload(result):
     value=_json_value(result.value)
     if isinstance(value,dict):payload=dict(value)

@@ -15,6 +15,9 @@ class Redis:
         self.values[key] = value
         return True
     async def delete(self, key): self.values.pop(key, None)
+    async def eval(self, _script, _key_count, key, token):
+        if self.values.get(key) != token: return 0
+        self.values.pop(key, None); return 1
     async def publish(self, channel, payload): self.published.append((channel, json.loads(payload)))
 
 class Loader:
