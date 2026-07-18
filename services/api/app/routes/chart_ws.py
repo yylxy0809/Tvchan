@@ -33,6 +33,7 @@ from trading_protocol import normalize_timeframe
 
 router = APIRouter(tags=["chart-ws"])
 CHAN_SNAPSHOT_INTERVAL_SECONDS = 3.0
+MAX_SUBSCRIPTIONS_PER_CONNECTION = 32
 REDIS_CHAN_HEAD_UPDATE_CHANNEL = "chan:head_updates"
 
 
@@ -191,6 +192,7 @@ async def _handle_chart_message(
         subscription_id = str(message.get("id") or request_id or "")
         if not subscription_id:
             raise ValueError("subscribe_chan requires id or request_id")
+        _ensure_subscription_capacity(subscriptions, subscription_id)
         params = _ChartRequestParams.from_subscription(message)
         subscriptions[subscription_id] = _ChartSubscription(params=params, kind="chan")
         await websocket.send_json(
@@ -233,12 +235,25 @@ async def _subscribe_legacy_bundle(
     subscription_id = str(message.get("id") or request_id or "")
     if not subscription_id:
         raise ValueError("subscribe_chart_bundle requires id or request_id")
+    _ensure_subscription_capacity(subscriptions, subscription_id)
     subscriptions[subscription_id] = _ChartSubscription(
         params=_ChartRequestParams.from_message(message), kind="legacy_bundle"
     )
     await websocket.send_json(
         {"type": "chart_bundle_subscribed", "id": subscription_id}
     )
+
+
+def _ensure_subscription_capacity(
+    subscriptions: dict[str, "_ChartSubscription"], subscription_id: str
+) -> None:
+    if (
+        subscription_id not in subscriptions
+        and len(subscriptions) >= MAX_SUBSCRIPTIONS_PER_CONNECTION
+    ):
+        raise ValueError(
+            f"Too many subscriptions; maximum is {MAX_SUBSCRIPTIONS_PER_CONNECTION}"
+        )
 
 
 async def _publish_chan_updates(

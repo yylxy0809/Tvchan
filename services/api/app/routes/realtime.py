@@ -23,10 +23,12 @@ from app.market_sidebar.service import (
 )
 from app.repositories.bars import generate_seed_bars, resolve_symbol
 from app.repositories.postgres import get_bars_db, resolve_symbol_db
-from trading_protocol import normalize_timeframe
+from trading_protocol import TIMEFRAMES, normalize_timeframe
 
 router = APIRouter(tags=["realtime"])
 UPDATE_INTERVAL_SECONDS = 3.0
+MAX_SUBSCRIPTIONS_PER_CONNECTION = 32
+SUBSCRIPTION_TIMEFRAMES = frozenset(TIMEFRAMES)
 SIDEBAR_DEMAND_TTL_SECONDS = 30
 REDIS_BAR_UPDATE_CHANNEL = "market:bar_updates"
 SIDEBAR_UPDATE_CHANNEL = "market:sidebar:updates"
@@ -76,12 +78,32 @@ async def realtime_ws(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "pong", "ts": _now_ts()})
             elif msg_type == "subscribe":
                 sub_id = str(message.get("id") or f"sub_{len(subscriptions) + 1}")
+                if (
+                    sub_id not in subscriptions
+                    and len(subscriptions) >= MAX_SUBSCRIPTIONS_PER_CONNECTION
+                ):
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": (
+                                "Too many subscriptions; maximum is "
+                                f"{MAX_SUBSCRIPTIONS_PER_CONNECTION}"
+                            ),
+                        }
+                    )
+                    continue
                 symbol = str(message.get("symbol") or "000001.SZ").upper()
-                timeframes = message.get("timeframes") or ["5f"]
+                try:
+                    timeframes = _normalize_subscription_timeframes(
+                        message.get("timeframes")
+                    )
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "message": str(exc)})
+                    continue
                 subscriptions[sub_id] = {
                     "id": sub_id,
                     "symbol": symbol,
-                    "timeframes": [normalize_timeframe(item) for item in timeframes],
+                    "timeframes": timeframes,
                 }
                 await websocket.send_json({"type": "subscribed", "id": sub_id})
             elif msg_type == "unsubscribe":
@@ -196,6 +218,31 @@ async def realtime_ws(websocket: WebSocket) -> None:
         aggregator = getattr(websocket.scope["app"].state, "market_sidebar_aggregator", None)
         if aggregator is not None:
             await aggregator.disconnect(connection_id)
+
+
+def _normalize_subscription_timeframes(value: Any) -> list[str]:
+    if not value:
+        return ["5f"]
+    if not isinstance(value, list):
+        raise ValueError("timeframes must be a list")
+    if len(value) > len(SUBSCRIPTION_TIMEFRAMES):
+        raise ValueError(
+            f"timeframes may contain at most {len(SUBSCRIPTION_TIMEFRAMES)} entries"
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        try:
+            timeframe = normalize_timeframe(item)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("timeframes contains an unsupported value") from exc
+        if timeframe not in SUBSCRIPTION_TIMEFRAMES:
+            raise ValueError("timeframes contains an unsupported value")
+        if timeframe not in seen:
+            normalized.append(timeframe)
+            seen.add(timeframe)
+    return normalized
 
 
 async def _send_sidebar_updates(
