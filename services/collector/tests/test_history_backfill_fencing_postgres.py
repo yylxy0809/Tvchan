@@ -195,28 +195,69 @@ def test_stale_backfill_owner_has_no_page_or_terminal_side_effects() -> None:
                         lease_seconds=30, max_attempts=3,
                     ))[0]
                     before_midtx = await _snapshot(setup, symbol_id, midtx["id"])
-                    original_upsert = writer._upsert_bars_rows
-
-                    async def expire_after_writes(conn, rows):
-                        await original_upsert(conn, rows)
-                        await conn.execute(
-                            "update historical_backfill_tasks set lease_until=clock_timestamp()-interval '1 second' where id=$1",
-                            midtx["id"],
+                    await setup.execute(
+                        "update historical_backfill_tasks set lease_until=clock_timestamp()-interval '1 second' where id=$1",
+                        midtx["id"],
+                    )
+                    expired_before_lock = _bar(symbol, 6)
+                    with pytest.raises(LostBackfillLease):
+                        await writer.commit_history_backfill_page(
+                            task=midtx, expected_offset=0, next_offset=1,
+                            bars=[expired_before_lock], oldest_ts=expired_before_lock.ts,
+                            newest_ts=expired_before_lock.ts, exhausted=False,
+                            lease_seconds=30,
                         )
+                    assert await _snapshot(setup, symbol_id, midtx["id"]) == before_midtx
 
-                    writer._upsert_bars_rows = expire_after_writes
-                    rolled_back_bar = _bar(symbol, 6)
+                    midtx_reclaimed = (await store.claim_tasks(
+                        provider="pytdx-midtx", limit=1,
+                        worker_id="worker-midtx-reclaimed",
+                        lease_seconds=1, max_attempts=3,
+                    ))[0]
+                    assert midtx_reclaimed["id"] == midtx["id"]
+                    original_upsert = writer._upsert_bars_rows
+                    write_started = asyncio.Event()
+                    release_write = asyncio.Event()
+
+                    async def hold_after_writes(conn, rows):
+                        await original_upsert(conn, rows)
+                        write_started.set()
+                        await release_write.wait()
+
+                    writer._upsert_bars_rows = hold_after_writes
+                    slow_bar = _bar(symbol, 6)
+                    slow_commit = asyncio.create_task(
+                        writer.commit_history_backfill_page(
+                            task=midtx_reclaimed, expected_offset=0, next_offset=1,
+                            bars=[slow_bar], oldest_ts=slow_bar.ts,
+                            newest_ts=slow_bar.ts, exhausted=False,
+                            lease_seconds=30,
+                        )
+                    )
                     try:
-                        with pytest.raises(LostBackfillLease):
-                            await writer.commit_history_backfill_page(
-                                task=midtx, expected_offset=0, next_offset=1,
-                                bars=[rolled_back_bar], oldest_ts=rolled_back_bar.ts,
-                                newest_ts=rolled_back_bar.ts, exhausted=False,
-                                lease_seconds=30,
-                            )
+                        await asyncio.wait_for(write_started.wait(), timeout=1)
+                        await asyncio.sleep(1.1)
+                        assert await asyncio.wait_for(
+                            store.claim_tasks(
+                                provider="pytdx-midtx", limit=1,
+                                worker_id="worker-midtx-successor",
+                                lease_seconds=30, max_attempts=3,
+                            ),
+                            timeout=0.5,
+                        ) == []
+                    finally:
+                        release_write.set()
+                    try:
+                        assert await slow_commit == 1
                     finally:
                         writer._upsert_bars_rows = original_upsert
-                    assert await _snapshot(setup, symbol_id, midtx["id"]) == before_midtx
+                    midtx_after = await setup.fetchrow(
+                        """select status, next_offset, pages_done,
+                                  lease_until > clock_timestamp() as lease_live
+                             from historical_backfill_tasks where id=$1""",
+                        midtx_reclaimed["id"],
+                    )
+                    assert tuple(midtx_after.values()) == ("running", 1, 1, True)
 
                     await setup.execute(
                         """insert into historical_backfill_tasks(

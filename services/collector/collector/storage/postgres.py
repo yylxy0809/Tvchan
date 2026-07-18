@@ -285,7 +285,6 @@ class PostgresKlineWriter:
                        and status = 'running'
                        and claim_token = $2
                        and lease_version = $3
-                       and lease_until > clock_timestamp()
                        and next_offset = $11
                     returning id
                     """,
