@@ -44,6 +44,13 @@ export class AuthenticationError extends Error {
   }
 }
 
+export function isCredentialRejection(error: unknown): boolean {
+  return (
+    error instanceof AuthenticationError &&
+    (error.status === 401 || error.status === 403)
+  );
+}
+
 export async function loginWithToken(token: string): Promise<AuthSession> {
   const normalized = token.trim();
   if (!normalized) {
@@ -135,7 +142,12 @@ function parseRole(value: unknown): UserRole | null {
 }
 
 async function readResponseError(response: Response, token: string): Promise<string> {
-  const text = await response.text();
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    return `${response.status} ${response.statusText}`.trim();
+  }
   if (!text) {
     return `${response.status} ${response.statusText}`;
   }

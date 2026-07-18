@@ -1,6 +1,6 @@
 import { AlertCircle, KeyRound } from "lucide-react";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { AuthenticationError, type AuthSession, loginWithToken } from "../auth/api";
+import { type AuthSession, isCredentialRejection, loginWithToken } from "../auth/api";
 import { LoginAttemptFence } from "../auth/loginAttemptFence";
 
 type Props = {
@@ -40,10 +40,7 @@ export function LoginPage({
       onAuthenticated(session);
     } catch (nextError) {
       if (!fence.isCurrent(attempt)) return;
-      if (
-        nextError instanceof AuthenticationError &&
-        (nextError.status === 401 || nextError.status === 403)
-      ) {
+      if (isCredentialRejection(nextError)) {
         setToken("");
         onAuthenticationFailure?.();
       }
