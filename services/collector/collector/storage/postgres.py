@@ -192,6 +192,7 @@ class PostgresKlineWriter:
         newest_ts: datetime | None,
         exhausted: bool,
         lease_seconds: int,
+        provider_newest_ts: datetime | None = None,
     ) -> int:
         """Atomically fence ownership, write one page, and advance its checkpoint."""
         assert self._pool is not None
@@ -215,6 +216,8 @@ class PostgresKlineWriter:
                            task.timeframe,
                            task.run_id,
                            task.stop_at,
+                           task.expected_through,
+                           task.provider_newest_ts,
                            symbol.code || '.' || symbol.exchange as symbol
                       from historical_backfill_tasks task
                       join symbols symbol on symbol.id = task.symbol_id
@@ -242,6 +245,23 @@ class PostgresKlineWriter:
                 authoritative_symbol = str(owned["symbol"])
                 authoritative_timeframe = int(owned["timeframe"])
                 authoritative_stop_at = owned["stop_at"]
+                authoritative_expected_through = owned["expected_through"]
+                prior_provider_newest = owned["provider_newest_ts"]
+                candidate_provider_newest = max(
+                    (
+                        value for value in (prior_provider_newest, provider_newest_ts)
+                        if value is not None
+                    ),
+                    default=None,
+                )
+                if owned["run_id"] is not None and (
+                    authoritative_expected_through is None
+                    or candidate_provider_newest is None
+                    or candidate_provider_newest < authoritative_expected_through
+                ):
+                    raise ValueError(
+                        f"scoped historical backfill expected-through is unproven for task {task_id}"
+                    )
                 if (
                     str(task.get("symbol") or "") != authoritative_symbol
                     or int(task.get("timeframe") or -1) != authoritative_timeframe
@@ -255,6 +275,14 @@ class PostgresKlineWriter:
                 ):
                     raise ValueError(
                         f"historical backfill page crosses scoped stop_at for task {task_id}"
+                    )
+                if any(
+                    authoritative_expected_through is not None
+                    and row[2] > authoritative_expected_through
+                    for row in rows
+                ):
+                    raise ValueError(
+                        f"historical backfill page exceeds expected-through for task {task_id}"
                     )
                 if any(
                     str(row[0]) != authoritative_symbol
@@ -281,12 +309,18 @@ class PostgresKlineWriter:
                                when $7::timestamptz < oldest_ts then $7::timestamptz
                                else oldest_ts
                            end,
-                           newest_ts = case
+                            newest_ts = case
                                when newest_ts is null then $8::timestamptz
                                when $8::timestamptz is null then newest_ts
                                when $8::timestamptz > newest_ts then $8::timestamptz
-                               else newest_ts
-                           end,
+                                else newest_ts
+                            end,
+                            provider_newest_ts = case
+                                when provider_newest_ts is null then $14::timestamptz
+                                when $14::timestamptz is null then provider_newest_ts
+                                when $14::timestamptz > provider_newest_ts then $14::timestamptz
+                                else provider_newest_ts
+                            end,
                            worker_id = case when $9 then null else worker_id end,
                            claim_token = case when $9 then null else claim_token end,
                            lease_until = case
@@ -322,6 +356,7 @@ class PostgresKlineWriter:
                     expected_offset,
                     task.get("run_id"),
                     task.get("stop_at"),
+                    provider_newest_ts,
                 )
                 if updated is None:
                     raise LostBackfillLease(

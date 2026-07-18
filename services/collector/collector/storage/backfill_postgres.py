@@ -163,6 +163,8 @@ class PostgresBackfillTaskStore:
         symbols: Iterable[SymbolInfo],
         timeframes: Iterable[str],
         stop_at: dict[str, datetime],
+        expected_through: dict[str, datetime],
+        freshness_contract_sha256: str,
         provider: str,
         page_size: int,
         endpoint: str,
@@ -181,6 +183,13 @@ class PostgresBackfillTaskStore:
             for timeframe in sorted(timeframe_names)
         }
         stop_at_payload = json.dumps(stop_at_json, sort_keys=True, separators=(",", ":"))
+        expected_through_json = {
+            timeframe: expected_through[timeframe].isoformat()
+            for timeframe in sorted(timeframe_names)
+        }
+        expected_through_payload = json.dumps(
+            expected_through_json, sort_keys=True, separators=(",", ":")
+        )
 
         async with self._pool.acquire() as conn:
             async with conn.transaction(isolation="serializable"):
@@ -201,14 +210,14 @@ class PostgresBackfillTaskStore:
                 authoritative = await conn.fetch(
                     """
                     select symbol.id, symbol.code || '.' || symbol.exchange as symbol,
-                           catalog.timeframe
+                           catalog.timeframe, catalog.max_ts
                     from symbols symbol
                     join kline_scope_catalog catalog
                       on catalog.generation_id = $1
                      and catalog.symbol_id = symbol.id
                      and catalog.timeframe = any($3::integer[])
                      and catalog.bounds_complete
-                     and catalog.state in ('present', 'empty')
+                     and catalog.state = 'present'
                     where (symbol.code || '.' || symbol.exchange) = any($2::text[])
                       and symbol.is_active
                     order by symbol.id, catalog.timeframe
@@ -231,26 +240,43 @@ class PostgresBackfillTaskStore:
                         "scoped backfill contains inactive, unknown, or non-authoritative "
                         f"scopes: {missing[:10]}"
                     )
+                stop_at_by_code = {
+                    timeframe_to_db_code(timeframe): stop_at[timeframe]
+                    for timeframe in timeframe_names
+                }
+                mismatched_bounds = sorted(
+                    (str(row["symbol"]), int(row["timeframe"]), row["max_ts"])
+                    for row in authoritative
+                    if row["max_ts"] != stop_at_by_code[int(row["timeframe"])]
+                )
+                if mismatched_bounds:
+                    raise RuntimeError(
+                        "scoped backfill stop-at differs from pinned catalog max_ts: "
+                        f"{mismatched_bounds[:10]}"
+                    )
 
                 await conn.execute(
                     """
                     insert into historical_backfill_scoped_runs (
                         run_id, run_identity, provider, manifest_sha256, page_size,
                         endpoint, source_policy, catalog_generation_id,
-                        catalog_revision, symbol_count, timeframes, stop_at, task_count
-                    ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)
+                        catalog_revision, symbol_count, timeframes, stop_at, task_count,
+                        expected_through, freshness_contract_sha256
+                    ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb,$15)
                     on conflict (run_id) do nothing
                     """,
                     run_id, run_identity, provider, manifest_sha256, page_size,
                     endpoint, source_policy, control["active_generation_id"],
                     int(control["revision"]), len(symbol_names), timeframe_codes,
                     stop_at_payload, expected_tasks,
+                    expected_through_payload, freshness_contract_sha256,
                 )
                 durable_run = await conn.fetchrow(
                     """
                     select run_identity, provider, manifest_sha256, page_size, endpoint,
                            source_policy, catalog_generation_id, catalog_revision,
-                           symbol_count, timeframes, stop_at, task_count
+                           symbol_count, timeframes, stop_at, task_count,
+                           expected_through, freshness_contract_sha256
                     from historical_backfill_scoped_runs
                     where run_id = $1
                     for share
@@ -262,6 +288,7 @@ class PostgresBackfillTaskStore:
                     source_policy, control["active_generation_id"],
                     int(control["revision"]), len(symbol_names), timeframe_codes,
                     stop_at_json, expected_tasks,
+                    expected_through_json, freshness_contract_sha256,
                 )
                 actual_run = (
                     str(durable_run["run_identity"]), str(durable_run["provider"]),
@@ -272,6 +299,8 @@ class PostgresBackfillTaskStore:
                     int(durable_run["symbol_count"]), list(durable_run["timeframes"]),
                     json.loads(str(durable_run["stop_at"])),
                     int(durable_run["task_count"]),
+                    json.loads(str(durable_run["expected_through"])),
+                    str(durable_run["freshness_contract_sha256"]),
                 )
                 if actual_run != expected_run:
                     raise RuntimeError("scoped backfill durable run identity mismatch")
@@ -280,16 +309,18 @@ class PostgresBackfillTaskStore:
                     await conn.execute(
                         """
                         insert into historical_backfill_tasks (
-                            run_id, stop_at, symbol_id, timeframe, provider, page_size
+                            run_id, stop_at, expected_through,
+                            symbol_id, timeframe, provider, page_size
                         )
-                        select $1, $2, symbol.id, $3, $4, $5
+                        select $1, $2, $3, symbol.id, $4, $5, $6
                         from symbols symbol
-                        where (symbol.code || '.' || symbol.exchange) = any($6::text[])
+                        where (symbol.code || '.' || symbol.exchange) = any($7::text[])
                           and symbol.is_active
                         on conflict (run_id, symbol_id, timeframe, provider)
                             where run_id is not null do nothing
                         """,
-                        run_id, stop_at[timeframe], timeframe_code, provider, page_size,
+                        run_id, stop_at[timeframe], expected_through[timeframe],
+                        timeframe_code, provider, page_size,
                         symbol_names,
                     )
                 rows = await conn.fetch(
@@ -389,6 +420,7 @@ class PostgresBackfillTaskStore:
                            updated_at = clock_timestamp()
                      where provider = $1
                        and run_id is not distinct from $6::uuid
+                       and ($6::uuid is null or expected_through is not null)
                        and ($7::bigint[] is null or id = any($7::bigint[]))
                        and (
                            (status in ('pending', 'failed')
@@ -404,6 +436,7 @@ class PostgresBackfillTaskStore:
                     from historical_backfill_tasks
                     where provider = $1
                       and run_id is not distinct from $6::uuid
+                      and ($6::uuid is null or expected_through is not null)
                       and ($7::bigint[] is null or id = any($7::bigint[]))
                       and (
                           (status in ('pending', 'failed')
@@ -453,6 +486,8 @@ class PostgresBackfillTaskStore:
                     task.max_attempts,
                     task.run_id,
                     task.stop_at,
+                    task.expected_through,
+                    task.provider_newest_ts,
                     s.code || '.' || s.exchange as symbol
                 """,
                     provider,
@@ -464,6 +499,21 @@ class PostgresBackfillTaskStore:
                     task_ids,
                 )
         return [dict(row) for row in rows]
+
+    async def summarize_scoped_run(self, run_id: UUID) -> dict[str, int]:
+        """Return exact durable task states; a scoped one-shot succeeds only if all did."""
+        assert self._pool is not None
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                select status, count(*)::bigint as count
+                from historical_backfill_tasks
+                where run_id = $1
+                group by status
+                """,
+                run_id,
+            )
+        return {str(row["status"]): int(row["count"]) for row in rows}
 
     async def heartbeat(
         self,
