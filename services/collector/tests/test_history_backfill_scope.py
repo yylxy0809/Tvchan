@@ -346,6 +346,123 @@ def test_scoped_zero_claims_with_failed_durable_task_is_not_success(
         asyncio.run(history_backfill.run_once(args))
 
 
+def test_scoped_run_claims_only_concurrency_slots_and_drains_in_batches(
+    tmp_path, monkeypatch
+) -> None:
+    symbols_file = tmp_path / "symbols.txt"
+    symbols_file.write_text("000001.SZ\n", encoding="utf-8")
+    task_ids = [101, 102, 103]
+
+    class _Context:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Store(_Context):
+        claimed_limits = []
+        completed = set()
+
+        async def ensure_scoped_run_tasks(self, **_kwargs):
+            return task_ids
+
+        async def claim_tasks(self, **kwargs):
+            self.claimed_limits.append(kwargs["limit"])
+            pending = [task_id for task_id in task_ids if task_id not in self.completed]
+            return [{"id": task_id} for task_id in pending[: kwargs["limit"]]]
+
+        async def summarize_scoped_run(self, _run_id):
+            return {
+                "success": len(self.completed),
+                "pending": len(task_ids) - len(self.completed),
+            }
+
+    async def _process(**kwargs):
+        _Store.completed.update(task["id"] for task in kwargs["tasks"])
+        return {"pages": len(kwargs["tasks"]), "bars": 0, "failed": 0, "lease_lost": 0}
+
+    monkeypatch.setattr(history_backfill, "PostgresKlineWriter", _Context)
+    monkeypatch.setattr(history_backfill, "PostgresBackfillTaskStore", _Store)
+    monkeypatch.setattr(history_backfill, "process_tasks_concurrently", _process)
+    args = history_backfill.parse_args(
+        [
+            "--provider", "pytdx", "--tdx-host", "127.0.0.1",
+            "--symbols-file", str(symbols_file), "--timeframes", "5f",
+            "--stop-at", "5f=2026-07-10T07:00:00Z",
+            "--expected-through", "5f=2026-07-17T07:00:00Z",
+            "--freshness-contract-sha256", "a" * 64,
+            "--task-limit", "5000", "--concurrency", "1",
+        ]
+    )
+    asyncio.run(history_backfill.run_once(args))
+    assert _Store.claimed_limits == [1, 1, 1]
+    assert _Store.completed == set(task_ids)
+
+
+def test_scoped_failed_task_does_not_block_remaining_pending_tasks(
+    tmp_path, monkeypatch
+) -> None:
+    symbols_file = tmp_path / "symbols.txt"
+    symbols_file.write_text("000001.SZ\n", encoding="utf-8")
+
+    class _Context:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Store(_Context):
+        states = {101: "pending", 102: "pending"}
+        claims = []
+
+        async def ensure_scoped_run_tasks(self, **_kwargs):
+            return [101, 102]
+
+        async def claim_tasks(self, **kwargs):
+            candidates = [key for key, value in self.states.items() if value == "pending"]
+            selected = candidates[: kwargs["limit"]]
+            self.claims.extend(selected)
+            return [{"id": task_id} for task_id in selected]
+
+        async def summarize_scoped_run(self, _run_id):
+            return {
+                status: list(self.states.values()).count(status)
+                for status in set(self.states.values())
+            }
+
+    async def _process(**kwargs):
+        task_id = kwargs["tasks"][0]["id"]
+        if task_id == 101:
+            _Store.states[task_id] = "dead_letter"
+            return {"pages": 0, "bars": 0, "failed": 1, "lease_lost": 0}
+        _Store.states[task_id] = "success"
+        return {"pages": 1, "bars": 0, "failed": 0, "lease_lost": 0}
+
+    monkeypatch.setattr(history_backfill, "PostgresKlineWriter", _Context)
+    monkeypatch.setattr(history_backfill, "PostgresBackfillTaskStore", _Store)
+    monkeypatch.setattr(history_backfill, "process_tasks_concurrently", _process)
+    args = history_backfill.parse_args([
+        "--provider", "pytdx", "--tdx-host", "127.0.0.1",
+        "--symbols-file", str(symbols_file), "--timeframes", "5f",
+        "--stop-at", "5f=2026-07-10T07:00:00Z",
+        "--expected-through", "5f=2026-07-17T07:00:00Z",
+        "--freshness-contract-sha256", "a" * 64,
+        "--task-limit", "5000", "--concurrency", "1",
+    ])
+    with pytest.raises(RuntimeError, match="did not complete cleanly"):
+        asyncio.run(history_backfill.run_once(args))
+    assert _Store.claims == [101, 102]
+    assert _Store.states == {101: "dead_letter", 102: "success"}
+
+
 def test_migration_046_isolates_legacy_workers_and_scoped_identity() -> None:
     migration = (
         Path(__file__).parents[3] / "db/sql/046_history_backfill_scoped_runs.sql"

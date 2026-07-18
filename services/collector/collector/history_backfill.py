@@ -268,57 +268,77 @@ async def run_once(args: argparse.Namespace) -> None:
                     run_id=run_id,
                 )
 
-            tasks = await task_store.claim_tasks(
-                provider=provider.name,
-                limit=args.task_limit,
-                worker_id=args.worker_id,
-                lease_seconds=args.lease_seconds,
-                max_attempts=args.max_attempts,
-                task_ids=task_ids,
-                run_id=run_id,
+            concurrency = max(1, args.concurrency)
+            claim_limit = (
+                min(max(1, args.task_limit), concurrency) if scoped else args.task_limit
             )
-            emit(
-                "history_tasks_claimed",
-                ensured=len(task_ids),
-                frozen_task_ids=task_ids,
-                run_identity=run_identity,
-                reset_running=reset_count,
-                tasks=len(tasks),
-                concurrency=max(1, args.concurrency),
-            )
-
-            result = await process_tasks_concurrently(
-                provider_factory=lambda: create_provider(args),
-                kline_writer=kline_writer,
-                task_store=task_store,
-                tasks=tasks,
-                concurrency=max(1, args.concurrency),
-                max_pages_per_task=args.max_pages_per_task,
-                sleep=args.sleep,
-                lease_seconds=args.lease_seconds,
-                stop_at_by_timeframe=stop_at_by_timeframe,
-                expected_through_by_timeframe=expected_through_by_timeframe,
-                run_id=run_id,
-            )
+            result = {"pages": 0, "bars": 0, "failed": 0, "lease_lost": 0}
+            claimed_total = 0
+            durable_states: dict[str, int] = {}
+            while True:
+                tasks = await task_store.claim_tasks(
+                    provider=provider.name,
+                    limit=claim_limit,
+                    worker_id=args.worker_id,
+                    lease_seconds=args.lease_seconds,
+                    max_attempts=args.max_attempts,
+                    task_ids=task_ids,
+                    run_id=run_id,
+                )
+                emit(
+                    "history_tasks_claimed",
+                    ensured=len(task_ids),
+                    frozen_task_ids=task_ids if claimed_total == 0 else [],
+                    run_identity=run_identity,
+                    reset_running=reset_count,
+                    tasks=len(tasks),
+                    concurrency=concurrency,
+                )
+                if not tasks:
+                    break
+                claimed_total += len(tasks)
+                batch_result = await process_tasks_concurrently(
+                    provider_factory=lambda: create_provider(args),
+                    kline_writer=kline_writer,
+                    task_store=task_store,
+                    tasks=tasks,
+                    concurrency=concurrency,
+                    max_pages_per_task=args.max_pages_per_task,
+                    sleep=args.sleep,
+                    lease_seconds=args.lease_seconds,
+                    stop_at_by_timeframe=stop_at_by_timeframe,
+                    expected_through_by_timeframe=expected_through_by_timeframe,
+                    run_id=run_id,
+                )
+                for key in result:
+                    result[key] += batch_result.get(key, 0)
+                if not scoped:
+                    break
+                durable_states = await task_store.summarize_scoped_run(run_id)
+                emit(
+                    "history_scoped_run_status", run_id=str(run_id), states=durable_states
+                )
+                if (
+                    batch_result.get("lease_lost", 0)
+                    or durable_states.get("success", 0) == len(task_ids)
+                ):
+                    break
             emit(
                 "history_pass_finished",
-                tasks=len(tasks),
+                tasks=claimed_total,
                 pages=result["pages"],
                 bars=result["bars"],
                 failed=result.get("failed", 0),
                 lease_lost=result.get("lease_lost", 0),
             )
-            durable_states = (
-                await task_store.summarize_scoped_run(run_id) if scoped else {}
-            )
+            durable_states = await task_store.summarize_scoped_run(run_id) if scoped else {}
             if scoped:
                 emit("history_scoped_run_status", run_id=str(run_id), states=durable_states)
             incomplete = sum(
                 count for status, count in durable_states.items() if status != "success"
             )
             if scoped and (
-                result.get("failed", 0)
-                or result.get("lease_lost", 0)
+                result.get("lease_lost", 0)
                 or incomplete
                 or durable_states.get("success", 0) != len(task_ids)
             ):
