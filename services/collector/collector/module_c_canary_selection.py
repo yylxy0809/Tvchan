@@ -241,7 +241,7 @@ async def select_from_build(
             connection, build, build_id=source_build_id, require_v2=True
         )
         await revalidate_strict_v2_build(
-            connection, build, build_id=source_build_id
+            connection, build, build_id=source_build_id, for_share=False
         )
         return await rebuild_selection_manifest(
             connection, source_build_id=source_build_id, build=build
