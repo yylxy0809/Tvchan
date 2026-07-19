@@ -14,6 +14,7 @@ from collector.module_c_eligibility import (
     FRESHNESS_CONTRACT_VERSION,
     Symbol,
     _load_strict_inputs,
+    _load_quarantine_inputs,
     build_manifest,
     build_summary,
     evaluate_dispositions,
@@ -367,6 +368,38 @@ def test_strict_input_row_lock_is_explicitly_disabled_for_readonly_callers(
     )
     assert "for share" in audit_sql
 
+
+def test_quarantine_supersession_is_bound_to_exact_audit_evidence() -> None:
+    class Connection:
+        def __init__(self):
+            self.args = None
+            self.sql = ""
+
+        async def fetch(self, sql, *args):
+            self.sql = " ".join(sql.lower().split())
+            self.args = args
+            return [{
+                "symbol": "688001.SH",
+                "timeframe": "5f",
+                "reason": "missing_source_file",
+                "rows": 2,
+            }]
+
+    connection = Connection()
+    unresolved, missing = asyncio.run(
+        _load_quarantine_inputs(
+            connection,
+            audit_run_id=str(UUID(int=10)),
+            audit_evidence_sha256="a" * 64,
+        )
+    )
+
+    assert unresolved == {}
+    assert missing == {("688001.SH", "5f"): 2}
+    assert "supersession.quarantine_rows=issue.rows" in connection.sql
+    assert "supersession.max_quarantine_id=issue.max_id" in connection.sql
+    assert "supersession.symbol_id=issue.symbol_id" in connection.sql
+    assert connection.args[1:] == (str(UUID(int=10)), "a" * 64)
 
 def test_strict_input_requires_complete_exact_audit_and_producer_universe_hash(
     tmp_path, monkeypatch
