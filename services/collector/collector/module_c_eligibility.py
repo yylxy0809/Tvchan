@@ -628,15 +628,43 @@ async def _load_strict_inputs(
     )
 
 
-async def _load_quarantine_inputs(connection: asyncpg.Connection) -> tuple[
+async def _load_quarantine_inputs(
+    connection: asyncpg.Connection,
+    *,
+    audit_run_id: str,
+    audit_evidence_sha256: str,
+) -> tuple[
     dict[tuple[str, str], int], dict[tuple[str, str], int]
 ]:
     issue_rows = await connection.fetch(
-        "SELECT upper(symbol_text) AS symbol, lower(timeframe) AS timeframe, reason, count(*) AS rows "
-        "FROM kline_import_quarantine "
-        "WHERE reason = ANY($1::text[]) AND symbol_text IS NOT NULL AND timeframe IS NOT NULL "
-        "GROUP BY upper(symbol_text), lower(timeframe), reason",
+        "WITH issue_groups AS ("
+        " SELECT quarantine.import_run_id,upper(btrim(quarantine.symbol_text)) AS symbol,"
+        " lower(btrim(quarantine.timeframe)) AS timeframe,quarantine.reason,"
+        " count(*) AS rows,max(quarantine.id) AS max_id"
+        ",symbol.id AS symbol_id"
+        " FROM kline_import_quarantine quarantine"
+        " LEFT JOIN symbols symbol"
+        " ON upper(symbol.code||'.'||symbol.exchange)=upper(btrim(quarantine.symbol_text))"
+        " WHERE quarantine.reason=ANY($1::text[])"
+        " AND quarantine.symbol_text IS NOT NULL AND quarantine.timeframe IS NOT NULL"
+        " GROUP BY quarantine.import_run_id,upper(btrim(quarantine.symbol_text)),"
+        " lower(btrim(quarantine.timeframe)),quarantine.reason,symbol.id"
+        ") SELECT issue.symbol,issue.timeframe,issue.reason,sum(issue.rows) AS rows"
+        " FROM issue_groups issue"
+        " LEFT JOIN kline_import_quarantine_supersessions supersession"
+        " ON supersession.source_import_run_id=issue.import_run_id"
+        " AND supersession.reason=issue.reason AND supersession.symbol=issue.symbol"
+        " AND supersession.symbol_id=issue.symbol_id"
+        " AND supersession.timeframe=issue.timeframe"
+        " AND supersession.quarantine_rows=issue.rows"
+        " AND supersession.max_quarantine_id=issue.max_id"
+        " AND supersession.canonical_audit_run_id=$2::uuid"
+        " AND supersession.audit_evidence_sha256=$3"
+        " WHERE supersession.supersession_id IS NULL"
+        " GROUP BY issue.symbol,issue.timeframe,issue.reason",
         ["ambiguous_volume_unit", "missing_source_file"],
+        audit_run_id,
+        audit_evidence_sha256,
     )
     unresolved: dict[tuple[str, str], int] = {}
     missing_source: dict[tuple[str, str], int] = {}
@@ -658,7 +686,11 @@ async def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     try:
         async with connection.transaction(isolation="repeatable_read"):
             strict = await _load_strict_inputs(connection, audit_run_id, freshness)
-            unresolved, missing_source = await _load_quarantine_inputs(connection)
+            unresolved, missing_source = await _load_quarantine_inputs(
+                connection,
+                audit_run_id=audit_run_id,
+                audit_evidence_sha256=strict.audit_evidence_sha256,
+            )
             rows = evaluate_dispositions(
                 strict.symbols,
                 strict.coverage,
