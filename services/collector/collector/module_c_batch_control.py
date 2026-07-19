@@ -251,6 +251,7 @@ async def revalidate_strict_v2_build(
     build: Mapping[str, Any],
     *,
     build_id: str,
+    for_share: bool = True,
 ) -> None:
     """Revalidate one frozen build against the current strict-v2 input snapshot."""
     provenance, parameters = _strict_v2_provenance(build)
@@ -259,6 +260,7 @@ async def revalidate_strict_v2_build(
         conn,
         provenance["canonical_audit_run_id"],
         freshness,
+        for_share=for_share,
     )
     observed = {
         "canonical_audit_run_id": provenance["canonical_audit_run_id"],

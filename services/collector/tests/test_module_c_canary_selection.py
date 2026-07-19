@@ -284,3 +284,4 @@ def test_select_from_build_uses_one_read_only_repeatable_read_snapshot(monkeypat
         "readonly": True,
     }
     assert len(calls) == 2
+    assert calls[1][1]["for_share"] is False

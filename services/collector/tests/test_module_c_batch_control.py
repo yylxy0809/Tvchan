@@ -224,14 +224,15 @@ def test_revalidate_strict_v2_build_rejects_live_input_drift(
         )
 
 
+@pytest.mark.parametrize("for_share", [True, False])
 def test_revalidate_strict_v2_build_reuses_complete_strict_input_validation(
-    monkeypatch,
+    monkeypatch, for_share,
 ) -> None:
     source = _strict_v2_source()
     calls: list[tuple[object, ...]] = []
 
-    async def fake_load(conn, audit_run_id, freshness):
-        calls.append((conn, audit_run_id, freshness.sha256))
+    async def fake_load(conn, audit_run_id, freshness, *, for_share):
+        calls.append((conn, audit_run_id, freshness.sha256, for_share))
         return _strict_inputs(source)
 
     async def fake_contract(conn, build, *, build_id, require_v2):
@@ -243,12 +244,16 @@ def test_revalidate_strict_v2_build_reuses_complete_strict_input_validation(
 
     asyncio.run(
         revalidate_strict_v2_build(
-            connection, source, build_id="33333333-3333-3333-3333-333333333333"
+            connection,
+            source,
+            build_id="33333333-3333-3333-3333-333333333333",
+            for_share=for_share,
         )
     )
 
     assert calls[0][0] is connection
     assert calls[0][1] == source["canonical_audit_run_id"]
+    assert calls[0][3] is for_share
     assert calls[1] == (
         connection,
         source,
