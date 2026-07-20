@@ -32,12 +32,14 @@ select r.id as run_id,
        r.config_hash,
        r.run_group_id,
        r.batch_id,
-       array_agg(distinct h.mode order by h.mode) as modes
+       array['confirmed'::varchar, 'predictive'::varchar] as modes
 from chan_c_runs r
+join chan_c_full_recompute_tasks task
+  on task.run_id = r.id
 join symbols s on s.id = r.symbol_id
-join chan_c_head_history h on h.new_run_id = r.id
 where r.status = 'success'
-  and (($1::bigint is not null and r.batch_id = $1)
+  and task.status = 'completed'
+  and (($1::bigint is not null and task.batch_id = $1)
        or ($2::varchar is not null and r.run_group_id = $2))
 group by r.id, r.symbol_id, s.code, s.exchange, r.chan_level, r.bar_from,
          r.bar_until, r.bar_count, r.config_hash, r.run_group_id, r.batch_id
