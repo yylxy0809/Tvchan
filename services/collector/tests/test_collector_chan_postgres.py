@@ -170,7 +170,10 @@ def test_tail_publication_lock_requires_exact_live_task_identity() -> None:
         assert "lease_until" in lowered
         assert "claim_token" in lowered
         assert "expected_head_run_id" in lowered
-        assert "for update" in lowered
+        assert "join symbols symbol" in lowered
+        assert "and symbol.is_active" in lowered
+        assert "for update of task" in lowered
+        assert "for share of symbol" in lowered
         assert args == (17,)
         assert conn.calls[1] == ("select clock_timestamp()", ())
 
@@ -351,6 +354,30 @@ def _full_recompute_writer(conn: FakeConn) -> PostgresChanWriter:
     )
     writer._pool = FakePool(conn)
     return writer
+
+
+def test_inactive_symbol_publication_fails_before_any_durable_write() -> None:
+    async def scenario() -> None:
+        conn = FakeConn()
+        conn._fetchval_results = iter([None])
+        writer = PostgresChanWriter("postgresql://unused")
+        writer._pool = FakePool(conn)
+
+        with pytest.raises(StaleChanHeadError, match="unknown or inactive symbol"):
+            await writer.replace_analysis(
+                symbol="000001.SZ",
+                level="5f",
+                modes=["confirmed"],
+                bar_from=datetime.fromtimestamp(100, UTC),
+                bar_until=datetime.fromtimestamp(200, UTC),
+                bar_count=20,
+                response={"snapshot_version": "inactive", "strokes": [], "segments": [], "centers": [], "signals": []},
+            )
+
+        assert conn.execute_calls == []
+        assert conn.copy_calls == []
+
+    asyncio.run(scenario())
 
 
 def test_replace_analysis_defaults_to_module_c_tables() -> (

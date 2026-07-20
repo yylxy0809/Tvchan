@@ -250,6 +250,84 @@ def test_publication_and_terminal_state_serialize_without_partial_writes(monkeyp
                 planned["symbol_id"],
             ) == "pending"
 
+            inactive_pending = await seed(
+                setup,
+                parent_status="running",
+                child_status="running",
+                task_status="pending",
+            )
+            await setup.execute(
+                "update symbols set is_active=false where id=$1",
+                inactive_pending["symbol_id"],
+            )
+            assert await claim_recompute_task(
+                kline_writer=SimpleNamespace(_pool=_Pool(setup)),
+                batch_id=inactive_pending["batch_id"],
+                worker_id="worker",
+                shard_index=0,
+                shard_count=1,
+                lease_seconds=60,
+                max_attempts=3,
+            ) is None
+            assert await setup.fetchval(
+                "select status from chan_c_full_recompute_tasks "
+                "where batch_id=$1 and symbol_id=$2 and chan_level=5",
+                inactive_pending["batch_id"],
+                inactive_pending["symbol_id"],
+            ) == "pending"
+
+            inactive_claimed = await seed(setup)
+            await setup.execute(
+                "update symbols set is_active=false where id=$1",
+                inactive_claimed["symbol_id"],
+            )
+            before_runs = await setup.fetchval(
+                "select count(*) from chan_c_runs where batch_id=$1",
+                inactive_claimed["batch_id"],
+            )
+            before_heads = await setup.fetchval(
+                "select count(*) from scheme2_chan_c_published_heads where batch_id=$1",
+                inactive_claimed["batch_id"],
+            )
+            before_history = await setup.fetchval(
+                "select count(*) from chan_c_head_history history "
+                "join chan_c_runs run on run.id=history.new_run_id where run.batch_id=$1",
+                inactive_claimed["batch_id"],
+            )
+            before_outbox = await setup.fetchval(
+                "select count(*) from chan_c_head_outbox outbox "
+                "join chan_c_head_history history on history.id=outbox.head_history_id "
+                "join chan_c_runs run on run.id=history.new_run_id where run.batch_id=$1",
+                inactive_claimed["batch_id"],
+            )
+            with pytest.raises(StaleChanHeadError, match="inactive symbol"):
+                await publish(writer(_Pool(setup), inactive_claimed), inactive_claimed)
+            assert await setup.fetchval(
+                "select count(*) from chan_c_runs where batch_id=$1",
+                inactive_claimed["batch_id"],
+            ) == before_runs
+            assert await setup.fetchval(
+                "select count(*) from scheme2_chan_c_published_heads where batch_id=$1",
+                inactive_claimed["batch_id"],
+            ) == before_heads
+            assert await setup.fetchval(
+                "select count(*) from chan_c_head_history history "
+                "join chan_c_runs run on run.id=history.new_run_id where run.batch_id=$1",
+                inactive_claimed["batch_id"],
+            ) == before_history
+            assert await setup.fetchval(
+                "select count(*) from chan_c_head_outbox outbox "
+                "join chan_c_head_history history on history.id=outbox.head_history_id "
+                "join chan_c_runs run on run.id=history.new_run_id where run.batch_id=$1",
+                inactive_claimed["batch_id"],
+            ) == before_outbox
+            assert await setup.fetchval(
+                "select status from chan_c_full_recompute_tasks "
+                "where batch_id=$1 and symbol_id=$2 and chan_level=5",
+                inactive_claimed["batch_id"],
+                inactive_claimed["symbol_id"],
+            ) == "running"
+
             assert await activate_batch(
                 setup, Namespace(batch_id=planned["batch_id"])
             ) == {"batch_id": planned["batch_id"], "status": "running"}
