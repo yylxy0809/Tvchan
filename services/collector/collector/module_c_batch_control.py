@@ -34,7 +34,9 @@ LEVEL_NAMES = tuple(CODE_TO_TIMEFRAME[level] for level in LEVELS)
 REQUIRED_CANARY_TRAITS = frozenset(
     {"main_board", "chinext", "star", "bj", "suspended_or_sparse", "gap", "price_limit", "long_history"}
 )
-PRODUCTION_CANARY_SELECTION_VERSION = "module-c-canary-selection-v2"
+PRODUCTION_CANARY_SELECTION_VERSIONS = frozenset(
+    {"module-c-canary-selection-v2", "module-c-canary-selection-v3"}
+)
 STRICT_V2_PROVENANCE_FIELDS = (
     "canonical_audit_run_id",
     "audit_evidence_sha256",
@@ -142,7 +144,7 @@ def load_selection(path: Path) -> tuple[tuple[str, ...], str, dict[str, Any]]:
     raw = path.read_bytes()
     payload = json.loads(raw.decode("utf-8"))
     contract_version = payload.get("contract_version")
-    if contract_version == "module-c-canary-selection-v2":
+    if contract_version in PRODUCTION_CANARY_SELECTION_VERSIONS:
         from collector.module_c_canary_selection import validate_selection_manifest
 
         payload = validate_selection_manifest(payload)
@@ -195,10 +197,10 @@ def validate_production_canary_selection(
         active_symbols != 20
         or parameters.get("scope") != "canary"
         or parameters.get("selection_contract_version")
-        != PRODUCTION_CANARY_SELECTION_VERSION
+        not in PRODUCTION_CANARY_SELECTION_VERSIONS
     ):
         raise RuntimeError(
-            "Canary batches require a frozen deterministic selection-v2 eligibility build"
+            "Canary batches require a frozen deterministic selection-v2 or selection-v3 eligibility build"
         )
 
 
@@ -437,8 +439,8 @@ def validate_canary_run_set(
 
 async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> dict[str, Any]:
     symbols, selection_sha, selection = load_selection(args.selection_manifest)
-    if selection["contract_version"] != PRODUCTION_CANARY_SELECTION_VERSION:
-        raise RuntimeError("New canary freezes require module-c-canary-selection-v2")
+    if selection["contract_version"] not in PRODUCTION_CANARY_SELECTION_VERSIONS:
+        raise RuntimeError("New canary freezes require selection-v2 or selection-v3")
     async with conn.transaction(isolation="serializable"):
         source = await conn.fetchrow(
             """
@@ -462,7 +464,7 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
         await validate_strict_build(
             conn, source, build_id=args.source_build_id, require_v2=True
         )
-        if selection["contract_version"] == "module-c-canary-selection-v2":
+        if selection["contract_version"] in PRODUCTION_CANARY_SELECTION_VERSIONS:
             from collector.module_c_canary_selection import (
                 rebuild_selection_manifest,
                 validate_selection_source,
@@ -481,7 +483,10 @@ async def freeze_canary(conn: asyncpg.Connection, args: argparse.Namespace) -> d
                 selection, source, build_id=args.source_build_id
             )
             reproduced = await rebuild_selection_manifest(
-                conn, source_build_id=args.source_build_id, build=source
+                conn,
+                source_build_id=args.source_build_id,
+                build=source,
+                contract_version=selection["contract_version"],
             )
             if selection != reproduced:
                 raise RuntimeError(
@@ -732,7 +737,7 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
                 or approved_canary["child_status"] != "completed"
                 or source_id != args.eligibility_build_id
                 or approved_parameters.get("selection_contract_version")
-                != PRODUCTION_CANARY_SELECTION_VERSION
+                not in PRODUCTION_CANARY_SELECTION_VERSIONS
             ):
                 raise RuntimeError("Approved canary is not sealed against this baseline eligibility build")
             for field in ("code_commit", "image_digest", "vendor_manifest_sha256", "config_hash"):

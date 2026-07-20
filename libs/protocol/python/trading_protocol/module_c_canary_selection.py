@@ -10,12 +10,19 @@ from typing import Any, Mapping
 
 
 CONTRACT_VERSION = "module-c-canary-selection-v2"
+NON_BJ_CONTRACT_VERSION = "module-c-canary-selection-v3"
 BARS_PER_COMPLETE_5F_SESSION = 49
 ACTIVITY_BASIS = "pinned-audit-5f-rows-per-49-bar-1d-session-v1"
 BOARD_ORDER = ("main_board", "chinext", "star", "bj")
 BOARD_QUOTAS = {board: 5 for board in BOARD_ORDER}
 BOUNDARY_COUNTS = {"lower": 2, "middle": 1, "upper": 2}
 BOUNDARY_ORDER = ("lower", "lower", "middle", "upper", "upper")
+NON_BJ_BOARD_ORDER = ("main_board", "chinext")
+NON_BJ_BOARD_QUOTAS = {"main_board": 10, "chinext": 10}
+NON_BJ_BOUNDARY_COUNTS = {"lower": 3, "middle": 4, "upper": 3}
+NON_BJ_BOUNDARY_ORDER = (
+    "lower", "lower", "lower", "middle", "middle", "middle", "middle", "upper", "upper", "upper",
+)
 FRESHNESS_CONTRACT_VERSION = "module-c-authoritative-freshness-v1"
 STRICT_PROVENANCE_FIELDS = (
     "canonical_audit_run_id",
@@ -98,10 +105,22 @@ def normalize_selection_source(source: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def selection_policy() -> dict[str, Any]:
+    return selection_policy_for(CONTRACT_VERSION)
+
+
+def selection_policy_for(contract_version: str) -> dict[str, Any]:
+    if contract_version == CONTRACT_VERSION:
+        board_quotas = BOARD_QUOTAS
+        boundary_counts = BOUNDARY_COUNTS
+    elif contract_version == NON_BJ_CONTRACT_VERSION:
+        board_quotas = NON_BJ_BOARD_QUOTAS
+        boundary_counts = NON_BJ_BOUNDARY_COUNTS
+    else:
+        raise ValueError("Unsupported canary selection contract_version")
     return {
-        "symbol_count": 20,
-        "board_quotas": dict(BOARD_QUOTAS),
-        "activity_boundary_counts_per_board": dict(BOUNDARY_COUNTS),
+        "symbol_count": sum(board_quotas.values()),
+        "board_quotas": dict(board_quotas),
+        "activity_boundary_counts_per_board": dict(boundary_counts),
         "activity_basis": ACTIVITY_BASIS,
         "bars_per_complete_5f_session": BARS_PER_COMPLETE_5F_SESSION,
         "legacy_free_text_scenario_traits": "not_authoritative_without_frozen_evidence",
@@ -109,16 +128,32 @@ def selection_policy() -> dict[str, Any]:
     }
 
 
-def _validated_symbols(payload: Mapping[str, Any], source: Mapping[str, Any]) -> list[dict[str, Any]]:
+def selection_spec(contract_version: str) -> tuple[tuple[str, ...], dict[str, int], dict[str, int], tuple[str, ...]]:
+    if contract_version == CONTRACT_VERSION:
+        return BOARD_ORDER, BOARD_QUOTAS, BOUNDARY_COUNTS, BOUNDARY_ORDER
+    if contract_version == NON_BJ_CONTRACT_VERSION:
+        return (
+            NON_BJ_BOARD_ORDER,
+            NON_BJ_BOARD_QUOTAS,
+            NON_BJ_BOUNDARY_COUNTS,
+            NON_BJ_BOUNDARY_ORDER,
+        )
+    raise ValueError("Unsupported canary selection contract_version")
+
+
+def _validated_symbols(
+    payload: Mapping[str, Any], source: Mapping[str, Any], *, contract_version: str
+) -> list[dict[str, Any]]:
+    board_order, board_quotas, boundary_counts_spec, boundary_order = selection_spec(contract_version)
     symbols = payload.get("symbols")
-    if not isinstance(symbols, list) or len(symbols) != 20:
-        raise ValueError("Canary selection must contain exactly 20 symbols")
+    if not isinstance(symbols, list) or len(symbols) != sum(board_quotas.values()):
+        raise ValueError("Canary selection has the wrong symbol count")
     identities: set[int] = set()
     names: set[str] = set()
     board_counts: Counter[str] = Counter()
-    boundary_counts: dict[str, Counter[str]] = {board: Counter() for board in BOARD_ORDER}
+    boundary_counts: dict[str, Counter[str]] = {board: Counter() for board in board_order}
     board_rows: dict[str, list[tuple[Fraction, int, str, str]]] = {
-        board: [] for board in BOARD_ORDER
+        board: [] for board in board_order
     }
     normalized: list[dict[str, Any]] = []
     for raw in symbols:
@@ -134,10 +169,10 @@ def _validated_symbols(payload: Mapping[str, Any], source: Mapping[str, Any]) ->
         evidence = raw.get("evidence")
         if symbol_id in identities or symbol in names:
             raise ValueError("Canary selection symbols must be 20 unique identities")
-        if classify_board(symbol) != board or board not in BOARD_QUOTAS:
-            raise ValueError("selection-v2 board evidence is inconsistent")
-        if boundary not in BOUNDARY_COUNTS or not isinstance(evidence, Mapping):
-            raise ValueError("selection-v2 activity boundary evidence is incomplete")
+        if classify_board(symbol) != board or board not in board_quotas:
+            raise ValueError("selection board evidence is inconsistent")
+        if boundary not in boundary_counts_spec or not isinstance(evidence, Mapping):
+            raise ValueError("selection activity boundary evidence is incomplete")
         if raw.get("traits") != [board, f"{boundary}_activity_boundary"]:
             raise ValueError("selection-v2 traits are inconsistent")
         eligible = raw.get("eligible_timeframes")
@@ -172,13 +207,13 @@ def _validated_symbols(payload: Mapping[str, Any], source: Mapping[str, Any]) ->
         boundary_counts[board][boundary] += 1
         board_rows[board].append((ratio, symbol_id, symbol, boundary))
         normalized.append(dict(raw))
-    if dict(board_counts) != BOARD_QUOTAS or any(
-        dict(boundary_counts[board]) != BOUNDARY_COUNTS for board in BOARD_ORDER
+    if dict(board_counts) != board_quotas or any(
+        dict(boundary_counts[board]) != boundary_counts_spec for board in board_order
     ):
         raise ValueError("selection-v2 board or activity boundary quotas are incomplete")
-    for board in BOARD_ORDER:
+    for board in board_order:
         rows = board_rows[board]
-        if [row[3] for row in rows] != list(BOUNDARY_ORDER) or rows != sorted(
+        if [row[3] for row in rows] != list(boundary_order) or rows != sorted(
             rows, key=lambda row: row[:3]
         ):
             raise ValueError("selection-v2 deterministic order is inconsistent")
@@ -190,12 +225,12 @@ def validate_selection_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         "contract_version", "source", "policy", "symbols", "selection_sha256"
     }:
         raise ValueError("selection-v2 manifest must use the exact schema")
-    if payload.get("contract_version") != CONTRACT_VERSION:
-        raise ValueError("Unsupported canary selection contract_version")
+    contract_version = str(payload.get("contract_version") or "")
+    selection_spec(contract_version)
     source = normalize_selection_source(payload.get("source"))
-    if payload.get("policy") != selection_policy():
-        raise ValueError("selection-v2 policy does not match the deterministic contract")
-    _validated_symbols(payload, source)
+    if payload.get("policy") != selection_policy_for(contract_version):
+        raise ValueError("selection policy does not match the deterministic contract")
+    _validated_symbols(payload, source, contract_version=contract_version)
     unsigned = {key: payload[key] for key in payload if key != "selection_sha256"}
     if payload.get("selection_sha256") != canonical_selection_sha256(unsigned):
         raise ValueError("selection-v2 canonical SHA-256 is invalid")
@@ -267,31 +302,38 @@ def evaluate_selection_evidence(
         activity_basis=policy.get("activity_basis") if isinstance(policy.get("activity_basis"), str) else None,
     )
     symbols = manifest.get("symbols") if isinstance(manifest.get("symbols"), list) else []
+    contract_version = manifest.get("contract_version") if isinstance(manifest.get("contract_version"), str) else ""
+    try:
+        board_order, board_quotas, boundary_counts_spec, _boundary_order = selection_spec(contract_version)
+        expected_policy = selection_policy_for(contract_version)
+    except ValueError:
+        board_order, board_quotas, boundary_counts_spec = (), {}, {}
+        expected_policy = None
     board_counts: Counter[str] = Counter()
-    boundary_counts: dict[str, Counter[str]] = {board: Counter() for board in BOARD_ORDER}
+    boundary_counts: dict[str, Counter[str]] = {board: Counter() for board in board_order}
     traits: set[str] = set()
     for entry in symbols:
         if not isinstance(entry, Mapping):
             continue
         board = entry.get("board")
         boundary = entry.get("activity_boundary")
-        if isinstance(board, str) and board in BOARD_ORDER:
+        if isinstance(board, str) and board in board_quotas:
             board_counts[board] += 1
-            if isinstance(boundary, str) and boundary in BOUNDARY_COUNTS:
+            if isinstance(boundary, str) and boundary in boundary_counts_spec:
                 boundary_counts[board][boundary] += 1
         if isinstance(entry.get("traits"), list):
             traits.update(str(value) for value in entry["traits"])
-    result["board_counts"] = {board: board_counts[board] for board in BOARD_ORDER}
+    result["board_counts"] = {board: board_counts[board] for board in board_order}
     result["boundary_counts"] = {
-        board: {boundary: boundary_counts[board][boundary] for boundary in BOUNDARY_COUNTS}
-        for board in BOARD_ORDER
+        board: {boundary: boundary_counts[board][boundary] for boundary in boundary_counts_spec}
+        for board in board_order
     }
     provenance = dict(strict_provenance) if isinstance(strict_provenance, Mapping) else {}
     contract_matches = bool(
-        manifest.get("contract_version") == CONTRACT_VERSION
+        contract_version in {CONTRACT_VERSION, NON_BJ_CONTRACT_VERSION}
         and params.get("scope") == "canary"
-        and params.get("selection_contract_version") == CONTRACT_VERSION
-        and policy == selection_policy()
+        and params.get("selection_contract_version") == contract_version
+        and policy == expected_policy
         and params.get("selection_traits") == sorted(traits)
     )
     unsigned = {key: manifest[key] for key in manifest if key != "selection_sha256"}
