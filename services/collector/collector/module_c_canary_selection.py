@@ -26,6 +26,8 @@ from trading_protocol.module_c_canary_selection import (
     classify_board,
     normalize_selection_source,
     selection_policy,
+    selection_policy_for,
+    selection_spec,
     validate_selection_manifest,
 )
 
@@ -121,14 +123,16 @@ def build_selection_manifest(
     source: Mapping[str, Any],
     dispositions: Sequence[Mapping[str, Any]],
     checkpoints: Sequence[Mapping[str, Any]],
+    contract_version: str = CONTRACT_VERSION,
 ) -> dict[str, Any]:
     normalized_source = _normalized_source(source)
+    board_order, board_quotas, boundary_counts, _boundary_order = selection_spec(contract_version)
     by_board: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for candidate in _candidate_rows(dispositions, checkpoints):
         by_board[str(candidate["board"])].append(candidate)
 
     selected: list[dict[str, Any]] = []
-    for board in BOARD_ORDER:
+    for board in board_order:
         ordered = sorted(
             by_board[board],
             key=lambda row: (
@@ -137,17 +141,19 @@ def build_selection_manifest(
                 row["symbol"],
             ),
         )
-        quota = BOARD_QUOTAS[board]
+        quota = board_quotas[board]
         if len(ordered) < quota:
             raise ValueError(
                 f"selection board {board} has {len(ordered)} candidates; {quota} required"
             )
+        lower = boundary_counts["lower"]
+        middle = boundary_counts["middle"]
+        upper = boundary_counts["upper"]
+        middle_start = (len(ordered) - middle) // 2
         picks = [
-            ("lower", ordered[0]),
-            ("lower", ordered[1]),
-            ("middle", ordered[(len(ordered) - 1) // 2]),
-            ("upper", ordered[-2]),
-            ("upper", ordered[-1]),
+            *(("lower", ordered[index]) for index in range(lower)),
+            *(("middle", ordered[index]) for index in range(middle_start, middle_start + middle)),
+            *(("upper", ordered[index]) for index in range(len(ordered) - upper, len(ordered))),
         ]
         identities = {int(row["symbol_id"]) for _, row in picks}
         if len(identities) != quota:
@@ -175,9 +181,9 @@ def build_selection_manifest(
             )
 
     unsigned: dict[str, Any] = {
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": contract_version,
         "source": normalized_source,
-        "policy": _policy(),
+        "policy": selection_policy_for(contract_version),
         "symbols": selected,
     }
     return {**unsigned, "selection_sha256": _canonical_sha256(unsigned)}
@@ -206,7 +212,7 @@ def validate_selection_source(
 
 
 async def select_from_build(
-    connection: asyncpg.Connection, source_build_id: str
+    connection: asyncpg.Connection, source_build_id: str, *, contract_version: str = CONTRACT_VERSION
 ) -> dict[str, Any]:
     from collector.module_c_batch_control import (
         revalidate_strict_v2_build,
@@ -244,7 +250,8 @@ async def select_from_build(
             connection, build, build_id=source_build_id, for_share=False
         )
         return await rebuild_selection_manifest(
-            connection, source_build_id=source_build_id, build=build
+            connection, source_build_id=source_build_id, build=build,
+            contract_version=contract_version,
         )
 
 
@@ -253,6 +260,7 @@ async def rebuild_selection_manifest(
     *,
     source_build_id: str,
     build: Mapping[str, Any],
+    contract_version: str = CONTRACT_VERSION,
 ) -> dict[str, Any]:
     dispositions = await connection.fetch(
         """
@@ -307,6 +315,7 @@ async def rebuild_selection_manifest(
         source=source,
         dispositions=[dict(row) for row in dispositions],
         checkpoints=[dict(row) for row in checkpoints],
+        contract_version=contract_version,
     )
 
 
@@ -316,6 +325,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL"))
     parser.add_argument("--source-build-id", required=True)
+    parser.add_argument("--contract-version", default=CONTRACT_VERSION)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if not args.database_url:
@@ -327,7 +337,9 @@ async def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     connection = await asyncpg.connect(args.database_url)
     try:
-        manifest = await select_from_build(connection, args.source_build_id)
+        manifest = await select_from_build(
+            connection, args.source_build_id, contract_version=args.contract_version
+        )
     finally:
         await connection.close()
     args.output.parent.mkdir(parents=True, exist_ok=True)

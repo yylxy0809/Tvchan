@@ -23,6 +23,8 @@ from collector.module_c_canary_selection import (
 from collector.module_c_eligibility import CODE_TO_TIMEFRAME, Disposition, _stable_hash
 from trading_protocol import MODULE_C_CONFIG_HASH
 from trading_protocol.module_c_canary_selection import (
+    NON_BJ_BOARD_QUOTAS,
+    NON_BJ_CONTRACT_VERSION,
     canonical_selection_sha256,
     classify_board,
     normalize_selection_source,
@@ -144,6 +146,38 @@ def test_selection_v2_fails_closed_when_one_board_lacks_candidates() -> None:
         build_selection_manifest(
             source=_source(), dispositions=dispositions, checkpoints=checkpoints
         )
+
+
+def test_selection_v3_is_deterministic_without_unavailable_boards() -> None:
+    dispositions = []
+    checkpoints = []
+    symbols = [
+        *( (index + 1, f"600{index:03d}.SH") for index in range(12) ),
+        *( (index + 101, f"300{index:03d}.SZ") for index in range(12) ),
+    ]
+    for symbol_id, symbol in symbols:
+        for timeframe in (5, 30, 1440, 10080, 43200):
+            dispositions.append({
+                "symbol_id": symbol_id, "symbol": symbol, "timeframe": timeframe,
+                "eligible": True, "reasons": [], "covered_until": None,
+                "unresolved_rows": 0,
+            })
+            checkpoints.append({
+                "symbol_id": symbol_id, "timeframe": timeframe, "status": "completed",
+                "rows_scanned": 1000 + symbol_id if timeframe == 5 else 100,
+            })
+
+    manifest = build_selection_manifest(
+        source=_source(), dispositions=dispositions, checkpoints=checkpoints,
+        contract_version=NON_BJ_CONTRACT_VERSION,
+    )
+
+    assert manifest["contract_version"] == NON_BJ_CONTRACT_VERSION
+    assert len(manifest["symbols"]) == 20
+    assert manifest["policy"]["board_quotas"] == NON_BJ_BOARD_QUOTAS
+    assert {board: sum(row["board"] == board for row in manifest["symbols"])
+            for board in NON_BJ_BOARD_QUOTAS} == NON_BJ_BOARD_QUOTAS
+    assert validate_selection_manifest(manifest) == manifest
 
 
 def test_activity_evidence_uses_canonical_49_bar_complete_session() -> None:
