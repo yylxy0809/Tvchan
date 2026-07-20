@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from collector.module_c_canary_ab import (
+    PUBLISHED_RUNS_SQL,
     _center_record,
     _json_object,
     _line_record,
@@ -12,6 +13,13 @@ from collector.module_c_canary_ab import (
     compare_payloads,
     parse_args,
 )
+
+
+def test_ab_selector_uses_completed_task_runs_not_only_new_head_history() -> None:
+    normalized = " ".join(PUBLISHED_RUNS_SQL.lower().split())
+    assert "join chan_c_full_recompute_tasks task on task.run_id = r.id" in normalized
+    assert "task.status = 'completed'" in normalized
+    assert "join chan_c_head_history" not in normalized
 
 
 def test_line_record_preserves_point_order_direction_and_native_time() -> None:
