@@ -597,6 +597,9 @@ async def claim_recompute_task(
                   from chan_c_full_recompute_tasks task
                   join executable_batch batch
                     on batch.batch_id = task.batch_id
+                  join symbols symbol
+                    on symbol.id = task.symbol_id
+                   and symbol.is_active
                  where task.batch_id = $1
                    and task.eligible
                    and task.attempts < batch.max_attempts

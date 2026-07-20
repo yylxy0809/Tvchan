@@ -280,6 +280,8 @@ def test_full_recompute_claim_is_sharded_leased_and_attempt_bounded() -> None:
         "executable_batch as materialized"
     ) < lowered.index("candidate as")
     assert "for update of task skip locked" in lowered
+    assert "join symbols symbol" in lowered
+    assert "and symbol.is_active" in lowered
     assert "batch.status = 'running'" in lowered
     assert "parent.status = 'running'" in lowered
     assert "parent.effective_config->>'max_attempts'" in lowered

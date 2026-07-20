@@ -161,6 +161,10 @@ class StaleChanHeadError(RuntimeError):
     pass
 
 
+class InactiveSymbolPublicationError(StaleChanHeadError):
+    pass
+
+
 class StaleTailTaskLeaseError(StaleChanHeadError):
     pass
 
@@ -264,18 +268,6 @@ class PostgresChanWriter:
                 raise ValueError("Full-recompute task batch does not match writer batch")
         assert self._pool is not None
         async with self._pool.acquire() as conn:
-            symbol_id = await conn.fetchval(
-                """
-                select id
-                from symbols
-                where code = split_part($1, '.', 1)
-                  and exchange = split_part($1, '.', 2)
-                """,
-                symbol,
-            )
-            if symbol_id is None:
-                raise RuntimeError(f"Unknown symbol in database: {symbol}")
-
             level_code = timeframe_to_db_code(level)
             snapshot_version = str(response.get("snapshot_version") or "")
             base_timeframe_code = timeframe_to_db_code(
@@ -331,10 +323,28 @@ class PostgresChanWriter:
                 )
 
             fenced_task = full_recompute_task or historical_replay_task
-            run_id = None if fenced_task is not None else await insert_run(resumable=False)
+            symbol_id: int | None = None
+            run_id = None
             locked_full_recompute_expected_heads: dict[str, Any] | None = None
             try:
                 async with conn.transaction():
+                    symbol_id = await conn.fetchval(
+                        """
+                        select id
+                          from symbols
+                         where code = split_part($1, '.', 1)
+                           and exchange = split_part($1, '.', 2)
+                           and is_active
+                         for share
+                        """,
+                        symbol,
+                    )
+                    if symbol_id is None:
+                        raise InactiveSymbolPublicationError(
+                            f"Publication rejected for unknown or inactive symbol: {symbol}"
+                        )
+                    if fenced_task is None:
+                        run_id = await insert_run(resumable=False)
                     if full_recompute_task is not None:
                         parent = await conn.fetchrow(
                             """
@@ -616,7 +626,11 @@ class PostgresChanWriter:
                         run_id,
                         str(exc)[:2000],
                     )
-                if fenced_task is None:
+                if (
+                    fenced_task is None
+                    and symbol_id is not None
+                    and not isinstance(exc, InactiveSymbolPublicationError)
+                ):
                     await self._upsert_recompute_watermarks(
                         conn,
                         symbol_id=symbol_id,
@@ -908,23 +922,27 @@ class PostgresChanWriter:
     ) -> None:
         task = await conn.fetchrow(
             """
-            select id,
-                   symbol_id,
-                   chan_level,
-                   mode,
-                   base_timeframe,
-                   status,
-                   claim_token,
-                   lease_version,
-                   lease_until,
-                   anchor_bar_end,
-                   claimed_target_bar_end,
-                   target_bar_end,
-                   expected_head_run_id,
-                   expected_head_base_to_bar_end
-            from scheme2_chan_c_tail_tasks
-            where id = $1
-            for update
+            select task.id,
+                   task.symbol_id,
+                   task.chan_level,
+                   task.mode,
+                   task.base_timeframe,
+                   task.status,
+                   task.claim_token,
+                   task.lease_version,
+                   task.lease_until,
+                   task.anchor_bar_end,
+                   task.claimed_target_bar_end,
+                   task.target_bar_end,
+                   task.expected_head_run_id,
+                   task.expected_head_base_to_bar_end
+            from scheme2_chan_c_tail_tasks task
+            join symbols symbol
+              on symbol.id = task.symbol_id
+             and symbol.is_active
+            where task.id = $1
+            for update of task
+            for share of symbol
             """,
             task_id,
         )
