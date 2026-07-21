@@ -50,6 +50,47 @@ def test_realtime_accepts_bearer_subprotocol_without_query_token() -> None:
         assert ws.receive_json()["type"] == "pong"
 
 
+def test_realtime_disconnect_waits_for_producer_cleanup(monkeypatch) -> None:
+    cleanup_finished = asyncio.Event()
+    producer_started = asyncio.Event()
+
+    class FakeWebSocket:
+        scope = {"app": SimpleNamespace(state=SimpleNamespace())}
+        query_params = {}
+
+        async def accept(self) -> None:
+            return None
+
+        async def receive_json(self):
+            await producer_started.wait()
+            raise realtime.WebSocketDisconnect()
+
+    async def producer() -> None:
+        try:
+            producer_started.set()
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.01)
+            cleanup_finished.set()
+
+    async def create_producer_task(_websocket, _subscriptions):
+        return asyncio.create_task(producer())
+
+    async def scenario() -> None:
+        monkeypatch.setattr(
+            realtime,
+            "get_settings",
+            lambda: SimpleNamespace(api_token="", admin_api_token=""),
+        )
+        monkeypatch.setattr(realtime, "_create_producer_task", create_producer_task)
+
+        await realtime.realtime_ws(FakeWebSocket())
+
+        assert cleanup_finished.is_set()
+
+    asyncio.run(scenario())
+
+
 def test_chart_ws_rejects_bad_token() -> None:
     client = TestClient(create_app())
     try:
