@@ -98,7 +98,10 @@ class PostgresChanCStreamStore:
             # levels are requested. The CASE below never reads this null value.
             closed_bar_join = """
                     left join lateral (
-                        select null::timestamptz as target_bar_end
+                        select
+                            null::timestamptz as target_bar_end,
+                            $6::timestamptz as unused_week_cutoff,
+                            $7::timestamptz as unused_month_cutoff
                     ) closed_bar on false
             """
         async with self._pool.acquire() as conn:
