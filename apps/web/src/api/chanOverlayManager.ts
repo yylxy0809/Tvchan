@@ -3,6 +3,7 @@ import type { ChanMode } from "../tradingview/overlaySettings";
 import type { ChanRealtimeOverlayState } from "./chanRealtimeOverlayBridge";
 
 export type ChanOverlayRange = { from: number; to: number };
+type TimedBar = Readonly<{ time: number }>;
 type FetchOverlay = (symbol: string, timeframe: string, limit: number, from?: number, to?: number, signal?: AbortSignal, levels?: readonly string[], modes?: readonly string[]) => Promise<ChanOverlayResponse>;
 export type ChanOverlayContextRequest = ChanOverlayRange & { symbol: string; timeframe: string; modes: ChanMode[] };
 type OverlayRequest = ChanOverlayContextRequest & { onPaint(overlay: ChanOverlayResponse): void; onError(error: Error): void };
@@ -22,6 +23,20 @@ export function chanLevelsForTimeframe(timeframe: string): readonly string[] {
     case "1m": return ["1m"];
     default: return [];
   }
+}
+
+export function clampOverlayRangeToBars(
+  range: ChanOverlayRange,
+  bars: readonly TimedBar[],
+): ChanOverlayRange | null {
+  const first = bars[0]?.time;
+  const last = bars[bars.length - 1]?.time;
+  if (!Number.isFinite(first) || !Number.isFinite(last)) return null;
+  const clamped = {
+    from: Math.max(range.from, first),
+    to: Math.min(range.to, last),
+  };
+  return clamped.from <= clamped.to ? clamped : null;
 }
 
 export class ChanOverlayManager {

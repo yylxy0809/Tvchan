@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   ChanOverlayManager,
   __CHAN_OVERLAY_MANAGER_TESTING__,
+  clampOverlayRangeToBars,
   chanLevelsForTimeframe,
   validateChanOverlayResponse,
 } from "./chanOverlayManager";
@@ -23,6 +24,22 @@ function overlay(id = "s1"): ChanOverlayResponse {
     segments: [], centers: [], signals: [], channels: [],
   };
 }
+
+test("visible overlay range is clamped to loaded chart bars", () => {
+  const bars = [{ time: 100 }, { time: 200 }, { time: 300 }];
+
+  assert.deepEqual(
+    clampOverlayRangeToBars({ from: 50, to: 400 }, bars),
+    { from: 100, to: 300 },
+  );
+  assert.deepEqual(
+    clampOverlayRangeToBars({ from: 150, to: 250 }, bars),
+    { from: 150, to: 250 },
+  );
+  assert.equal(clampOverlayRangeToBars({ from: 301, to: 400 }, bars), null);
+  assert.equal(clampOverlayRangeToBars({ from: 50, to: 99 }, bars), null);
+  assert.equal(clampOverlayRangeToBars({ from: 50, to: 400 }, []), null);
+});
 
 test("uses only the backend display levels for each chart timeframe", () => {
   assert.deepEqual(chanLevelsForTimeframe("5f"), ["5f", "30f", "1d"]);

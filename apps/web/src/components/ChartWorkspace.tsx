@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "
 import { chartDataManager, type RealtimeFeedback } from "../api/chartDataManager";
 import { createHttpMarketSidebarTransport } from "../api/marketSidebar";
 import { MarketSidebarStore } from "../api/marketSidebarStore";
-import { ChanOverlayManager, chanLevelsForTimeframe } from "../api/chanOverlayManager";
+import { ChanOverlayManager, chanLevelsForTimeframe, clampOverlayRangeToBars } from "../api/chanOverlayManager";
 import { ChanRealtimeOverlayBridge, ChanRealtimePollingGate, type ChanRealtimeContext } from "../api/chanRealtimeOverlayBridge";
 import { getBars, type ApiBar, type ChanOverlayResponse } from "../api/client";
 import { listUserSettings, saveUserSetting } from "../api/userSettings";
@@ -307,7 +307,9 @@ export function ChartWorkspace({
     };
     const requestOverlay = (symbol: string, timeframe: string, from: number, to: number, chartBars: ApiBar[]) => {
       const widget = widgetRef.current;
-      if (!widget || to < from) return;
+      const availableRange = clampOverlayRangeToBars({ from, to }, chartBars);
+      if (!widget || !availableRange) return;
+      ({ from, to } = availableRange);
       const modes = (["confirmed", "predictive"] as const).filter(
         (mode) => chanOverlaySettingsRef.current.modes[mode],
       );
