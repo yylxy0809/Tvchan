@@ -134,8 +134,10 @@ def test_windowed_module_c_head_selection_requires_native_successful_published_r
             assert "from scheme2_chan_c_published_heads" in query
             assert "head.base_timeframe = head.chan_level" in query
             assert "head.status = 'published'" in query
+            assert "head.base_to_bar_end = watermark.last_bar_end" in query
+            assert "head.consumed_input_version = watermark.change_version" in query
             assert "run.status = 'success'" in query
-            assert "run.config_hash = any($6::varchar[])" in query
+            assert "run.config_hash = any($5::varchar[])" in query
             return []
 
     selected = asyncio.run(_select_windowed_module_c_runs(
