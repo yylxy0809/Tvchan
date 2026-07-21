@@ -30,11 +30,21 @@ def hash_token(token: str) -> str:
     return sha256(token.encode("utf-8")).hexdigest()
 
 
+def websocket_bearer_subprotocol(websocket) -> str | None:
+    return next(
+        (
+            protocol
+            for protocol in websocket.scope.get("subprotocols", ())
+            if protocol.startswith(WEBSOCKET_BEARER_PROTOCOL_PREFIX)
+        ),
+        None,
+    )
+
+
 def websocket_token_value(websocket) -> str | None:
     """Read browser WebSocket credentials without putting them in the URL."""
-    for protocol in websocket.scope.get("subprotocols", ()):
-        if not protocol.startswith(WEBSOCKET_BEARER_PROTOCOL_PREFIX):
-            continue
+    protocol = websocket_bearer_subprotocol(websocket)
+    if protocol is not None:
         encoded = protocol.removeprefix(WEBSOCKET_BEARER_PROTOCOL_PREFIX)
         if not encoded or len(encoded) > 4096:
             return None

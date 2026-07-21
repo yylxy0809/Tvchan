@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.security import (
     AuthenticationServiceUnavailable,
     authenticate_token_value,
+    websocket_bearer_subprotocol,
     websocket_token_value,
 )
 from app.market_sidebar.dto import SetSidebarContext
@@ -41,6 +42,7 @@ logger = logging.getLogger(__name__)
 @router.websocket("/ws/v1/realtime")
 async def realtime_ws(websocket: WebSocket) -> None:
     settings = get_settings()
+    subprotocol = websocket_bearer_subprotocol(websocket)
     token = websocket_token_value(websocket)
     if settings.api_token or settings.admin_api_token:
         app = websocket.scope.get("app")
@@ -52,18 +54,18 @@ async def realtime_ws(websocket: WebSocket) -> None:
             )
         except AuthenticationServiceUnavailable:
             # A pre-accept close is converted to an HTTP 403 by ASGI servers.
-            await websocket.accept()
+            await websocket.accept(subprotocol=subprotocol)
             await websocket.close(code=1013)
             return
     else:
         principal = True
     if principal is None:
         # Complete the handshake so the client receives the policy close code.
-        await websocket.accept()
+        await websocket.accept(subprotocol=subprotocol)
         await websocket.close(code=1008)
         return
 
-    await websocket.accept()
+    await websocket.accept(subprotocol=subprotocol)
     connection_id = uuid4().hex
     subscriptions: dict[str, dict[str, Any]] = {}
     producer_task = await _create_producer_task(websocket, subscriptions)
