@@ -72,6 +72,13 @@ update kline_scope_catalog catalog
        )
    )
    and generation.status in ('building', 'complete')
+   and (
+       catalog.state <> 'present'
+       or catalog.min_ts is null
+       or catalog.max_ts is null
+       or target.min_ts < catalog.min_ts
+       or target.max_ts > catalog.max_ts
+   )
 """
 
 CATALOG_TARGETS_SQL = """

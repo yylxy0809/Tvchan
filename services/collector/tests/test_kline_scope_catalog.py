@@ -390,8 +390,12 @@ def test_bulk_present_hook_merges_duplicate_ranges_without_claiming_complete() -
     ]))
 
     assert updated == 3
-    _sql, args = calls[0]
+    sql, args = calls[0]
     assert args == ([7, 8], [5, 30], [1, 10], [5, 12])
+    normalized = " ".join(sql.lower().split())
+    assert "catalog.state <> 'present'" in normalized
+    assert "target.min_ts < catalog.min_ts" in normalized
+    assert "target.max_ts > catalog.max_ts" in normalized
 
 
 class ExactConnection:
