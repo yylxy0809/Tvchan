@@ -133,7 +133,7 @@ class PostgresChanCStreamStore:
                           )
                         order by k.ts desc
                         limit 1
-                    ) closed_bar on true
+                    ) closed_bar on head.chan_level in (10080, 43200)
                     where head.status = 'published'
                       and head.run_id is not null
                       and head.base_to_bar_end is not null
