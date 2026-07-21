@@ -94,6 +94,18 @@ type ChanSubscriptionReply = WebSocketReply & {
 };
 
 export type ChanOverlayTransportStatus = "connected" | "disconnected" | "replayed";
+type RealtimeTransportStatus = "connecting" | "connected" | "disconnected";
+export type RealtimeChannel = "bars" | "chan";
+export type RealtimeChannelFeedback = {
+  state: "connecting" | "live" | "degraded";
+  lastEventAt?: number;
+};
+export type RealtimeFeedback = {
+  state: RealtimeChannelFeedback["state"];
+  channels: Record<RealtimeChannel, RealtimeChannelFeedback>;
+  degradedChannels: RealtimeChannel[];
+  lastEventAt?: number;
+};
 
 type RealtimeBarReply = {
   type?: string;
@@ -121,6 +133,8 @@ export type RealtimeSidebarContext = {
 const CACHE_TTL_MS = 90_000;
 const WS_RETRY_COOLDOWN_MS = 30_000;
 const WS_REQUEST_TIMEOUT_MS = 8_000;
+const WS_RECONNECT_INITIAL_MS = 250;
+const WS_RECONNECT_MAX_MS = 4_000;
 const SESSION_HISTORY_MAX_BARS = 15_000;
 const SESSION_CHAN_MAX_ITEMS = 30_000;
 const BARS_HISTORY_MAX_SERIES = 24;
@@ -171,6 +185,7 @@ class ChartWebSocketClient {
     }
   >();
   private reconnectTimer: number | null = null;
+  private reconnectDelayMs = WS_RECONNECT_INITIAL_MS;
 
   reset(): void {
     const error = new Error("Authentication session changed");
@@ -314,6 +329,7 @@ class ChartWebSocketClient {
         this.clearConnectTimer();
         this.connectPromise = null;
         this.connectReject = null;
+        this.reconnectDelayMs = WS_RECONNECT_INITIAL_MS;
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
           this.reconnectTimer = null;
@@ -332,6 +348,7 @@ class ChartWebSocketClient {
         this.socket = null;
         this.connectPromise = null;
         this.connectReject = null;
+        if (socket.readyState < 2) socket.close();
         reject(new Error("WebSocket chart transport failed"));
       };
       socket.onclose = () => {
@@ -444,6 +461,8 @@ class ChartWebSocketClient {
     if (this.reconnectTimer !== null || this.subscriptions.size === 0) {
       return;
     }
+    const delay = this.reconnectDelayMs;
+    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, WS_RECONNECT_MAX_MS);
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       if (this.socket || this.connectPromise || this.subscriptions.size === 0) {
@@ -452,7 +471,7 @@ class ChartWebSocketClient {
       void this.connect().catch(() => {
         this.scheduleReconnect();
       });
-    }, 1_000);
+    }, delay);
   }
 }
 
@@ -468,6 +487,7 @@ class RealtimeBarSocketClient {
       timeframe: string;
       listeners: Set<(message: RealtimeBarReply) => void>;
       sessionListeners: Set<(generation: number) => void>;
+      statusListeners: Set<(status: RealtimeTransportStatus) => void>;
     }
   >();
   private sidebarSubscriptions = new Map<string, {
@@ -475,6 +495,7 @@ class RealtimeBarSocketClient {
     listeners: Set<(message: unknown) => void>;
   }>();
   private reconnectTimer: number | null = null;
+  private reconnectDelayMs = WS_RECONNECT_INITIAL_MS;
   private connectionGeneration = 0;
   private activeGeneration = 0;
 
@@ -507,6 +528,7 @@ class RealtimeBarSocketClient {
     timeframe: string,
     listener: (message: RealtimeBarReply) => void,
     sessionListener: (generation: number) => void,
+    statusListener: (status: RealtimeTransportStatus) => void,
   ): Promise<() => void> {
     const normalizedSymbol = symbol.toUpperCase();
     const existing = this.subscriptions.get(subscriptionId);
@@ -515,24 +537,27 @@ class RealtimeBarSocketClient {
       existing.timeframe = timeframe;
       existing.listeners.add(listener);
       existing.sessionListeners.add(sessionListener);
+      existing.statusListeners.add(statusListener);
     } else {
       this.subscriptions.set(subscriptionId, {
         symbol: normalizedSymbol,
         timeframe,
         listeners: new Set([listener]),
         sessionListeners: new Set([sessionListener]),
+        statusListeners: new Set([statusListener]),
       });
     }
-    try {
-      const socket = await this.connect();
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      const socket = this.socket;
       this.sendSubscribe(socket, subscriptionId, normalizedSymbol, timeframe);
       if (this.activeGeneration > 0) sessionListener(this.activeGeneration);
-    } catch (error) {
-      this.removeSubscriptionListener(subscriptionId, listener, sessionListener, false);
-      throw error;
+      statusListener("connected");
+    } else {
+      statusListener("connecting");
+      void this.connect().catch(() => this.scheduleReconnect());
     }
     return () => {
-      this.removeSubscriptionListener(subscriptionId, listener, sessionListener, true);
+      this.removeSubscriptionListener(subscriptionId, listener, sessionListener, statusListener, true);
     };
   }
 
@@ -547,12 +572,11 @@ class RealtimeBarSocketClient {
     } else {
       this.sidebarSubscriptions.set(context.subscriptionId, { context, listeners: new Set([listener]) });
     }
-    try {
-      const socket = await this.connect();
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      const socket = this.socket;
       this.sendSidebarContext(socket, context);
-    } catch (error) {
-      this.removeSidebarListener(context.subscriptionId, listener, false);
-      throw error;
+    } else {
+      void this.connect().catch(() => this.scheduleReconnect());
     }
     return () => this.removeSidebarListener(context.subscriptionId, listener, true);
   }
@@ -589,12 +613,14 @@ class RealtimeBarSocketClient {
         this.activeGeneration = socketGeneration;
         this.connectPromise = null;
         this.connectReject = null;
+        this.reconnectDelayMs = WS_RECONNECT_INITIAL_MS;
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
           this.reconnectTimer = null;
         }
         this.notifySessionGeneration(socketGeneration);
-        if (socketGeneration > 1) this.replaySubscriptions(socket);
+        this.notifyTransport("connecting");
+        this.replaySubscriptions(socket);
         resolve(socket);
       };
       socket.onerror = () => {
@@ -607,6 +633,8 @@ class RealtimeBarSocketClient {
         this.socket = null;
         this.connectPromise = null;
         this.connectReject = null;
+        if (socket.readyState < 2) socket.close();
+        this.notifyTransport("disconnected");
         reject(new Error("Realtime bar transport failed"));
       };
       socket.onclose = () => {
@@ -616,6 +644,7 @@ class RealtimeBarSocketClient {
         this.connectPromise = null;
         this.connectReject?.(new Error("Realtime bar transport closed"));
         this.connectReject = null;
+        this.notifyTransport("disconnected");
         this.scheduleReconnect();
       };
       socket.onmessage = (event) => {
@@ -642,6 +671,13 @@ class RealtimeBarSocketClient {
     if (message.subscription_id) {
       const subscription = this.sidebarSubscriptions.get(message.subscription_id);
       subscription?.listeners.forEach((listener) => listener(message));
+      return;
+    }
+    if (message.type === "subscribed" && typeof message.id === "string") {
+      const subscription = this.subscriptions.get(message.id);
+      if (subscription) {
+        for (const listener of subscription.statusListeners) listener("connected");
+      }
       return;
     }
     if (message.type !== "bar_update" || !message.bar) {
@@ -675,6 +711,7 @@ class RealtimeBarSocketClient {
     subscriptionId: string,
     listener: (message: RealtimeBarReply) => void,
     sessionListener: (generation: number) => void,
+    statusListener: (status: RealtimeTransportStatus) => void,
     notifyServer: boolean,
   ): void {
     const subscription = this.subscriptions.get(subscriptionId);
@@ -683,6 +720,7 @@ class RealtimeBarSocketClient {
     }
     subscription.listeners.delete(listener);
     subscription.sessionListeners.delete(sessionListener);
+    subscription.statusListeners.delete(statusListener);
     if (subscription.listeners.size > 0 || subscription.sessionListeners.size > 0) {
       return;
     }
@@ -728,6 +766,12 @@ class RealtimeBarSocketClient {
     }
   }
 
+  private notifyTransport(status: RealtimeTransportStatus): void {
+    for (const subscription of this.subscriptions.values()) {
+      for (const listener of subscription.statusListeners) listener(status);
+    }
+  }
+
   private sendSubscribe(
     socket: WebSocket,
     subscriptionId: string,
@@ -748,6 +792,8 @@ class RealtimeBarSocketClient {
     if (this.reconnectTimer !== null || (this.subscriptions.size === 0 && this.sidebarSubscriptions.size === 0)) {
       return;
     }
+    const delay = this.reconnectDelayMs;
+    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, WS_RECONNECT_MAX_MS);
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       if (this.socket || this.connectPromise || (this.subscriptions.size === 0 && this.sidebarSubscriptions.size === 0)) {
@@ -756,7 +802,7 @@ class RealtimeBarSocketClient {
       void this.connect().catch(() => {
         this.scheduleReconnect();
       });
-    }, 1_000);
+    }, delay);
   }
 }
 
@@ -776,6 +822,11 @@ export class ChartDataManager {
   private sessionHistoryWindows = new Map<string, ChartHistoryWindowEvent>();
   private sessionChanOverlays = new Map<string, ChanOverlayResponse>();
   private snapshotListeners = new Set<(event: SnapshotUpdateEvent) => void>();
+  private realtimeFeedbackListeners = new Set<(event: RealtimeFeedback) => void>();
+  private realtimeFeedbackByChannel: Record<RealtimeChannel, RealtimeChannelFeedback> = {
+    bars: { state: "connecting" },
+    chan: { state: "connecting" },
+  };
   private wsClient = new ChartWebSocketClient();
   private realtimeClient = new RealtimeBarSocketClient();
   private wsDisabledUntil = 0;
@@ -792,6 +843,10 @@ export class ChartDataManager {
     this.latestRealtimeVersions.clear();
     this.realtimeBarStates.clear();
     this.realtimeSessionGenerations.clear();
+    this.realtimeFeedbackByChannel = {
+      bars: { state: "connecting" },
+      chan: { state: "connecting" },
+    };
     this.wsDisabledUntil = 0;
   }
 
@@ -811,6 +866,16 @@ export class ChartDataManager {
     return () => {
       this.snapshotListeners.delete(listener);
     };
+  }
+
+  subscribeRealtimeFeedback(listener: (event: RealtimeFeedback) => void): () => void {
+    this.realtimeFeedbackListeners.add(listener);
+    listener(this.currentRealtimeFeedback());
+    return () => this.realtimeFeedbackListeners.delete(listener);
+  }
+
+  markChanOverlayLive(): void {
+    this.notifyRealtimeFeedback("chan", { state: "live", lastEventAt: Date.now() });
   }
 
   publishHistoryWindow(event: ChartHistoryWindowEvent): void {
@@ -1024,11 +1089,24 @@ export class ChartDataManager {
       (message) => {
         if (!message || typeof message !== "object") return;
         const type = (message as { type?: unknown }).type;
-        if (type === "chan_overlay" || type === "chan_resync_required") {
+        if (type === "chan_subscribed") {
+          this.notifyRealtimeFeedback("chan", { state: "live" });
+          return;
+        }
+        if (type === "chan_overlay") {
+          this.markChanOverlayLive();
+          listener(message);
+        } else if (type === "chan_resync_required") {
+          this.notifyRealtimeFeedback("chan", { state: "degraded", lastEventAt: Date.now() });
           listener(message);
         }
       },
-      statusListener,
+      (status) => {
+        this.notifyRealtimeFeedback("chan", {
+          state: status === "disconnected" ? "degraded" : "connecting",
+        });
+        statusListener(status);
+      },
     );
   }
 
@@ -1055,6 +1133,7 @@ export class ChartDataManager {
         }
         const symbol = String(message.symbol ?? request.symbol).toUpperCase();
         const timeframe = String(message.timeframe ?? request.timeframe);
+        this.notifyRealtimeFeedback("bars", { state: "live", lastEventAt: Date.now() });
         listener({
           symbol,
           timeframe,
@@ -1065,6 +1144,9 @@ export class ChartDataManager {
         });
       },
       sessionListener,
+      (status) => this.notifyRealtimeFeedback("bars", {
+        state: status === "connected" ? "live" : status === "connecting" ? "connecting" : "degraded",
+      }),
     );
   }
 
@@ -1794,6 +1876,39 @@ export class ChartDataManager {
     for (const listener of this.snapshotListeners) {
       listener(event);
     }
+  }
+
+  private notifyRealtimeFeedback(channel: RealtimeChannel, event: RealtimeChannelFeedback): void {
+    const previous = this.realtimeFeedbackByChannel[channel];
+    this.realtimeFeedbackByChannel[channel] = {
+      ...event,
+      lastEventAt: event.lastEventAt ?? previous.lastEventAt,
+    };
+    const feedback = this.currentRealtimeFeedback();
+    for (const listener of this.realtimeFeedbackListeners) listener(feedback);
+  }
+
+  private currentRealtimeFeedback(): RealtimeFeedback {
+    const channels = {
+      bars: { ...this.realtimeFeedbackByChannel.bars },
+      chan: { ...this.realtimeFeedbackByChannel.chan },
+    };
+    const values = Object.values(channels);
+    const degradedChannels = (["bars", "chan"] as const).filter(
+      (channel) => channels[channel].state === "degraded",
+    );
+    const state = degradedChannels.length > 0
+      ? "degraded"
+      : values.some((item) => item.state === "connecting")
+        ? "connecting"
+        : "live";
+    const lastEventAt = Math.max(...values.map((item) => item.lastEventAt ?? 0));
+    return {
+      state,
+      channels,
+      degradedChannels,
+      ...(lastEventAt > 0 ? { lastEventAt } : {}),
+    };
   }
 }
 

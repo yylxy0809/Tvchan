@@ -143,6 +143,7 @@ def test_tail_publication_lock_requires_exact_live_task_identity() -> None:
             "lease_until": datetime.fromtimestamp(250, UTC),
             "anchor_bar_end": anchor,
             "claimed_target_bar_end": target,
+            "claimed_input_version": 2,
             "target_bar_end": target,
             "expected_head_run_id": 11,
             "expected_head_base_to_bar_end": anchor,
@@ -160,6 +161,7 @@ def test_tail_publication_lock_requires_exact_live_task_identity() -> None:
             base_timeframe_code=5,
             anchor_bar_end=anchor,
             claimed_target_bar_end=target,
+            expected_input_version=2,
             expected_head_run_id=11,
             expected_head_base_to_bar_end=anchor,
         )
@@ -189,6 +191,7 @@ def test_tail_publication_lock_requires_exact_live_task_identity() -> None:
                 base_timeframe_code=5,
                 anchor_bar_end=anchor,
                 claimed_target_bar_end=target,
+                expected_input_version=2,
                 expected_head_run_id=11,
                 expected_head_base_to_bar_end=anchor,
             )
@@ -218,6 +221,7 @@ def test_tail_publication_rejects_target_drift_before_pool_acquire() -> None:
                 publication_claim_token="claim-7",
                 publication_lease_version=7,
                 publication_target_bar_end=target,
+                expected_input_version=2,
                 expected_head_run_id=11,
                 expected_head_base_to_bar_end=datetime(
                     2026, 7, 3, 6, 50, tzinfo=UTC
@@ -252,6 +256,7 @@ def test_tail_publication_accepts_same_week_canonical_bar_label() -> None:
                 publication_claim_token="claim-7",
                 publication_lease_version=7,
                 publication_target_bar_end=claimed_monday,
+                expected_input_version=2,
                 expected_head_run_id=11,
                 expected_head_base_to_bar_end=datetime(
                     2026, 7, 3, 7, tzinfo=UTC
@@ -579,6 +584,7 @@ def test_publish_heads_cas_returns_only_the_winning_committed_identity() -> None
             "snapshot_version": "committed-v99",
             "run_id": 99,
             "expected_run_id": 98,
+            "expected_input_version": 2,
         }
         committed = await writer._publish_heads_cas(CasConn("UPDATE 1"), **kwargs)
         assert committed == {"run_id": 99, "snapshot_version": "committed-v99"}

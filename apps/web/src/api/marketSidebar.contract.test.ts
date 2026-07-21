@@ -47,8 +47,12 @@ test("maps the canonical flat API bootstrap including exact local projections", 
     anchorTime: 1783666800, anchorPrice: 10.5,
   }]);
   assert.deepEqual(snapshot.profileBySymbol["000001.SZ"].strategySignals, [{
-    key: "strategy-v1", label: "weekly_daily_b2", value: "entry / confirmed",
-    tone: "up", source: "local_db",
+    key: "strategy-v1", eventId: "event-v1", label: "weekly_daily_b2", value: "entry / confirmed",
+    tone: "up", source: "local_db", eventType: "strategy_lifecycle", status: "active",
+    sourceLevel: "1d", sourceSignalType: "b2", sourceSignalSide: "buy",
+    pointTime: "2026-07-12T09:30:00+08:00", firstSeenTime: "2026-07-12T09:31:00+08:00",
+    confirmTime: "2026-07-12T09:32:00+08:00", disappearTime: null,
+    sourceSnapshotVersion: "snapshot-v1", confidenceScore: 0.9, strengthScore: 0.8,
   }]);
   assert.equal(snapshot.newsBySymbol["000001.SZ"].stockNews[0].id, "news-1");
   assert.deepEqual(snapshot.newsBySymbol["000001.SZ"].stockNews[0], {
@@ -354,7 +358,14 @@ function nestedProfile(symbol: string) {
     capital_flow: { net_inflow: 1000, main_net_inflow: 1200, small_net_inflow: -200, ...iwencaiMetadata("fresh") },
     themes: ["Bank"],
     chan_state: { source: "local_db", stroke_states: [{ level: "5f", label: "5分钟", direction: "up", state_label: "published", mode: "confirmed", mode_label: "confirmed", confirmed: true, anchor_time: 1783666800, anchor_price: 10.5 }] },
-    strategy_signals: [{ key: "strategy-v1", label: "weekly_daily_b2", value: "entry / confirmed", tone: "up", source: "local_db" }],
+    strategy_signals: [{
+      key: "strategy-v1", event_id: "event-v1", label: "weekly_daily_b2", value: "entry / confirmed",
+      tone: "up", source: "local_db", event_type: "strategy_lifecycle", status: "active",
+      source_level: "1d", source_signal_type: "b2", source_signal_side: "buy",
+      point_time: "2026-07-12T09:30:00+08:00", first_seen_time: "2026-07-12T09:31:00+08:00",
+      confirm_time: "2026-07-12T09:32:00+08:00", disappear_time: null,
+      source_snapshot_version: "snapshot-v1", confidence_score: 0.9, strength_score: 0.8,
+    }],
   };
 }
 

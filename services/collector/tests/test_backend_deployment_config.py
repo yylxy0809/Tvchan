@@ -105,6 +105,28 @@ def test_lifecycle_observer_is_a_single_standard_realtime_worker() -> None:
     assert "LIFECYCLE_MAX_ATTEMPTS=5" in example
 
 
+def test_realtime_pipeline_includes_a_bounded_market_fill_worker() -> None:
+    compose = (ROOT / "deploy" / "docker-compose.backend.yml").read_text(encoding="utf-8")
+
+    worker = compose[
+        compose.index("  market-fill-worker:") : compose.index("  iwencai-sidebar-event-worker:")
+    ]
+    assert 'profiles: ["manual-market-fill", "realtime-pipeline"]' in worker
+    assert "MARKET_FILL_SYMBOL_LIMIT: ${MARKET_FILL_SYMBOL_LIMIT:-10}" in worker
+    assert "MARKET_FILL_CONCURRENCY: ${MARKET_FILL_CONCURRENCY:-1}" in worker
+    assert "MARKET_FILL_LOOP_INTERVAL: ${MARKET_FILL_LOOP_INTERVAL:-60}" in worker
+
+
+def test_api_pool_is_bounded_and_web_health_requires_chart_runtime_asset() -> None:
+    compose = (ROOT / "deploy" / "docker-compose.backend.yml").read_text(encoding="utf-8")
+
+    api = compose[compose.index("  api:") : compose.index("  web-gateway:")]
+    web = compose[compose.index("  web-gateway:") : compose.index("  cloudflared:")]
+    assert "DATABASE_POOL_MIN_SIZE: ${DATABASE_POOL_MIN_SIZE:-1}" in api
+    assert "DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-8}" in api
+    assert "charting_library/charting_library.js" in web
+
+
 def test_kline_scope_bootstrap_is_registered_but_never_auto_started_by_compose() -> None:
     compose = (ROOT / "deploy" / "docker-compose.backend.yml").read_text(encoding="utf-8")
     windows_compose = (ROOT / "deploy" / "docker-compose.backend.windows.yml").read_text(

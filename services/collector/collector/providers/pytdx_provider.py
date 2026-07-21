@@ -4,7 +4,7 @@ import time
 import asyncio
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from collector.models import ProviderHealth
@@ -13,6 +13,7 @@ from collector.providers.seed import SeedProvider
 from trading_protocol import Bar, SymbolInfo, canonical_kline_timestamp, normalize_timeframe
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+TDX_CLOSE_GRACE = timedelta(seconds=1)
 
 
 class PytdxLunchReopenRowError(ValueError):
@@ -407,8 +408,15 @@ async def _seed_symbols_if_explicitly_enabled(reason: str) -> list[SymbolInfo]:
     raise RuntimeError(f"{reason}; seed fallback is disabled in production")
 
 
-def _tdx_bar_to_bar(symbol: str, timeframe: str, item: dict) -> Bar:
+def _tdx_bar_to_bar(
+    symbol: str,
+    timeframe: str,
+    item: dict,
+    *,
+    now: datetime | None = None,
+) -> Bar:
     ts = _parse_tdx_datetime(item, timeframe)
+    complete = _is_tdx_period_complete(timeframe, ts, now=now)
     volume = int(float(item.get("vol") or item.get("volume") or 0))
     amount = item.get("amount")
     return Bar(
@@ -421,10 +429,28 @@ def _tdx_bar_to_bar(symbol: str, timeframe: str, item: dict) -> Bar:
         close=float(item["close"]),
         volume=volume,
         amount=None if amount is None else float(amount),
-        complete=True,
-        revision=0,
+        complete=complete,
+        revision=0 if complete else 1,
         source="pytdx",
     )
+
+
+def _is_tdx_period_complete(
+    timeframe: str,
+    bar_end: datetime,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    normalized = normalize_timeframe(timeframe)
+    current = (now or datetime.now(SHANGHAI_TZ)).astimezone(SHANGHAI_TZ)
+    local_end = bar_end.astimezone(SHANGHAI_TZ)
+    if normalized == "1w":
+        bar_week = local_end.date() - timedelta(days=local_end.weekday())
+        current_week = current.date() - timedelta(days=current.weekday())
+        return current_week > bar_week
+    if normalized == "1m":
+        return (current.year, current.month) > (local_end.year, local_end.month)
+    return current >= local_end + TDX_CLOSE_GRACE
 
 
 def _tdx_rows_to_bars(

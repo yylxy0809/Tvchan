@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import CancelledError as FutureCancelledError
 import json
+import threading
+import time
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app.main import create_app
 from app.models import (
@@ -197,6 +202,209 @@ def test_chart_ws_request_response_protocol(monkeypatch) -> None:
         assert bundle["snapshot_id"]
         assert len(bundle["bars"]) > 0
         assert set(bundle["chan"]["levels"]) == {"5f", "30f", "1d"}
+
+
+def test_chart_ws_ping_is_not_blocked_by_a_slow_chart_query(monkeypatch) -> None:
+    async def slow_overlay(**_kwargs):
+        await asyncio.sleep(0.1)
+        return ChanOverlayResponse(
+            symbol="000001.SZ", chart_timeframe="5f", levels=["5f", "30f", "1d"],
+            modes=["confirmed", "predictive"], snapshot_version="slow-snapshot",
+            base_timeframe="5f", base_ts_semantics="bar_end", engine="test",
+            requested_bar_count=20, bars_by_level={"5f": 20, "30f": 20, "1d": 20},
+            strokes=[], segments=[], centers=[], signals=[], channels=[],
+        )
+
+    monkeypatch.setattr(chart_ws, "build_chan_overlay", slow_overlay)
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v2/chart?token=dev-local-token") as ws:
+        ws.send_json({
+            "type": "get_chan", "request_id": "slow", "symbol": "000001.SZ",
+            "timeframe": "5f", "limit": 20,
+        })
+        ws.send_json({"type": "ping", "request_id": "ping-during-query"})
+        pong = ws.receive_json()
+        assert pong["type"] == "pong"
+        assert pong["request_id"] == "ping-during-query"
+        response = ws.receive_json()
+        assert response["type"] == "chan_full"
+        assert response["request_id"] == "slow"
+
+
+def test_chart_ws_bounds_in_flight_requests_without_blocking_ping(monkeypatch) -> None:
+    calls = 0
+
+    async def slow_overlay(**_kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.1)
+        return ChanOverlayResponse(
+            symbol="000001.SZ", chart_timeframe="5f", levels=["5f", "30f", "1d"],
+            modes=["confirmed", "predictive"], snapshot_version="bounded",
+            base_timeframe="5f", base_ts_semantics="bar_end", engine="test",
+            requested_bar_count=20, bars_by_level={"5f": 20, "30f": 20, "1d": 20},
+            strokes=[], segments=[], centers=[], signals=[], channels=[],
+        )
+
+    monkeypatch.setattr(chart_ws, "build_chan_overlay", slow_overlay)
+    monkeypatch.setattr(chart_ws, "MAX_IN_FLIGHT_CHART_REQUESTS", 1)
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws/v2/chart?token=dev-local-token") as ws:
+        base = {"type": "get_chan", "symbol": "000001.SZ", "timeframe": "5f", "limit": 20}
+        ws.send_json({**base, "request_id": "first"})
+        ws.send_json({**base, "request_id": "rejected"})
+        ws.send_json({"type": "ping", "request_id": "still-responsive"})
+        messages = [ws.receive_json() for _ in range(3)]
+        types = [message["type"] for message in messages]
+        assert types.index("pong") < types.index("chan_full")
+        assert any(
+            message.get("request_id") == "rejected"
+            and message.get("error") == "Too many in-flight chart requests"
+            for message in messages
+        )
+        assert calls == 1
+
+
+def test_chart_ws_disconnect_cancels_in_flight_query(monkeypatch) -> None:
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    async def never_finishes(**_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(chart_ws, "build_chan_overlay", never_finishes)
+    client = TestClient(create_app())
+    try:
+        with client.websocket_connect("/ws/v2/chart?token=dev-local-token") as ws:
+            ws.send_json({
+                "type": "get_chan", "request_id": "cancel-me", "symbol": "000001.SZ",
+                "timeframe": "5f", "limit": 20,
+            })
+            assert started.wait(timeout=1)
+    except FutureCancelledError:
+        # Starlette's synchronous test transport cancels the ASGI future when
+        # exiting with an intentionally unfinished server task.
+        pass
+    assert cancelled.wait(timeout=1)
+
+
+def test_chart_ws_sender_serializes_all_producers() -> None:
+    class Socket:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.messages = []
+
+        async def send_json(self, payload):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0)
+            self.messages.append(payload)
+            self.active -= 1
+
+        async def close(self, **_kwargs):
+            pass
+
+    async def scenario():
+        socket = Socket()
+        sender = chart_ws._ChartSender(socket)
+        writer = asyncio.create_task(sender.run())
+        await asyncio.gather(*(
+            sender.send_json({"type": "event", "value": value})
+            for value in range(8)
+        ))
+        await sender._outbox.join()
+        writer.cancel()
+        await asyncio.gather(writer, return_exceptions=True)
+        assert socket.max_active == 1
+        assert len(socket.messages) == 8
+
+    asyncio.run(scenario())
+
+
+def test_chart_ws_sender_enforces_byte_budget(monkeypatch) -> None:
+    class Socket:
+        async def send_json(self, _payload):
+            return None
+
+    async def scenario():
+        monkeypatch.setattr(chart_ws, "MAX_CHART_OUTBOX_BYTES", 100)
+        monkeypatch.setattr(chart_ws, "CHART_SEND_TIMEOUT_SECONDS", 0.01)
+        sender = chart_ws._ChartSender(Socket())
+        await sender.send_json({"type": "event", "value": "x" * 45})
+        with pytest.raises(TimeoutError):
+            await sender.send_json({"type": "event", "value": "y" * 45})
+        with pytest.raises(ValueError, match="outbound byte budget"):
+            await sender.send_json({"type": "event", "value": "z" * 100})
+
+    asyncio.run(scenario())
+
+
+def test_chart_ws_global_query_slot_is_pool_linked_and_times_out(monkeypatch) -> None:
+    async def scenario():
+        assert chart_ws._chart_query_capacity(1) == 1
+        assert chart_ws._chart_query_capacity(8) == 7
+        semaphore = asyncio.Semaphore(1)
+        await semaphore.acquire()
+        adapter = chart_ws._RequestAdapter(
+            SimpleNamespace(state=SimpleNamespace(chart_query_semaphore=semaphore))
+        )
+        monkeypatch.setattr(chart_ws, "CHART_QUERY_SLOT_TIMEOUT_SECONDS", 0.01)
+        with pytest.raises(chart_ws.ChartQueryCapacityError, match="server is busy"):
+            async with chart_ws._chart_query_slot(adapter):
+                raise AssertionError("capacity guard was bypassed")
+
+    asyncio.run(scenario())
+
+
+def test_chart_ws_cleanup_has_a_total_deadline() -> None:
+    async def scenario():
+        release = asyncio.Event()
+
+        async def delays_cancellation():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        task = asyncio.create_task(delays_cancellation())
+        await asyncio.sleep(0)
+        started = time.monotonic()
+        await chart_ws._cancel_chart_tasks(task, timeout=0.01)
+        assert time.monotonic() - started < 0.2
+        assert not task.done()
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(scenario())
+
+
+def test_chart_ws_redis_client_has_read_timeout(monkeypatch) -> None:
+    import redis.asyncio as redis
+
+    captured = {}
+
+    class Client:
+        async def ping(self):
+            return True
+
+    def fake_from_url(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return Client()
+
+    async def scenario():
+        monkeypatch.setattr(redis, "from_url", fake_from_url)
+        client = await chart_ws._try_create_redis_client("redis://test")
+        assert client is not None
+        assert captured["socket_connect_timeout"] == 0.2
+        assert captured["socket_timeout"] == 0.5
+
+    asyncio.run(scenario())
 
 
 def test_chart_ws_subscribe_chan_emits_snapshot_and_delta(monkeypatch) -> None:

@@ -2821,8 +2821,46 @@ body[data-app-theme="dark"] .tv-watchlist-group-edit input {
 }
 
 .tv-strategy-signal-row {
-  grid-template-columns: 64px minmax(0, 1fr);
+  grid-template-columns: 64px minmax(0, 1fr) auto;
 }
+
+.tv-strategy-signal-row small,
+.tv-strategy-signal-row time,
+.tv-strategy-signal-row code {
+  color: #787b86;
+  font-size: 10px;
+}
+
+.tv-strategy-signal-row time,
+.tv-strategy-signal-row code {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chart-realtime-status {
+  position: absolute;
+  z-index: 4;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #d1d4dc;
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: rgb(255 255 255 / 88%);
+  color: #787b86;
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.chart-realtime-status strong { color: #2962ff; }
+.chart-realtime-status[data-state="live"] strong { color: #089981; }
+.chart-realtime-status[data-state="degraded"] strong { color: #f23645; }
+.chart-realtime-status span[data-state="live"] { color: #089981; }
+.chart-realtime-status span[data-state="degraded"] { color: #f23645; }
 
 .tv-chan-state-pill span,
 .tv-strategy-signal-row span {

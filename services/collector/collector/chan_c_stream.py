@@ -31,6 +31,7 @@ DB_TO_TIMEFRAME = {value.minutes: code for code, value in TIMEFRAMES.items()}
 DEFAULT_MODULE_C_CHAN_LEVELS = "5f,30f,1d,1w,1m"
 DEFAULT_TAIL_BAR_LIMIT = 2000
 DEFAULT_CONTEXT_BARS = 64
+REDIS_PUBLISH_ATTEMPTS = 3
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -394,6 +395,7 @@ async def process_symbol_tail(
                     publication_claim_token=str(job["claim_token"]),
                     publication_lease_version=int(job["lease_version"]),
                     publication_target_bar_end=claimed_target,
+                    expected_input_version=int(job["claimed_input_version"]),
                     expected_head_run_id=job.get("expected_head_run_id"),
                     expected_head_base_to_bar_end=job.get(
                         "expected_head_base_to_bar_end"
@@ -410,15 +412,24 @@ async def process_symbol_tail(
                     **counts,
                 )
                 if redis_url:
-                    await publish_chan_head_update(
-                        redis_url=redis_url,
-                        symbol=symbol,
-                        level=level,
-                        modes=[mode],
-                        bar_until=publication_bar_until,
-                        run_id=int(counts["run_id"]),
-                        snapshot_version=str(counts["snapshot_version"]),
-                    )
+                    published = False
+                    for _attempt in range(REDIS_PUBLISH_ATTEMPTS):
+                        published = await publish_chan_head_update(
+                            redis_url=redis_url,
+                            symbol=symbol,
+                            level=level,
+                            modes=[mode],
+                            bar_until=publication_bar_until,
+                            run_id=int(counts["run_id"]),
+                            snapshot_version=str(counts["snapshot_version"]),
+                        )
+                        if published:
+                            break
+                    if not published:
+                        raise RuntimeError(
+                            "Redis Chan head publication failed after "
+                            f"{REDIS_PUBLISH_ATTEMPTS} attempts: {symbol} {level} {mode}"
+                        )
                 runs += 1
     return runs
 

@@ -50,10 +50,23 @@ export type ChanStrokeState = {
 
 export type StrategySignal = {
   key: string;
+  eventId: string;
   label: string;
   value: string;
   tone: "up" | "down" | "neutral";
   source: "local_db";
+  eventType: string;
+  status: string;
+  sourceLevel: string | null;
+  sourceSignalType: string | null;
+  sourceSignalSide: string | null;
+  pointTime: string | null;
+  firstSeenTime: string | null;
+  confirmTime: string | null;
+  disappearTime: string | null;
+  sourceSnapshotVersion: string | null;
+  confidenceScore: number | null;
+  strengthScore: number | null;
 };
 
 export type SymbolProfile = ExternalMetadata & {
@@ -490,10 +503,23 @@ function parseLocalStrategySignals(value: unknown): StrategySignal[] {
     if (tone !== "up" && tone !== "down" && tone !== "neutral") throw new Error("profile.strategy_signals.tone is invalid");
     return {
       key: string(item.key, `profile.strategy_signals[${index}].key`),
+      eventId: string(item.event_id ?? item.eventId, `profile.strategy_signals[${index}].event_id`),
       label: string(item.label, `profile.strategy_signals[${index}].label`),
       value: string(item.value, `profile.strategy_signals[${index}].value`),
       tone,
       source: "local_db",
+      eventType: string(item.event_type ?? item.eventType, `profile.strategy_signals[${index}].event_type`),
+      status: string(item.status, `profile.strategy_signals[${index}].status`),
+      sourceLevel: readNullableString(item.source_level ?? item.sourceLevel, `profile.strategy_signals[${index}].source_level`),
+      sourceSignalType: readNullableString(item.source_signal_type ?? item.sourceSignalType, `profile.strategy_signals[${index}].source_signal_type`),
+      sourceSignalSide: readNullableString(item.source_signal_side ?? item.sourceSignalSide, `profile.strategy_signals[${index}].source_signal_side`),
+      pointTime: readNullableString(item.point_time ?? item.pointTime, `profile.strategy_signals[${index}].point_time`),
+      firstSeenTime: readNullableString(item.first_seen_time ?? item.firstSeenTime, `profile.strategy_signals[${index}].first_seen_time`),
+      confirmTime: readNullableString(item.confirm_time ?? item.confirmTime, `profile.strategy_signals[${index}].confirm_time`),
+      disappearTime: readNullableString(item.disappear_time ?? item.disappearTime, `profile.strategy_signals[${index}].disappear_time`),
+      sourceSnapshotVersion: readNullableString(item.source_snapshot_version ?? item.sourceSnapshotVersion, `profile.strategy_signals[${index}].source_snapshot_version`),
+      confidenceScore: readNullableNumber(item.confidence_score ?? item.confidenceScore, `profile.strategy_signals[${index}].confidence_score`),
+      strengthScore: readNullableNumber(item.strength_score ?? item.strengthScore, `profile.strategy_signals[${index}].strength_score`),
     };
   });
 }
@@ -520,6 +546,11 @@ function record(value: unknown, label: string): Record<string, unknown> {
 }
 function string(value: unknown, label: string): string {
   if (typeof value !== "string" || !value) throw new Error(`${label} must be a string`);
+  return value;
+}
+function readNullableString(value: unknown, label: string): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") throw new Error(`${label} must be a string or null`);
   return value;
 }
 function integer(value: unknown, label: string): number {

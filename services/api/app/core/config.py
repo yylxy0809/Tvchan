@@ -23,6 +23,12 @@ class Settings:
         "DATABASE_URL",
         "postgresql://trader:change-me-before-long-running@127.0.0.1:5432/tradingview_local",
     )
+    database_pool_min_size: int = field(
+        default_factory=lambda: int(os.getenv("DATABASE_POOL_MIN_SIZE", "1"))
+    )
+    database_pool_max_size: int = field(
+        default_factory=lambda: int(os.getenv("DATABASE_POOL_MAX_SIZE", "8"))
+    )
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     chan_lifecycle_observer: str = field(
         default_factory=lambda: os.getenv("CHAN_LIFECYCLE_OBSERVER", "chan-lifecycle-v1")
@@ -70,6 +76,12 @@ class Settings:
     wencai_timeout_seconds: float = float(os.getenv("WENCAI_TIMEOUT_SECONDS", "20"))
 
     def __post_init__(self) -> None:
+        if self.database_pool_min_size <= 0:
+            raise RuntimeError("DATABASE_POOL_MIN_SIZE must be greater than zero")
+        if self.database_pool_max_size < self.database_pool_min_size:
+            raise RuntimeError("DATABASE_POOL_MAX_SIZE must be at least DATABASE_POOL_MIN_SIZE")
+        if self.database_pool_max_size > 32:
+            raise RuntimeError("DATABASE_POOL_MAX_SIZE must be at most 32")
         if self.chan_lifecycle_observer_stale_seconds <= 0:
             raise RuntimeError("CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS must be greater than zero")
         if self.api_token and self.admin_api_token and self.api_token == self.admin_api_token:

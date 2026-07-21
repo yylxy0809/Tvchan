@@ -3,6 +3,7 @@
 import asyncio
 import zipfile
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -13,6 +14,7 @@ from collector.providers.pytdx_provider import (
     PytdxProvider,
     _is_a_share_code,
     _split_tdx_symbol,
+    _tdx_bar_to_bar,
 )
 from collector.market_fill import (
     bar_to_chan_payload,
@@ -125,6 +127,83 @@ def test_pytdx_timeout_is_configurable() -> None:
     provider = PytdxProvider(host="124.70.199.56", timeout=12, retries=4)
     assert provider.timeout == 12
     assert provider.retries == 4
+
+
+def test_pytdx_marks_the_open_intraday_period_incomplete() -> None:
+    item = {
+        "datetime": "2026-07-21 09:35",
+        "open": 10,
+        "high": 11,
+        "low": 9,
+        "close": 10.5,
+        "vol": 100,
+    }
+
+    open_bar = _tdx_bar_to_bar(
+        "000001.SZ",
+        "5f",
+        item,
+        now=datetime(2026, 7, 21, 9, 33, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    closed_bar = _tdx_bar_to_bar(
+        "000001.SZ",
+        "5f",
+        item,
+        now=datetime(2026, 7, 21, 9, 36, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert (open_bar.complete, open_bar.revision) == (False, 1)
+    assert (closed_bar.complete, closed_bar.revision) == (True, 0)
+
+
+def test_pytdx_close_boundary_requires_one_second_grace() -> None:
+    item = {
+        "datetime": "2026-07-21 09:35",
+        "open": 10,
+        "high": 11,
+        "low": 9,
+        "close": 10.5,
+        "vol": 100,
+    }
+
+    boundary = _tdx_bar_to_bar(
+        "000001.SZ", "5f", item,
+        now=datetime(2026, 7, 21, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    after_grace = _tdx_bar_to_bar(
+        "000001.SZ", "5f", item,
+        now=datetime(2026, 7, 21, 9, 35, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert boundary.complete is False
+    assert after_grace.complete is True
+
+
+def test_pytdx_weekly_period_closes_only_after_the_week() -> None:
+    item = {
+        "datetime": "2026-07-20",
+        "open": 10,
+        "high": 11,
+        "low": 9,
+        "close": 10.5,
+        "vol": 100,
+    }
+
+    current_week = _tdx_bar_to_bar(
+        "000001.SZ",
+        "1w",
+        item,
+        now=datetime(2026, 7, 24, 15, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    next_week = _tdx_bar_to_bar(
+        "000001.SZ",
+        "1w",
+        item,
+        now=datetime(2026, 7, 27, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert current_week.complete is False
+    assert next_week.complete is True
 
 
 @pytest.mark.parametrize("comparator_offset", [9, 11])
