@@ -45,6 +45,14 @@ import { ScreenerDock } from "./ScreenerDock";
 const DEFAULT_SYMBOL = "000001.SZ";
 const DEFAULT_TIMEFRAME = "5f";
 const DEFAULT_BAR_WINDOW_SIZE = 300;
+const INITIAL_REALTIME_FEEDBACK: RealtimeFeedback = {
+  state: "connecting",
+  channels: {
+    bars: { state: "connecting" },
+    chan: { state: "connecting" },
+  },
+  degradedChannels: [],
+};
 
 type ChartMode = "loading" | "tradingview" | "fallback";
 
@@ -95,7 +103,7 @@ export function ChartWorkspace({
   const remoteIndicatorSettingsReadyRef = useRef(false);
   const suppressNextIndicatorSettingsSyncRef = useRef(false);
   const [chartMode, setChartMode] = useState<ChartMode>("loading");
-  const [realtimeFeedback, setRealtimeFeedback] = useState<RealtimeFeedback>({ state: "connecting", channel: "bars" });
+  const [realtimeFeedback, setRealtimeFeedback] = useState<RealtimeFeedback>(INITIAL_REALTIME_FEEDBACK);
   const [feedbackNow, setFeedbackNow] = useState(Date.now);
   const [bars, setBars] = useState<ApiBar[]>([]);
   const [currentSymbol, setCurrentSymbol] = useState(loadInitialChartSymbol);
@@ -363,6 +371,7 @@ export function ChartWorkspace({
           if (!isCurrent() || controller.signal.aborted) return;
           hydrateBridge(overlay);
           paint(overlay);
+          chartDataManager.markChanOverlayLive();
         }).catch((error) => {
           if (!controller.signal.aborted && isCurrent()) {
             recordTvDebug(`chan.overlay.${source}.error`, {
@@ -607,10 +616,20 @@ export function ChartWorkspace({
         >
           {chartTheme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
         </button>
-        <div className="chart-realtime-status" data-state={realtimeFeedback.state} role="status" aria-live="polite">
+        <div
+          className="chart-realtime-status"
+          data-state={realtimeFeedback.state}
+          data-degraded-channels={realtimeFeedback.degradedChannels.join(",")}
+          role="status"
+          aria-live="polite"
+        >
           <strong>{realtimeStateLabel(realtimeFeedback.state)}</strong>
-          <span>{realtimeFeedback.channel === "bars" ? "K线" : "缠论"}</span>
-          <span>最近事件 {formatRealtimeAge(realtimeFeedback.lastEventAt, feedbackNow)}</span>
+          <span data-state={realtimeFeedback.channels.bars.state}>
+            K线 {realtimeStateLabel(realtimeFeedback.channels.bars.state)} / {formatRealtimeAge(realtimeFeedback.channels.bars.lastEventAt, feedbackNow)}
+          </span>
+          <span data-state={realtimeFeedback.channels.chan.state}>
+            缠论 {realtimeStateLabel(realtimeFeedback.channels.chan.state)} / {formatRealtimeAge(realtimeFeedback.channels.chan.lastEventAt, feedbackNow)}
+          </span>
         </div>
         {chartMode === "loading" ? (
           <div className="chart-loading">Loading TradingView</div>

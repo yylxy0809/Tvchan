@@ -2859,6 +2859,8 @@ body[data-app-theme="dark"] .tv-watchlist-group-edit input {
 .chart-realtime-status strong { color: #2962ff; }
 .chart-realtime-status[data-state="live"] strong { color: #089981; }
 .chart-realtime-status[data-state="degraded"] strong { color: #f23645; }
+.chart-realtime-status span[data-state="live"] { color: #089981; }
+.chart-realtime-status span[data-state="degraded"] { color: #f23645; }
 
 .tv-chan-state-pill span,
 .tv-strategy-signal-row span {

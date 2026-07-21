@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { ChartDataManager } from "./chartDataManager";
+import { ChartDataManager, type RealtimeFeedback } from "./chartDataManager";
 import { ChanRealtimeOverlayBridge } from "./chanRealtimeOverlayBridge";
 import { CHAN_DELTA_FIXTURE, CHAN_SNAPSHOT_FIXTURE } from "./chanRealtimeOverlayBridge.fixtures";
 import { installAsyncSubscription } from "../components/ChartWorkspace";
@@ -243,7 +243,7 @@ test("an initial realtime connection failure retains the subscription and retrie
   FakeWebSocket.instances = [];
   FakeWebSocket.failFirstConnection = true;
   const manager = new ChartDataManager();
-  const feedback: Array<{ state: string; lastEventAt?: number }> = [];
+  const feedback: RealtimeFeedback[] = [];
   const releaseFeedback = manager.subscribeRealtimeFeedback((event) => feedback.push(event));
   t.after(() => {
     manager.resetSession();
@@ -264,8 +264,71 @@ test("an initial realtime connection failure retains the subscription and retrie
   });
   assert.equal(feedback.some((event) => event.state === "connecting"), true);
   assert.equal(feedback.some((event) => event.state === "degraded"), true);
-  assert.equal(feedback[feedback.length - 1]?.state, "live");
+  assert.equal(feedback[feedback.length - 1]?.state, "connecting");
+  FakeWebSocket.instances[1].receive({ type: "subscribed", id: "bar:000001.SZ:5f" });
+  assert.equal(feedback[feedback.length - 1]?.channels.bars.state, "live");
+  assert.equal(feedback[feedback.length - 1]?.channels.chan.state, "connecting");
   release();
+});
+
+test("realtime feedback preserves bars and Chan state until each channel recovers", async (t) => {
+  const original = globalThis.WebSocket;
+  (globalThis as { WebSocket?: typeof WebSocket }).WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  FakeWebSocket.instances = [];
+  const manager = new ChartDataManager();
+  const feedback: RealtimeFeedback[] = [];
+  const releaseFeedback = manager.subscribeRealtimeFeedback((event) => feedback.push(event));
+  t.after(() => {
+    manager.resetSession();
+    releaseFeedback();
+    globalThis.WebSocket = original;
+  });
+
+  const releaseBars = await manager.subscribeRealtimeBars({
+    symbol: "000001.SZ", timeframe: "5f",
+  }, () => {}, () => {});
+  const releaseChan = await manager.subscribeChanOverlay({
+    symbol: "000001.SZ", timeframe: "5f", levels: ["5f", "30f", "1d"],
+    modes: ["confirmed", "predictive"], from: 100, to: 200, limit: 300,
+  }, () => {}, () => {});
+  await sleep(0);
+
+  const [barSocket, chanSocket] = FakeWebSocket.instances;
+  assert.equal(feedback[feedback.length - 1]?.state, "connecting");
+  barSocket.receive({ type: "subscribed", id: "bar:000001.SZ:5f" });
+  assert.equal(feedback[feedback.length - 1]?.channels.bars.state, "live");
+  assert.equal(feedback[feedback.length - 1]?.channels.chan.state, "connecting");
+
+  const chanSubscriptionId = (chanSocket.sent[0] as { id: string }).id;
+  chanSocket.receive({ type: "chan_subscribed", id: chanSubscriptionId });
+  assert.equal(feedback[feedback.length - 1]?.state, "live");
+
+  chanSocket.receive({ type: "chan_resync_required", id: chanSubscriptionId });
+  assert.equal(feedback[feedback.length - 1]?.state, "degraded");
+  assert.deepEqual(feedback[feedback.length - 1]?.degradedChannels, ["chan"]);
+  assert.equal(feedback[feedback.length - 1]?.channels.bars.state, "live");
+  assert.equal(feedback[feedback.length - 1]?.channels.chan.state, "degraded");
+
+  barSocket.receive({
+    type: "bar_update",
+    symbol: "000001.SZ",
+    timeframe: "5f",
+    bar: { time: 100, open: 1, high: 2, low: 1, close: 2, volume: 10, revision: 1, complete: false },
+  });
+  assert.deepEqual(feedback[feedback.length - 1]?.degradedChannels, ["chan"]);
+
+  manager.markChanOverlayLive();
+  assert.equal(feedback[feedback.length - 1]?.state, "live");
+  assert.deepEqual(feedback[feedback.length - 1]?.degradedChannels, []);
+  releaseBars();
+  releaseChan();
+});
+
+test("workspace renders independent bars and Chan realtime feedback", () => {
+  const source = readFileSync(new URL("../components/ChartWorkspace.tsx", import.meta.url), "utf8");
+  assert.match(source, /realtimeFeedback\.channels\.bars\.state/);
+  assert.match(source, /realtimeFeedback\.channels\.chan\.state/);
+  assert.match(source, /data-degraded-channels=\{realtimeFeedback\.degradedChannels\.join\(","\)\}/);
 });
 
 test("late widget subscription is disposed after StrictMode-style cleanup", async () => {

@@ -95,10 +95,15 @@ type ChanSubscriptionReply = WebSocketReply & {
 
 export type ChanOverlayTransportStatus = "connected" | "disconnected" | "replayed";
 type RealtimeTransportStatus = "connecting" | "connected" | "disconnected";
-
-export type RealtimeFeedback = {
+export type RealtimeChannel = "bars" | "chan";
+export type RealtimeChannelFeedback = {
   state: "connecting" | "live" | "degraded";
-  channel: "bars" | "chan";
+  lastEventAt?: number;
+};
+export type RealtimeFeedback = {
+  state: RealtimeChannelFeedback["state"];
+  channels: Record<RealtimeChannel, RealtimeChannelFeedback>;
+  degradedChannels: RealtimeChannel[];
   lastEventAt?: number;
 };
 
@@ -614,7 +619,7 @@ class RealtimeBarSocketClient {
           this.reconnectTimer = null;
         }
         this.notifySessionGeneration(socketGeneration);
-        this.notifyTransport("connected");
+        this.notifyTransport("connecting");
         this.replaySubscriptions(socket);
         resolve(socket);
       };
@@ -666,6 +671,13 @@ class RealtimeBarSocketClient {
     if (message.subscription_id) {
       const subscription = this.sidebarSubscriptions.get(message.subscription_id);
       subscription?.listeners.forEach((listener) => listener(message));
+      return;
+    }
+    if (message.type === "subscribed" && typeof message.id === "string") {
+      const subscription = this.subscriptions.get(message.id);
+      if (subscription) {
+        for (const listener of subscription.statusListeners) listener("connected");
+      }
       return;
     }
     if (message.type !== "bar_update" || !message.bar) {
@@ -811,7 +823,10 @@ export class ChartDataManager {
   private sessionChanOverlays = new Map<string, ChanOverlayResponse>();
   private snapshotListeners = new Set<(event: SnapshotUpdateEvent) => void>();
   private realtimeFeedbackListeners = new Set<(event: RealtimeFeedback) => void>();
-  private realtimeFeedbackByChannel = new Map<RealtimeFeedback["channel"], RealtimeFeedback>();
+  private realtimeFeedbackByChannel: Record<RealtimeChannel, RealtimeChannelFeedback> = {
+    bars: { state: "connecting" },
+    chan: { state: "connecting" },
+  };
   private wsClient = new ChartWebSocketClient();
   private realtimeClient = new RealtimeBarSocketClient();
   private wsDisabledUntil = 0;
@@ -828,7 +843,10 @@ export class ChartDataManager {
     this.latestRealtimeVersions.clear();
     this.realtimeBarStates.clear();
     this.realtimeSessionGenerations.clear();
-    this.realtimeFeedbackByChannel.clear();
+    this.realtimeFeedbackByChannel = {
+      bars: { state: "connecting" },
+      chan: { state: "connecting" },
+    };
     this.wsDisabledUntil = 0;
   }
 
@@ -852,7 +870,12 @@ export class ChartDataManager {
 
   subscribeRealtimeFeedback(listener: (event: RealtimeFeedback) => void): () => void {
     this.realtimeFeedbackListeners.add(listener);
+    listener(this.currentRealtimeFeedback());
     return () => this.realtimeFeedbackListeners.delete(listener);
+  }
+
+  markChanOverlayLive(): void {
+    this.notifyRealtimeFeedback("chan", { state: "live", lastEventAt: Date.now() });
   }
 
   publishHistoryWindow(event: ChartHistoryWindowEvent): void {
@@ -1066,15 +1089,21 @@ export class ChartDataManager {
       (message) => {
         if (!message || typeof message !== "object") return;
         const type = (message as { type?: unknown }).type;
-        if (type === "chan_overlay" || type === "chan_resync_required") {
-          this.notifyRealtimeFeedback({ state: "live", channel: "chan", lastEventAt: Date.now() });
+        if (type === "chan_subscribed") {
+          this.notifyRealtimeFeedback("chan", { state: "live" });
+          return;
+        }
+        if (type === "chan_overlay") {
+          this.markChanOverlayLive();
+          listener(message);
+        } else if (type === "chan_resync_required") {
+          this.notifyRealtimeFeedback("chan", { state: "degraded", lastEventAt: Date.now() });
           listener(message);
         }
       },
       (status) => {
-        this.notifyRealtimeFeedback({
-          state: status === "connected" || status === "replayed" ? "live" : "degraded",
-          channel: "chan",
+        this.notifyRealtimeFeedback("chan", {
+          state: status === "disconnected" ? "degraded" : "connecting",
         });
         statusListener(status);
       },
@@ -1104,7 +1133,7 @@ export class ChartDataManager {
         }
         const symbol = String(message.symbol ?? request.symbol).toUpperCase();
         const timeframe = String(message.timeframe ?? request.timeframe);
-        this.notifyRealtimeFeedback({ state: "live", channel: "bars", lastEventAt: Date.now() });
+        this.notifyRealtimeFeedback("bars", { state: "live", lastEventAt: Date.now() });
         listener({
           symbol,
           timeframe,
@@ -1115,9 +1144,8 @@ export class ChartDataManager {
         });
       },
       sessionListener,
-      (status) => this.notifyRealtimeFeedback({
+      (status) => this.notifyRealtimeFeedback("bars", {
         state: status === "connected" ? "live" : status === "connecting" ? "connecting" : "degraded",
-        channel: "bars",
       }),
     );
   }
@@ -1850,25 +1878,37 @@ export class ChartDataManager {
     }
   }
 
-  private notifyRealtimeFeedback(event: RealtimeFeedback): void {
-    const previous = this.realtimeFeedbackByChannel.get(event.channel);
-    this.realtimeFeedbackByChannel.set(event.channel, {
+  private notifyRealtimeFeedback(channel: RealtimeChannel, event: RealtimeChannelFeedback): void {
+    const previous = this.realtimeFeedbackByChannel[channel];
+    this.realtimeFeedbackByChannel[channel] = {
       ...event,
-      lastEventAt: event.lastEventAt ?? previous?.lastEventAt,
-    });
-    const channels = [...this.realtimeFeedbackByChannel.values()];
-    const state = channels.some((item) => item.state === "degraded")
+      lastEventAt: event.lastEventAt ?? previous.lastEventAt,
+    };
+    const feedback = this.currentRealtimeFeedback();
+    for (const listener of this.realtimeFeedbackListeners) listener(feedback);
+  }
+
+  private currentRealtimeFeedback(): RealtimeFeedback {
+    const channels = {
+      bars: { ...this.realtimeFeedbackByChannel.bars },
+      chan: { ...this.realtimeFeedbackByChannel.chan },
+    };
+    const values = Object.values(channels);
+    const degradedChannels = (["bars", "chan"] as const).filter(
+      (channel) => channels[channel].state === "degraded",
+    );
+    const state = degradedChannels.length > 0
       ? "degraded"
-      : channels.some((item) => item.state === "connecting")
+      : values.some((item) => item.state === "connecting")
         ? "connecting"
         : "live";
-    const lastEventAt = Math.max(...channels.map((item) => item.lastEventAt ?? 0));
-    const feedback: RealtimeFeedback = {
+    const lastEventAt = Math.max(...values.map((item) => item.lastEventAt ?? 0));
+    return {
       state,
-      channel: event.channel,
+      channels,
+      degradedChannels,
       ...(lastEventAt > 0 ? { lastEventAt } : {}),
     };
-    for (const listener of this.realtimeFeedbackListeners) listener(feedback);
   }
 }
 

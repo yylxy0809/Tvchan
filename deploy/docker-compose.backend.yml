@@ -132,7 +132,7 @@ services:
     ports:
       - "${WEB_GATEWAY_BIND:-0.0.0.0}:${WEB_GATEWAY_PORT:-8080}:80"
     healthcheck:
-      test: ["CMD-SHELL", "test -s /usr/share/nginx/html/index.html && test -s /usr/share/nginx/html/charting_library/charting_library.js && wget -qO- http://127.0.0.1/healthz >/dev/null"]
+      test: ["CMD-SHELL", "test -s /usr/share/nginx/html/index.html && (test -s /usr/share/nginx/html/charting_library/charting_library.js || test -s /usr/share/nginx/html/charting_library/charting_library.standalone.js) && wget -qO- http://127.0.0.1/healthz >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 10

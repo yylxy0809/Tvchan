@@ -34,5 +34,13 @@ test("gateway keeps entry configuration uncached and versioned runtime assets im
   assert.match(source, /location = \/app-config\.js[\s\S]*no-store/);
   assert.match(source, /location = \/index\.html[\s\S]*no-store/);
   assert.match(source, /location \/assets\/[\s\S]*max-age=31536000, immutable/);
-  assert.match(source, /location \/charting_library\/[\s\S]*max-age=31536000, immutable/);
+  assert.match(source, /location \/charting_library\/[\s\S]*max-age=0, must-revalidate/);
+  assert.doesNotMatch(source, /location \/charting_library\/[\s\S]*immutable/);
+});
+
+test("gateway health accepts either supported TradingView entrypoint", () => {
+  const source = readFileSync(new URL("../../../deploy/docker-compose.backend.yml", import.meta.url), "utf8");
+  const healthcheck = source.split("container_name: tv_backend_web_gateway")[1]?.split("restart: unless-stopped")[0] ?? "";
+
+  assert.match(healthcheck, /charting_library\.js \|\| test -s .*charting_library\.standalone\.js/);
 });
