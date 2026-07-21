@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -10,6 +11,7 @@ from .config import Settings, get_settings
 
 bearer = HTTPBearer(auto_error=False)
 AUTHENTICATION_SERVICE_UNAVAILABLE = "Authentication service unavailable"
+WEBSOCKET_BEARER_PROTOCOL_PREFIX = "tvchan.bearer."
 
 
 class AuthenticationServiceUnavailable(RuntimeError):
@@ -26,6 +28,25 @@ class TokenPrincipal:
 
 def hash_token(token: str) -> str:
     return sha256(token.encode("utf-8")).hexdigest()
+
+
+def websocket_token_value(websocket) -> str | None:
+    """Read browser WebSocket credentials without putting them in the URL."""
+    for protocol in websocket.scope.get("subprotocols", ()):
+        if not protocol.startswith(WEBSOCKET_BEARER_PROTOCOL_PREFIX):
+            continue
+        encoded = protocol.removeprefix(WEBSOCKET_BEARER_PROTOCOL_PREFIX)
+        if not encoded or len(encoded) > 4096:
+            return None
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            token = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return token or None
+    # Temporary compatibility for non-browser clients. The web application never
+    # uses this path, so its credential cannot appear in proxy or ASGI URL logs.
+    return websocket.query_params.get("token")
 
 
 def effective_admin_token(settings: Settings) -> str:

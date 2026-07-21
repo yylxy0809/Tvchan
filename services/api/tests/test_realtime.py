@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import CancelledError as FutureCancelledError
 import json
 import threading
@@ -26,6 +27,11 @@ from app.routes import realtime
 from app.market_sidebar.service import SidebarContext
 
 
+def _ws_bearer_protocol(token: str) -> str:
+    encoded = base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
+    return f"tvchan.bearer.{encoded}"
+
+
 def test_realtime_rejects_bad_token() -> None:
     client = TestClient(create_app())
     try:
@@ -35,6 +41,15 @@ def test_realtime_rejects_bad_token() -> None:
         pass
 
 
+def test_realtime_accepts_bearer_subprotocol_without_query_token() -> None:
+    client = TestClient(create_app())
+    with client.websocket_connect(
+        "/ws/v1/realtime", subprotocols=[_ws_bearer_protocol("dev-local-token")]
+    ) as ws:
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+
+
 def test_chart_ws_rejects_bad_token() -> None:
     client = TestClient(create_app())
     try:
@@ -42,6 +57,15 @@ def test_chart_ws_rejects_bad_token() -> None:
             raise AssertionError("websocket should not connect")
     except Exception:
         pass
+
+
+def test_chart_ws_accepts_bearer_subprotocol_without_query_token() -> None:
+    client = TestClient(create_app())
+    with client.websocket_connect(
+        "/ws/v2/chart", subprotocols=[_ws_bearer_protocol("dev-local-token")]
+    ) as ws:
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
 
 
 def test_chart_ws_request_response_protocol(monkeypatch) -> None:
