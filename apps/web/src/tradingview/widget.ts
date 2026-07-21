@@ -738,6 +738,12 @@ async function renderChanStudy(
     const effectiveSettings = existingId === undefined
       ? settings
       : readCurrentChanStudySettings(chart, existingId, settings);
+    const shouldRecreate = existingId !== undefined && existingDatasetKey !== datasetKey;
+    if (shouldRecreate) {
+      if (!isCurrent()) return false;
+      removeChanStudy(widget, chart);
+      existingId = undefined;
+    }
     const studyId = await ensureChanStudy(widget, effectiveSettings, isCurrent);
     if (studyId !== undefined) {
       if (!isCurrent()) return false;
@@ -755,9 +761,9 @@ async function renderChanStudy(
       ready: studyId !== undefined,
       studyId: studyId ?? null,
       datasetKey,
-      recreated: false,
+      recreated: shouldRecreate,
       reused: existingId !== undefined && existingDatasetKey === datasetKey,
-      settingsPreserved: existingId !== undefined,
+      settingsPreserved: existingDatasetKey !== undefined,
     });
     return studyId !== undefined;
   } catch (error) {
