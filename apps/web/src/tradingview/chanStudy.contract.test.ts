@@ -347,17 +347,26 @@ test("mid-render stale fence leaves Pine state and study objects untouched", asy
   }
 });
 
-test("a changed overlay dataset recreates the Pine study to recalculate plots", async () => {
+test("a changed overlay dataset refreshes the Pine study without recreating it", async () => {
   const originalWindow = globalThis.window;
   const originalSetInterval = globalThis.setInterval;
   const originalClearInterval = globalThis.clearInterval;
   const activeStudies = new Set<string>();
   const removed: string[] = [];
   let creates = 0;
+  const inputUpdates: ReturnType<typeof studyInputItemsFromSettings>[] = [];
   const settings = createDefaultChanOverlaySettings();
+  let inputValues = studyInputItemsFromSettings(settings);
   const study = {
     applyOverrides: () => {},
-    getInputValues: () => studyInputItemsFromSettings(settings),
+    getInputValues: () => inputValues,
+    setInputValues: (values: ReturnType<typeof studyInputItemsFromSettings>) => {
+      inputValues = [
+        ...inputValues.filter((current) => !values.some((next) => next.id === current.id)),
+        ...values,
+      ];
+      inputUpdates.push(values);
+    },
     setUserEditEnabled: () => {},
   };
   const chart = {
@@ -389,8 +398,65 @@ test("a changed overlay dataset recreates the Pine study to recalculate plots", 
     assert.equal(await __CHAN_WIDGET_RENDER_TESTING__.renderChanStudy(
       widget as never, studyOverlay(13), settings, [],
     ), true);
+    assert.equal(creates, 1);
+    assert.deepEqual(removed, []);
+    assert.equal(inputUpdates.length, 1);
+    assert.equal(inputUpdates[0].some((item) => item.id === "__overlay_revision"), true);
+    assert.equal(inputValues.some((item) => item.id === "show_strokes"), true);
+  } finally {
+    Object.assign(globalThis, {
+      window: originalWindow,
+      setInterval: originalSetInterval,
+      clearInterval: originalClearInterval,
+    });
+  }
+});
+
+test("a failed in-place Pine refresh recreates the study as a safe fallback", async () => {
+  const originalWindow = globalThis.window;
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const activeStudies = new Set<string>();
+  const removed: string[] = [];
+  let creates = 0;
+  const settings = createDefaultChanOverlaySettings();
+  const study = {
+    applyOverrides: () => {},
+    getInputValues: () => studyInputItemsFromSettings(settings),
+    setInputValues: () => { throw new Error("refresh unsupported"); },
+    setUserEditEnabled: () => {},
+  };
+  const chart = {
+    createStudy: async () => {
+      const id = `fallback-study-${++creates}`;
+      activeStudies.add(id);
+      return id;
+    },
+    getStudyById: (id: string) => {
+      if (!activeStudies.has(id)) throw new Error("study missing");
+      return study;
+    },
+    removeEntity: (id: string) => {
+      removed.push(id);
+      activeStudies.delete(id);
+    },
+  };
+  const widget = {
+    activeChart: () => chart,
+    onChartReady: (callback: () => void) => callback(),
+  };
+  Object.assign(globalThis, { window: globalThis });
+  globalThis.setInterval = (() => 1) as unknown as typeof globalThis.setInterval;
+  globalThis.clearInterval = (() => {}) as unknown as typeof globalThis.clearInterval;
+  try {
+    assert.equal(await __CHAN_WIDGET_RENDER_TESTING__.renderChanStudy(
+      widget as never, studyOverlay(12), settings, [],
+    ), true);
+    assert.equal(await __CHAN_WIDGET_RENDER_TESTING__.renderChanStudy(
+      widget as never, studyOverlay(13), settings, [],
+    ), true);
     assert.equal(creates, 2);
-    assert.deepEqual(removed, ["study-1"]);
+    assert.deepEqual(removed, ["fallback-study-1"]);
   } finally {
     Object.assign(globalThis, {
       window: originalWindow,

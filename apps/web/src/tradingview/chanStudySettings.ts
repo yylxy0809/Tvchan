@@ -20,6 +20,7 @@ type StudyInputDefinition = {
   min?: number;
   max?: number;
   step?: number;
+  isHidden?: boolean;
 };
 
 type PineInputGetter = (index: number) => StudyInputValue;
@@ -42,7 +43,9 @@ const LEVEL_LABELS: Record<ChanLevel, string> = {
   "1d": "日线",
 };
 
-export const CHAN_STUDY_INPUTS: StudyInputDefinition[] = [
+export const CHAN_STUDY_REFRESH_INPUT_ID = "__overlay_revision";
+
+const USER_CHAN_STUDY_INPUTS: StudyInputDefinition[] = [
   boolInput("show_5f", "显示 5f 级别", true),
   boolInput("show_30f", "显示 30f 级别", true),
   boolInput("show_1d", "显示日线级别", true),
@@ -79,6 +82,20 @@ export const CHAN_STUDY_INPUTS: StudyInputDefinition[] = [
     colorInput(`${level}_sell_color`, `${LEVEL_LABELS[level]} 卖点标签背景`),
     colorInput(`${level}_sell_text_color`, `${LEVEL_LABELS[level]} 卖点文字`),
   ]),
+];
+
+export const CHAN_STUDY_INPUTS: StudyInputDefinition[] = [
+  ...USER_CHAN_STUDY_INPUTS,
+  {
+    id: CHAN_STUDY_REFRESH_INPUT_ID,
+    name: "Overlay revision",
+    type: "integer",
+    defval: 0,
+    min: 0,
+    max: 2147483647,
+    step: 1,
+    isHidden: true,
+  },
 ];
 
 export const DEFAULT_CHAN_STUDY_INPUTS: Record<string, StudyInputValue> =
@@ -179,7 +196,7 @@ export function studyInputItemsFromSettings(
   settings: ChanOverlaySettings,
 ): StudyInputValueItem[] {
   const values = chanOverlaySettingsToStudyInputs(settings);
-  return CHAN_STUDY_INPUTS.map((input) => ({
+  return USER_CHAN_STUDY_INPUTS.map((input) => ({
     id: input.id,
     value: values[input.id],
   }));
