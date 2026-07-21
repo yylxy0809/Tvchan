@@ -132,7 +132,7 @@ def test_upsert_prevents_lower_priority_and_derived_overwrites() -> None:
     sql = asyncio.run(scenario())
     normalized_sql = " ".join(sql.lower().split())
 
-    assert "where (" in normalized_sql
+    assert "where not (klines.is_complete and not excluded.is_complete)" in normalized_sql
     assert "excluded.source" in normalized_sql
     assert "when 2 then 6" in normalized_sql
     assert "when 8 then 2" in normalized_sql
@@ -170,6 +170,73 @@ def test_writer_uses_persisted_coverage_not_physical_parquet_rows_for_priority()
     assert "from klines covered" not in sql
 
 
+def test_writer_updates_changed_open_bar_and_never_downgrades_closed_bar() -> None:
+    async def scenario() -> str:
+        conn = FakeConnection()
+        writer = PostgresKlineWriter("postgresql://example")
+        await writer._upsert_bars_rows(
+            conn,
+            [
+                bar_to_db_values(
+                    Bar(
+                        "000001.SZ",
+                        "5f",
+                        datetime(2026, 7, 21, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai")),
+                        10,
+                        11,
+                        9,
+                        10.5,
+                        100,
+                        complete=False,
+                        revision=1,
+                        source="pytdx",
+                    )
+                )
+            ],
+        )
+        return next(sql for sql, _rows in conn.executemany_calls if "insert into klines" in sql)
+
+    normalized = " ".join(asyncio.run(scenario()).lower().split())
+
+    assert "klines.is_complete and not excluded.is_complete" in normalized
+    assert "is distinct from" in normalized
+    assert "klines.revision + 1" in normalized
+
+
+def test_watermark_changes_only_for_a_new_or_revised_canonical_bar() -> None:
+    async def scenario() -> str:
+        conn = FakeConnection(symbol_rows=[{"symbol_id": 7, "symbol": "000001.SZ"}])
+        writer = PostgresKlineWriter("postgresql://example")
+        await writer._upsert_bars_rows(
+            conn,
+            [
+                bar_to_db_values(
+                    Bar(
+                        "000001.SZ",
+                        "5f",
+                        datetime(2026, 7, 21, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai")),
+                        10,
+                        11,
+                        9,
+                        10.5,
+                        100,
+                        complete=False,
+                        revision=1,
+                        source="pytdx",
+                    )
+                )
+            ],
+        )
+        return next(sql for sql, _args in conn.executes if "scheme2_ingest_watermarks" in sql)
+
+    normalized = " ".join(asyncio.run(scenario()).lower().split())
+
+    assert "join klines" in normalized
+    assert "canonical.updated_at" in normalized
+    assert "note, updated_at" in normalized
+    assert "excluded.updated_at > scheme2_ingest_watermarks.updated_at" in normalized
+
+
 def test_writer_records_distinct_scope_bounds_in_the_kline_transaction(monkeypatch) -> None:
     first = datetime(2026, 7, 10, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai"))
     last = datetime(2026, 7, 10, 9, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -193,8 +260,44 @@ def test_writer_records_distinct_scope_bounds_in_the_kline_transaction(monkeypat
     assert result == 2
     assert recorded == [(7, 5, first, last)]
     assert conn.events.index("klines-upsert") < conn.events.index("catalog-present")
+    assert conn.events.index("klines-upsert") < conn.events.index("watermark-upsert")
+    assert conn.events.index("watermark-upsert") < conn.events.index("commit")
     assert conn.events[0] == "begin"
     assert conn.events[-1] == "commit"
+
+
+def test_writer_reads_back_the_exact_canonical_winner_for_publication() -> None:
+    timestamp = datetime(2026, 7, 10, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class CanonicalConnection:
+        def __init__(self) -> None:
+            self.args = None
+
+        async def fetchrow(self, sql, *args):
+            assert "from klines k" in sql.lower()
+            self.args = args
+            return {
+                "ts": timestamp,
+                "open_x1000": 10000,
+                "high_x1000": 11000,
+                "low_x1000": 9000,
+                "close_x1000": 10800,
+                "volume": 123,
+                "amount_x100": 45600,
+                "is_complete": True,
+                "revision": 4,
+                "source": 4,
+            }
+
+    conn = CanonicalConnection()
+    writer = PostgresKlineWriter("postgresql://example")
+    writer._pool = FakePool(conn)
+
+    bar = asyncio.run(writer.get_canonical_bar("000001.SZ", "5f", timestamp))
+
+    assert conn.args == ("000001.SZ", 5, timestamp)
+    assert bar is not None
+    assert (bar.close, bar.revision, bar.source) == (10.8, 4, "parquet_5f")
 
 
 def test_market_claim_rejection_writes_neither_klines_nor_catalog(monkeypatch) -> None:

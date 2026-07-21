@@ -54,12 +54,7 @@ def source_priority_case(column: str, *, timestamp: str | None = None, coverage_
 
 def bar_to_db_values(bar: Bar) -> tuple:
     timeframe = normalize_timeframe(bar.timeframe)
-    local = bar.ts.astimezone(ZoneInfo("Asia/Shanghai"))
-    ts = canonical_kline_timestamp(
-        timeframe,
-        bar.ts,
-        date_only=timeframe in {"1d", "1w", "1m"} and (local.hour, local.minute) == (0, 0),
-    )
+    ts = canonical_bar_timestamp(timeframe, bar.ts)
     return (
         bar.symbol,
         timeframe_to_db_code(timeframe),
@@ -73,6 +68,17 @@ def bar_to_db_values(bar: Bar) -> tuple:
         bar.complete,
         bar.revision,
         source_to_code(bar.source),
+    )
+
+
+def canonical_bar_timestamp(timeframe: str, timestamp: datetime) -> datetime:
+    normalized = normalize_timeframe(timeframe)
+    local = timestamp.astimezone(ZoneInfo("Asia/Shanghai"))
+    return canonical_kline_timestamp(
+        normalized,
+        timestamp,
+        date_only=normalized in {"1d", "1w", "1m"}
+        and (local.hour, local.minute) == (0, 0),
     )
 
 
@@ -370,6 +376,13 @@ class PostgresKlineWriter:
             where coverage.symbol_id = klines.symbol_id
               and coverage.timeframe = klines.timeframe
               and coverage.source in (4, 9))"""
+        payload_changed = """row(
+                excluded.open_x1000, excluded.high_x1000, excluded.low_x1000,
+                excluded.close_x1000, excluded.volume, excluded.amount_x100
+            ) is distinct from row(
+                klines.open_x1000, klines.high_x1000, klines.low_x1000,
+                klines.close_x1000, klines.volume, klines.amount_x100
+            )"""
         await conn.executemany(
             f"""
             insert into klines (
@@ -410,17 +423,25 @@ class PostgresKlineWriter:
                 volume = excluded.volume,
                 amount_x100 = excluded.amount_x100,
                 is_complete = excluded.is_complete,
-                revision = excluded.revision,
+                revision = greatest(excluded.revision, klines.revision + 1),
                 source = excluded.source,
                 updated_at = now()
-            where ({source_priority_case('excluded.source', timestamp='excluded.ts', coverage_end=coverage_end)}) > ({source_priority_case('klines.source', timestamp='klines.ts', coverage_end=coverage_end)})
-               or (
-                    ({source_priority_case('excluded.source', timestamp='excluded.ts', coverage_end=coverage_end)}) = ({source_priority_case('klines.source', timestamp='klines.ts', coverage_end=coverage_end)})
-                    and (
-                        excluded.revision > klines.revision
-                        or (excluded.is_complete and not klines.is_complete)
+            where not (klines.is_complete and not excluded.is_complete)
+              and (
+                    ({source_priority_case('excluded.source', timestamp='excluded.ts', coverage_end=coverage_end)}) > ({source_priority_case('klines.source', timestamp='klines.ts', coverage_end=coverage_end)})
+                    or (
+                        ({source_priority_case('excluded.source', timestamp='excluded.ts', coverage_end=coverage_end)}) = ({source_priority_case('klines.source', timestamp='klines.ts', coverage_end=coverage_end)})
+                        and (
+                            excluded.revision > klines.revision
+                            or (excluded.is_complete and not klines.is_complete)
+                            or (
+                                not excluded.is_complete
+                                and not klines.is_complete
+                                and ({payload_changed})
+                            )
+                        )
                     )
-               )
+              )
             """,
             rows,
         )
@@ -448,6 +469,64 @@ class PostgresKlineWriter:
                 for (symbol, timeframe), bounds in sorted(scope_bounds.items())
                 if symbol in symbol_ids
             ],
+        )
+        await self._upsert_ingest_watermarks(
+            conn,
+            scopes=[
+                (symbol_ids[symbol], timeframe, bounds[1])
+                for (symbol, timeframe), bounds in sorted(scope_bounds.items())
+                if symbol in symbol_ids
+            ],
+        )
+
+    async def _upsert_ingest_watermarks(
+        self,
+        conn,
+        *,
+        scopes: list[tuple[int, int, datetime]],
+    ) -> None:
+        if not scopes:
+            return
+        await conn.execute(
+            """
+            insert into scheme2_ingest_watermarks (
+                symbol_id,
+                timeframe,
+                last_bar_end,
+                source,
+                note,
+                updated_at
+            )
+            select
+                target.symbol_id,
+                target.timeframe,
+                target.last_bar_end,
+                'canonical-kline-writer',
+                'advanced atomically with canonical K-line upsert',
+                canonical.updated_at
+            from unnest($1::integer[], $2::integer[], $3::timestamptz[])
+                as target(symbol_id, timeframe, last_bar_end)
+            join klines canonical
+              on canonical.symbol_id = target.symbol_id
+             and canonical.timeframe = target.timeframe
+             and canonical.ts = target.last_bar_end
+            on conflict (symbol_id, timeframe) do update
+            set last_bar_end = greatest(
+                    coalesce(scheme2_ingest_watermarks.last_bar_end, excluded.last_bar_end),
+                    excluded.last_bar_end
+                ),
+                source = excluded.source,
+                note = excluded.note,
+                updated_at = excluded.updated_at
+            where excluded.last_bar_end > scheme2_ingest_watermarks.last_bar_end
+               or (
+                    excluded.last_bar_end = scheme2_ingest_watermarks.last_bar_end
+                    and excluded.updated_at > scheme2_ingest_watermarks.updated_at
+               )
+            """,
+            [scope[0] for scope in scopes],
+            [scope[1] for scope in scopes],
+            [scope[2] for scope in scopes],
         )
 
     async def _register_source_coverage(self, conn, rows: list[tuple]) -> None:
@@ -523,6 +602,56 @@ class PostgresKlineWriter:
                 limit=None,
             )
         return _rows_to_canonical_bars(symbol, timeframe, rows)
+
+    async def get_canonical_bar(
+        self,
+        symbol: str,
+        timeframe: str,
+        timestamp: datetime,
+    ) -> Bar | None:
+        assert self._pool is not None
+        normalized = normalize_timeframe(timeframe)
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                select
+                    k.ts,
+                    k.open_x1000,
+                    k.high_x1000,
+                    k.low_x1000,
+                    k.close_x1000,
+                    k.volume,
+                    k.amount_x100,
+                    k.is_complete,
+                    k.revision,
+                    k.source
+                from klines k
+                join symbols s on s.id = k.symbol_id
+                where s.code = split_part($1, '.', 1)
+                  and s.exchange = split_part($1, '.', 2)
+                  and k.timeframe = $2
+                  and k.ts = $3
+                """,
+                symbol,
+                timeframe_to_db_code(normalized),
+                canonical_bar_timestamp(normalized, timestamp),
+            )
+        if row is None:
+            return None
+        return Bar(
+            symbol=symbol,
+            timeframe=normalized,
+            ts=row["ts"],
+            open=row["open_x1000"] / 1000,
+            high=row["high_x1000"] / 1000,
+            low=row["low_x1000"] / 1000,
+            close=row["close_x1000"] / 1000,
+            volume=row["volume"],
+            amount=None if row["amount_x100"] is None else row["amount_x100"] / 100,
+            complete=row["is_complete"],
+            revision=row["revision"],
+            source=code_to_source(row["source"]),
+        )
 
     async def get_bars_chunk(
         self,

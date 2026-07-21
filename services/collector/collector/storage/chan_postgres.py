@@ -697,7 +697,8 @@ class PostgresChanWriter:
             published_heads_table = self.tables["published_heads"]
             head = await conn.fetchrow(
                 f"""
-                select run_id, base_from_bar_end, base_to_bar_end, snapshot_version
+                select run_id, base_from_bar_end, base_to_bar_end, snapshot_version,
+                       updated_at
                 from {published_heads_table}
                 where symbol_id = $1
                   and chan_level = $2
@@ -732,9 +733,29 @@ class PostgresChanWriter:
                     f"Stale Chan head endpoint for {symbol} {level}: expected {expected_head_base_to_bar_end}, "
                     f"got {head['base_to_bar_end']}"
                 )
-            if (
-                head["base_to_bar_end"] is not None
-                and bar_until <= head["base_to_bar_end"]
+            same_endpoint_revision = False
+            if head["base_to_bar_end"] is not None and bar_until == head["base_to_bar_end"]:
+                same_endpoint_revision = bool(
+                    await conn.fetchval(
+                        """
+                        select exists (
+                            select 1
+                            from klines kline
+                            where kline.symbol_id = $1
+                              and kline.timeframe = $2
+                              and kline.ts = $3
+                              and kline.updated_at > $4
+                        )
+                        """,
+                        symbol_id,
+                        base_timeframe_code,
+                        bar_until,
+                        head["updated_at"],
+                    )
+                )
+            if head["base_to_bar_end"] is not None and (
+                bar_until < head["base_to_bar_end"]
+                or (bar_until == head["base_to_bar_end"] and not same_endpoint_revision)
             ):
                 raise StaleChanHeadError(
                     f"Refusing to publish non-advancing Chan tail for {symbol} {level}: {bar_until}"
@@ -1275,7 +1296,7 @@ class PostgresChanWriter:
         for mode in modes:
             result = await conn.execute(
                 f"""
-                update {table}
+                update {table} as head
                 set base_from_bar_end = $5,
                     base_to_bar_end = $6,
                     bar_count = $7,
@@ -1295,6 +1316,17 @@ class PostgresChanWriter:
                   and (
                       base_to_bar_end is null
                       or base_to_bar_end < $6
+                      or (
+                          base_to_bar_end = $6
+                          and exists (
+                              select 1
+                              from klines kline
+                              where kline.symbol_id = $1
+                                and kline.timeframe = $4
+                                and kline.ts = $6
+                                and kline.updated_at > head.updated_at
+                          )
+                      )
                   )
                 """,
                 symbol_id,

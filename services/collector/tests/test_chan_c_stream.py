@@ -341,6 +341,24 @@ def test_chan_c_stream_uses_frozen_module_c_semantic_hash_for_tail_runs() -> Non
     assert "tail_config_hash=MODULE_C_CONFIG_HASH" in source.read_text(encoding="utf-8")
 
 
+def test_chan_c_stream_discovers_and_publishes_same_endpoint_revisions() -> None:
+    storage_source = (
+        Path(__file__).resolve().parents[1]
+        / "collector"
+        / "storage"
+        / "chan_c_stream_postgres.py"
+    ).read_text(encoding="utf-8")
+    writer_source = (
+        Path(__file__).resolve().parents[1]
+        / "collector"
+        / "storage"
+        / "chan_postgres.py"
+    ).read_text(encoding="utf-8")
+
+    assert "ingest.updated_at > head.updated_at" in storage_source
+    assert "kline.updated_at > head.updated_at" in writer_source
+
+
 def test_closed_period_cutoffs_use_current_local_week_and_month_start() -> None:
     week_cutoff, month_cutoff = closed_period_cutoffs_utc(
         datetime(2026, 7, 7, 3, 45, tzinfo=timezone.utc)

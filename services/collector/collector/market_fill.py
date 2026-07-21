@@ -249,11 +249,20 @@ async def fill_one_timeframe(
     written = await kline_writer.upsert_bars(bars)
     emit("bars_written", symbol=symbol.symbol, timeframe=timeframe, bars=len(bars))
     if bars and not skip_publish:
+        canonical_bar = await kline_writer.get_canonical_bar(
+            symbol.symbol,
+            timeframe,
+            bars[-1].ts,
+        )
+        if canonical_bar is None:
+            raise RuntimeError(
+                f"Canonical bar missing after K-line upsert: {symbol.symbol} {timeframe}"
+            )
         published = await publish_bar_update(
             redis_url=redis_url,
             symbol=symbol.symbol,
             timeframe=timeframe,
-            bar=bars[-1],
+            bar=canonical_bar,
         )
         emit(
             "bar_published",
@@ -261,6 +270,10 @@ async def fill_one_timeframe(
             timeframe=timeframe,
             published=published,
         )
+        if not published:
+            raise RuntimeError(
+                f"Redis bar publication failed: {symbol.symbol} {timeframe}"
+            )
     await sleep_between_requests(sleep)
     return written
 

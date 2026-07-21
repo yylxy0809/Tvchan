@@ -138,8 +138,14 @@ class PostgresChanCStreamStore:
                           when head.chan_level = 43200 then
                               date_trunc('month', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
                               > date_trunc('month', head.base_to_bar_end at time zone 'Asia/Shanghai')
-                          else coalesce(ingest.last_bar_end, '-infinity'::timestamptz)
-                              > head.base_to_bar_end
+                          else (
+                              coalesce(ingest.last_bar_end, '-infinity'::timestamptz)
+                                  > head.base_to_bar_end
+                              or (
+                                  ingest.last_bar_end = head.base_to_bar_end
+                                  and ingest.updated_at > head.updated_at
+                              )
+                          )
                       end
                       and (
                           $5::text[] is null
@@ -398,7 +404,13 @@ class PostgresChanCStreamStore:
                           when task.chan_level = 43200 then
                               date_trunc('month', task.target_bar_end at time zone 'Asia/Shanghai')
                               > date_trunc('month', head.base_to_bar_end at time zone 'Asia/Shanghai')
-                          else task.target_bar_end > head.base_to_bar_end
+                          else (
+                              task.target_bar_end > head.base_to_bar_end
+                              or (
+                                  task.target_bar_end = head.base_to_bar_end
+                                  and task.updated_at > head.updated_at
+                              )
+                          )
                       end
                       and task.next_run_at <= now()
                       and coalesce(task.backoff_until, '-infinity'::timestamptz) <= now()
