@@ -242,6 +242,7 @@ async def fill_one_timeframe(
             "bars_failed",
             symbol=symbol.symbol,
             timeframe=timeframe,
+            error_type=type(exc).__name__,
             error=str(exc)[:500],
         )
         await sleep_between_requests(sleep)

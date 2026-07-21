@@ -106,3 +106,44 @@ def test_market_fill_fails_closed_when_redis_publish_fails(monkeypatch) -> None:
                 redis_url="redis://unused",
             )
         )
+
+
+def test_market_fill_logs_exception_type_when_provider_error_has_no_message(monkeypatch) -> None:
+    class Provider:
+        async def get_bars(self, *_args, **_kwargs):
+            raise TimeoutError()
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        market_fill,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    written = asyncio.run(
+        market_fill.fill_one_timeframe(
+            provider=Provider(),
+            kline_writer=object(),
+            symbol=SymbolInfo(
+                symbol="000001.SZ", code="000001", exchange="SZ", name="Ping An"
+            ),
+            timeframe="5f",
+            limit=1,
+            sleep=0,
+            skip_publish=False,
+            redis_url="redis://unused",
+        )
+    )
+
+    assert written == 0
+    assert events == [
+        (
+            "bars_failed",
+            {
+                "symbol": "000001.SZ",
+                "timeframe": "5f",
+                "error_type": "TimeoutError",
+                "error": "",
+            },
+        )
+    ]
