@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.security import (
     AuthenticationServiceUnavailable,
     authenticate_token_value,
+    websocket_token_value,
 )
 from app.market_sidebar.dto import SetSidebarContext
 from app.market_sidebar.service import (
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 @router.websocket("/ws/v1/realtime")
 async def realtime_ws(websocket: WebSocket) -> None:
     settings = get_settings()
-    token = websocket.query_params.get("token")
+    token = websocket_token_value(websocket)
     if settings.api_token or settings.admin_api_token:
         app = websocket.scope.get("app")
         try:

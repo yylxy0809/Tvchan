@@ -20,7 +20,7 @@ class FakeWebSocket {
   onclose: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
 
-  constructor(readonly url: string) {
+  constructor(readonly url: string, readonly protocols?: string | string[]) {
     FakeWebSocket.instances.push(this);
     const shouldFail = FakeWebSocket.failFirstConnection && FakeWebSocket.instances.length === 1;
     queueMicrotask(() => {
@@ -160,7 +160,8 @@ test("session reset closes old-token sockets before a new login subscribes", asy
   }, () => {}, () => {});
   await sleep(0);
   const first = FakeWebSocket.instances[0];
-  assert.equal(new URL(first.url).searchParams.get("token"), "token-a");
+  assert.equal(new URL(first.url).searchParams.has("token"), false);
+  assert.deepEqual(first.protocols, ["tvchan.bearer.dG9rZW4tYQ"]);
 
   manager.resetSession();
   assert.equal(first.readyState, 3);
@@ -172,7 +173,8 @@ test("session reset closes old-token sockets before a new login subscribes", asy
   await sleep(0);
   const second = FakeWebSocket.instances[1];
   assert.ok(second);
-  assert.equal(new URL(second.url).searchParams.get("token"), "token-b");
+  assert.equal(new URL(second.url).searchParams.has("token"), false);
+  assert.deepEqual(second.protocols, ["tvchan.bearer.dG9rZW4tYg"]);
   await sleep(1_100);
   assert.equal(FakeWebSocket.instances.length, 2);
 

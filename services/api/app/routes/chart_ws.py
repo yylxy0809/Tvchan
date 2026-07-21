@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.security import (
     AuthenticationServiceUnavailable,
     authenticate_token_value,
+    websocket_token_value,
 )
 from app.routes.chan import DEFAULT_MODES, _display_levels_for_chart, build_chan_overlay
 from app.routes.chart import (
@@ -112,7 +113,7 @@ class _ChartSender:
 @router.websocket("/ws/v2/chart")
 async def chart_ws(websocket: WebSocket) -> None:
     settings = get_settings()
-    token = websocket.query_params.get("token")
+    token = websocket_token_value(websocket)
     if settings.api_token or settings.admin_api_token:
         app = websocket.scope.get("app")
         try:

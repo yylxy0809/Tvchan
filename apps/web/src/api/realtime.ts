@@ -21,6 +21,13 @@ export function createRealtimeSocket(): WebSocket {
 
 function createSocket(path: string): WebSocket {
   const url = new URL(webSocketUrl(path));
-  url.searchParams.set("token", getApiToken());
-  return new WebSocket(url.toString());
+  return new WebSocket(url.toString(), [encodeBearerProtocol(getApiToken())]);
+}
+
+function encodeBearerProtocol(token: string): string {
+  const bytes = new TextEncoder().encode(token);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  const encoded = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `tvchan.bearer.${encoded}`;
 }
