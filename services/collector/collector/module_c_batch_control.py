@@ -204,6 +204,22 @@ def validate_production_canary_selection(
         )
 
 
+def approved_canary_covers_build(
+    *,
+    eligibility_build_id: str,
+    parameters: Mapping[str, Any],
+    approved_parameters: Mapping[str, Any],
+) -> bool:
+    if approved_parameters.get("source_build_id") == eligibility_build_id:
+        return True
+    return (
+        parameters.get("scope") == "supplemental"
+        and parameters.get("supplemental_contract_version")
+        == "module-c-supplemental-selection-v1"
+        and bool(parameters.get("source_build_id"))
+    )
+
+
 async def validate_strict_build(
     conn: asyncpg.Connection,
     build: Mapping[str, Any],
@@ -730,12 +746,15 @@ async def prepare_batch(conn: asyncpg.Connection, args: argparse.Namespace) -> d
                 if approved_canary
                 else {}
             )
-            source_id = approved_parameters.get("source_build_id")
             if (
                 approved_canary is None
                 or approved_canary["status"] != "sealed"
                 or approved_canary["child_status"] != "completed"
-                or source_id != args.eligibility_build_id
+                or not approved_canary_covers_build(
+                    eligibility_build_id=args.eligibility_build_id,
+                    parameters=parameters,
+                    approved_parameters=approved_parameters,
+                )
                 or approved_parameters.get("selection_contract_version")
                 not in PRODUCTION_CANARY_SELECTION_VERSIONS
             ):

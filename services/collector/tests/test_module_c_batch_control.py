@@ -13,6 +13,7 @@ import pytest
 import collector.module_c_batch_control as batch_control
 from collector.module_c_batch_control import (
     _strict_v2_provenance,
+    approved_canary_covers_build,
     activate_batch,
     freeze_canary,
     load_selection,
@@ -27,6 +28,24 @@ from collector.module_c_batch_control import (
 )
 from collector.module_c_eligibility import _canonical_sha256
 from trading_protocol import MODULE_C_CONFIG_HASH
+
+
+def test_approved_canary_may_cover_a_strict_supplemental_recovery_build() -> None:
+    approved = {"source_build_id": "old-source"}
+    assert not approved_canary_covers_build(
+        eligibility_build_id="supplemental",
+        parameters={"scope": "baseline"},
+        approved_parameters=approved,
+    )
+    assert approved_canary_covers_build(
+        eligibility_build_id="supplemental",
+        parameters={
+            "scope": "supplemental",
+            "supplemental_contract_version": "module-c-supplemental-selection-v1",
+            "source_build_id": "new-audited-source",
+        },
+        approved_parameters=approved,
+    )
 
 
 def _selection() -> dict[str, object]:
