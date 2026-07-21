@@ -164,8 +164,12 @@ def test_head_selection_rejects_missing_mode_or_invalid_module_c_run() -> None:
     class RejectedConn:
         async def fetch(self, query, *_args):
             assert "head.base_timeframe = head.chan_level" in query
+            assert "join scheme2_ingest_watermarks watermark" in query
+            assert "head.base_to_bar_end = watermark.last_bar_end" in query
+            assert "head.consumed_input_version = watermark.change_version" in query
+            assert "run.bar_until = watermark.last_bar_end" in query
             assert "run.status = 'success'" in query
-            assert "run.config_hash = any($6::varchar[])" in query
+            assert "run.config_hash = any($5::varchar[])" in query
             return []
 
     assert asyncio.run(_select_windowed_module_c_runs(
@@ -185,16 +189,21 @@ def test_head_selection_rejects_each_invalid_head_attribute() -> None:
                 assert "head.mode = any($3::varchar[])" in query
                 assert "head.base_timeframe = head.chan_level" in query
                 assert "head.status = 'published'" in query
-                assert "run.status = 'success' and run.config_hash = any($6::varchar[])" in query
-                _symbol_id, _levels, modes, first, last, config_hashes = _args
+                assert "head.base_to_bar_end = watermark.last_bar_end" in query
+                assert "head.consumed_input_version = watermark.change_version" in query
+                assert "run.status = 'success' and run.config_hash = any($5::varchar[])" in query
+                _symbol_id, _levels, modes, first, config_hashes = _args
                 if not (
                     row["mode"] in modes
                     and row["base_timeframe"] == row["chan_level"]
                     and row["head_status"] == "published"
                     and row["run_status"] == "success"
                     and row["config_hash"] in config_hashes
-                    and row["base_from_bar_end"] <= first <= last <= row["base_to_bar_end"]
-                    and row["bar_from"] <= first <= last <= row["bar_until"]
+                    and row["base_from_bar_end"] <= first
+                    and row["base_to_bar_end"] == row["watermark_last_bar_end"]
+                    and row["consumed_input_version"] == row["watermark_change_version"]
+                    and row["bar_from"] <= first
+                    and row["bar_until"] == row["watermark_last_bar_end"]
                 ):
                     return []
                 return [row]
@@ -210,6 +219,8 @@ def test_head_selection_rejects_each_invalid_head_attribute() -> None:
         "bar_from": _dt(1), "bar_until": _dt(99), "base_timeframe": 5,
         "head_status": "published", "run_status": "success",
         "config_hash": MODULE_C_CONFIG_HASH,
+        "watermark_last_bar_end": _dt(99),
+        "consumed_input_version": 3, "watermark_change_version": 3,
     }
     # The query predicates are tested independently because a DB fake must not
     # accidentally accept rows that a real WHERE clause would reject.
@@ -220,9 +231,33 @@ def test_head_selection_rejects_each_invalid_head_attribute() -> None:
         {**valid, "run_status": "failed"},
         {**valid, "head_status": "failed"},
         {**valid, "base_from_bar_end": _dt(11)},
-        {**valid, "bar_until": _dt(19)},
+        {**valid, "base_to_bar_end": _dt(98)},
+        {**valid, "consumed_input_version": 2},
+        {**valid, "bar_until": _dt(98)},
     ):
         asyncio.run(assert_rejected(rejected))
+
+
+def test_head_selection_uses_each_native_closed_watermark() -> None:
+    class NativeWatermarkConn:
+        async def fetch(self, query, *_args):
+            assert "head.base_to_bar_end >= $5" not in query
+            assert "run.bar_until >= $5" not in query
+            assert "head.base_to_bar_end = watermark.last_bar_end" in query
+            assert "head.consumed_input_version = watermark.change_version" in query
+            return [{
+                "chan_level": 10080, "mode": "confirmed", "run_id": 7,
+                "snapshot_version": "weekly-current", "base_from_bar_end": _dt(1),
+                "base_to_bar_end": _dt(17), "bar_from": _dt(1),
+                "bar_until": _dt(17), "computed_at": _dt(17),
+            }]
+
+    selected = asyncio.run(_select_windowed_module_c_runs(
+        NativeWatermarkConn(), symbol_id=1, levels=["1w"], modes=["confirmed"],
+        first_ts=_dt(10), last_ts=_dt(21),
+    ))
+    assert selected is not None
+    assert selected[("1w", "confirmed")]["snapshot_version"] == "weekly-current"
 
 
 def test_windowed_queries_cap_at_remaining_plus_one() -> None:

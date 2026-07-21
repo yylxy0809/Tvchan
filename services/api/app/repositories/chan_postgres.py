@@ -318,19 +318,24 @@ async def _select_windowed_module_c_runs(
                run.bar_from, run.bar_until, run.computed_at
         from scheme2_chan_c_published_heads head
         join chan_c_runs run on run.id = head.run_id
+        join scheme2_ingest_watermarks watermark
+          on watermark.symbol_id = head.symbol_id
+         and watermark.timeframe = head.base_timeframe
         where head.symbol_id = $1
           and head.chan_level = any($2::integer[])
           and head.mode = any($3::varchar[])
           and head.base_timeframe = head.chan_level
           and head.status = 'published'
           and head.run_id is not null
-          and head.base_from_bar_end <= $4 and head.base_to_bar_end >= $5
-          and run.status = 'success' and run.config_hash = any($6::varchar[])
-          and run.bar_from <= $4 and run.bar_until >= $5
+          and head.base_from_bar_end <= $4
+          and head.base_to_bar_end = watermark.last_bar_end
+          and head.consumed_input_version = watermark.change_version
+          and run.status = 'success' and run.config_hash = any($5::varchar[])
+          and run.bar_from <= $4 and run.bar_until = watermark.last_bar_end
         order by head.chan_level, head.mode, coalesce(head.published_at, head.updated_at) desc, head.id desc
         """,
         symbol_id, [TIMEFRAME_TO_DB[level] for level in levels], modes,
-        first_ts, last_ts, list(SUPPORTED_MODULE_C_CONFIG_HASHES),
+        first_ts, list(SUPPORTED_MODULE_C_CONFIG_HASHES),
     )
     selected: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
