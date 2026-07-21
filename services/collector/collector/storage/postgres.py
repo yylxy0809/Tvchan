@@ -371,6 +371,35 @@ class PostgresKlineWriter:
         return len(rows)
 
     async def _upsert_bars_rows(self, conn, rows: list[tuple]) -> None:
+        scope_bounds: dict[tuple[str, int], tuple[datetime, datetime]] = {}
+        for symbol, timeframe, timestamp, *_values in rows:
+            key = (symbol, timeframe)
+            current = scope_bounds.get(key)
+            scope_bounds[key] = (
+                min(timestamp, current[0]) if current else timestamp,
+                max(timestamp, current[1]) if current else timestamp,
+            )
+        symbol_ids = {
+            row["symbol"]: int(row["symbol_id"])
+            for row in await conn.fetch(
+                """select id as symbol_id, code || '.' || exchange as symbol
+                     from symbols
+                    where code || '.' || exchange = any($1::text[])""",
+                sorted({symbol for symbol, _timeframe in scope_bounds}),
+            )
+        }
+        for symbol_id, timeframe in sorted(
+            {
+                (symbol_ids[symbol], timeframe)
+                for symbol, timeframe in scope_bounds
+                if symbol in symbol_ids
+            }
+        ):
+            await conn.execute(
+                "select pg_advisory_xact_lock($1::integer, $2::integer)",
+                symbol_id,
+                timeframe,
+            )
         await self._register_source_coverage(conn, rows)
         coverage_end = """(select max(coverage.covered_until) from kline_source_coverage coverage
             where coverage.symbol_id = klines.symbol_id
@@ -452,23 +481,6 @@ class PostgresKlineWriter:
             """,
             rows,
         )
-        scope_bounds: dict[tuple[str, int], tuple[datetime, datetime]] = {}
-        for symbol, timeframe, timestamp, *_values in rows:
-            key = (symbol, timeframe)
-            current = scope_bounds.get(key)
-            scope_bounds[key] = (
-                min(timestamp, current[0]) if current else timestamp,
-                max(timestamp, current[1]) if current else timestamp,
-            )
-        symbol_ids = {
-            row["symbol"]: int(row["symbol_id"])
-            for row in await conn.fetch(
-                """select id as symbol_id, code || '.' || exchange as symbol
-                     from symbols
-                    where code || '.' || exchange = any($1::text[])""",
-                sorted({symbol for symbol, _timeframe in scope_bounds}),
-            )
-        }
         await record_present_scopes(
             conn,
             scopes=[

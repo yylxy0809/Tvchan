@@ -154,6 +154,31 @@ def test_writer_registers_persisted_parquet_coverage_before_upserting_bars() -> 
     assert "insert into klines" in calls[1][0]
 
 
+def test_writer_locks_canonical_scopes_in_stable_order_before_any_scope_write() -> None:
+    async def scenario():
+        conn = FakeConnection(symbol_rows=[
+            {"symbol_id": 9, "symbol": "000002.SZ"},
+            {"symbol_id": 7, "symbol": "000001.SZ"},
+        ])
+        writer = PostgresKlineWriter("postgresql://example")
+        await writer._upsert_bars_rows(conn, [
+            bar_to_db_values(Bar("000002.SZ", "1d", datetime(2026, 7, 10, 15, tzinfo=ZoneInfo("Asia/Shanghai")), 10, 11, 9, 10.5, 100, source="parquet_5f")),
+            bar_to_db_values(Bar("000001.SZ", "5f", datetime(2026, 7, 10, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai")), 10, 11, 9, 10.5, 100, source="pytdx")),
+            bar_to_db_values(Bar("000001.SZ", "1d", datetime(2026, 7, 10, 15, tzinfo=ZoneInfo("Asia/Shanghai")), 10, 11, 9, 10.5, 100, source="pytdx")),
+        ])
+        return conn
+
+    conn = asyncio.run(scenario())
+    lock_calls = [
+        args for sql, args in conn.executes
+        if "pg_advisory_xact_lock" in sql.lower()
+    ]
+
+    assert lock_calls == [(7, 5), (7, 1440), (9, 1440)]
+    assert conn.events.index("scope-lock") < conn.events.index("coverage-upsert")
+    assert conn.events.index("coverage-upsert") < conn.events.index("klines-upsert")
+
+
 def test_writer_uses_persisted_coverage_not_physical_parquet_rows_for_priority() -> None:
     async def scenario() -> str:
         conn = FakeConnection()
@@ -809,7 +834,9 @@ class FakeConnection:
     async def execute(self, sql, *args):
         self.executes.append((sql, args))
         normalized = " ".join(sql.lower().split())
-        if "insert into klines" in normalized:
+        if "pg_advisory_xact_lock" in normalized:
+            self.events.append("scope-lock")
+        elif "insert into klines" in normalized:
             self.events.append("klines-upsert")
         elif "delete from klines" in normalized:
             self.events.append("klines-delete")
@@ -821,6 +848,8 @@ class FakeConnection:
         self.executemany_calls.append((sql, rows))
         if "insert into klines" in sql.lower():
             self.events.append("klines-upsert")
+        elif "kline_source_coverage" in sql.lower():
+            self.events.append("coverage-upsert")
 
     async def fetch(self, sql, *args):
         self.fetch_calls.append((sql, args))

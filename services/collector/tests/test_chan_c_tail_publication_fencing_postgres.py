@@ -116,6 +116,125 @@ def test_earlier_canonical_revision_advances_independent_input_version() -> None
     not TEST_DATABASE_URL,
     reason="set MODULE_C_EXECUTION_TEST_DATABASE_URL for a disposable migrated PostgreSQL database",
 )
+def test_same_scope_writers_serialize_versions_and_leave_tail_dirty() -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+
+    async def scenario() -> None:
+        control = await asyncpg.connect(TEST_DATABASE_URL)
+        writer_a_connection = await asyncpg.connect(TEST_DATABASE_URL)
+        writer_b_connection = await asyncpg.connect(TEST_DATABASE_URL)
+        suffix = uuid4().hex[:10].upper()
+        code = f"L{suffix}"
+        symbol = f"{code}.TS"
+        symbol_id = await control.fetchval(
+            "insert into symbols (code,exchange,name,market,is_active) "
+            "values ($1,'TS',$1,'A_SHARE',true) returning id",
+            code,
+        )
+        earlier = datetime(2026, 7, 3, 6, 55, tzinfo=UTC)
+        latest = datetime(2026, 7, 3, 7, 0, tzinfo=UTC)
+        writer = PostgresKlineWriter(TEST_DATABASE_URL)
+        try:
+            async with control.transaction():
+                await writer._upsert_bars_rows(control, [
+                    (symbol, 5, earlier, 10000, 11000, 9000, 10500, 100, 1000, True, 0, 2),
+                    (symbol, 5, latest, 10000, 11000, 9000, 10500, 100, 1000, True, 0, 2),
+                ])
+            initial_version = int(await control.fetchval(
+                "select change_version from scheme2_ingest_watermarks "
+                "where symbol_id=$1 and timeframe=5",
+                symbol_id,
+            ))
+            baseline_run_id = await control.fetchval(
+                "insert into chan_c_runs "
+                "(symbol_id,chan_level,mode,input_signature,config_hash,bar_from,bar_until,"
+                "bar_count,status,finished_at,snapshot_version,computed_at,run_kind,run_group_id) "
+                "values ($1,5,0,$2,$3,$4,$5,2,'success',now(),$2,now(),'online','online') "
+                "returning id",
+                symbol_id, f"scope-lock-{suffix}", MODULE_C_CONFIG_HASH, earlier, latest,
+            )
+            await control.execute(
+                "insert into scheme2_chan_c_published_heads "
+                "(symbol_id,chan_level,mode,base_timeframe,base_from_bar_end,base_to_bar_end,"
+                "bar_count,snapshot_version,status,run_id,published_at,config_hash,consumed_input_version) "
+                "values ($1,5,'confirmed',5,$2,$3,2,$4,'published',$5,now(),$6,$7)",
+                symbol_id, earlier, latest, f"scope-lock-{suffix}", baseline_run_id,
+                MODULE_C_CONFIG_HASH, initial_version,
+            )
+
+            transaction_a = writer_a_connection.transaction()
+            transaction_b = writer_b_connection.transaction()
+            await transaction_a.start()
+            await writer._upsert_bars_rows(writer_a_connection, [
+                (symbol, 5, earlier, 10000, 11000, 9000, 10600, 101, 1000, True, 0, 2)
+            ])
+            assert await writer_a_connection.fetchval(
+                "select change_version from scheme2_ingest_watermarks "
+                "where symbol_id=$1 and timeframe=5",
+                symbol_id,
+            ) == initial_version + 1
+
+            await transaction_b.start()
+            write_b = asyncio.create_task(writer._upsert_bars_rows(writer_b_connection, [
+                (symbol, 5, latest, 10000, 11000, 9000, 10700, 102, 1000, True, 0, 2)
+            ]))
+            wait_event_type = None
+            for _ in range(50):
+                wait_event_type = await control.fetchval(
+                    "select wait_event_type from pg_stat_activity where pid=$1",
+                    writer_b_connection.get_server_pid(),
+                )
+                if wait_event_type == "Lock":
+                    break
+                await asyncio.sleep(0.02)
+            assert wait_event_type == "Lock"
+            assert await control.fetchval(
+                "select change_version from scheme2_ingest_watermarks "
+                "where symbol_id=$1 and timeframe=5",
+                symbol_id,
+            ) == initial_version
+
+            await transaction_a.commit()
+            await asyncio.wait_for(write_b, timeout=5)
+            assert await writer_b_connection.fetchval(
+                "select change_version from scheme2_ingest_watermarks "
+                "where symbol_id=$1 and timeframe=5",
+                symbol_id,
+            ) == initial_version + 2
+            await transaction_b.commit()
+
+            store = PostgresChanCStreamStore(TEST_DATABASE_URL)
+            store._pool = _Pool(control)
+            assert await store.ensure_tail_tasks_for_stale_heads(
+                levels=["5f"], modes=["confirmed"], limit=10, symbols=[symbol]
+            ) == 1
+            assert await control.fetchval(
+                "select target_input_version from scheme2_chan_c_tail_tasks "
+                "where symbol_id=$1 and chan_level=5 and mode='confirmed'",
+                symbol_id,
+            ) == initial_version + 2
+        finally:
+            for connection in (writer_a_connection, writer_b_connection):
+                if connection.is_in_transaction():
+                    await connection.execute("rollback")
+            await control.execute("delete from scheme2_chan_c_tail_tasks where symbol_id=$1", symbol_id)
+            await control.execute("delete from scheme2_chan_c_published_heads where symbol_id=$1", symbol_id)
+            await control.execute("delete from chan_c_runs where symbol_id=$1", symbol_id)
+            await control.execute("delete from scheme2_ingest_watermarks where symbol_id=$1", symbol_id)
+            await control.execute("delete from kline_scope_catalog where symbol_id=$1", symbol_id)
+            await control.execute("delete from klines where symbol_id=$1", symbol_id)
+            await control.execute("delete from symbols where id=$1", symbol_id)
+            await writer_a_connection.close()
+            await writer_b_connection.close()
+            await control.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not TEST_DATABASE_URL,
+    reason="set MODULE_C_EXECUTION_TEST_DATABASE_URL for a disposable migrated PostgreSQL database",
+)
 def test_expired_normalized_tail_claim_fences_stale_publication() -> None:
     asyncpg = pytest.importorskip("asyncpg")
 
