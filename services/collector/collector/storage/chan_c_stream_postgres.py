@@ -80,7 +80,16 @@ class PostgresChanCStreamStore:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                with candidate_jobs as (
+                with selected_symbols as materialized (
+                    select id, code, exchange
+                    from symbols
+                    where is_active = true
+                      and (
+                          $5::text[] is null
+                          or (code || '.' || exchange) = any($5::text[])
+                      )
+                ),
+                candidate_jobs as (
                     select
                         head.symbol_id,
                         head.chan_level,
@@ -94,8 +103,8 @@ class PostgresChanCStreamStore:
                         head.run_id as expected_head_run_id,
                         head.base_to_bar_end as expected_head_base_to_bar_end,
                         ingest.change_version as target_input_version
-                    from scheme2_chan_c_published_heads head
-                    join symbols s on s.id = head.symbol_id
+                    from selected_symbols s
+                    join scheme2_chan_c_published_heads head on head.symbol_id = s.id
                     join scheme2_ingest_watermarks ingest
                       on ingest.symbol_id = head.symbol_id
                      and ingest.timeframe = head.base_timeframe
@@ -125,8 +134,7 @@ class PostgresChanCStreamStore:
                         order by k.ts desc
                         limit 1
                     ) closed_bar on true
-                    where s.is_active = true
-                      and head.status = 'published'
+                    where head.status = 'published'
                       and head.run_id is not null
                       and head.base_to_bar_end is not null
                       and head.base_timeframe = head.chan_level
@@ -158,10 +166,6 @@ class PostgresChanCStreamStore:
                               )
                           )
                       end
-                      and (
-                          $5::text[] is null
-                          or (s.code || '.' || s.exchange) = any($5::text[])
-                      )
                       and (
                           $4::int <= 1
                           or mod(abs(hashtext(s.code || '.' || s.exchange)::bigint), $4::int) = $3::int
