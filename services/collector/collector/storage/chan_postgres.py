@@ -806,7 +806,7 @@ class PostgresChanWriter:
             run_identity = hashlib.sha256(
                 (
                     f"{head['batch_id']}|{head['run_group_id']}|{symbol}|{level}|"
-                    f"{snapshot_version}|{expected_input_version}"
+                    f"{','.join(modes)}|{snapshot_version}|{expected_input_version}"
                 ).encode("utf-8")
             ).hexdigest()
             combined_response = await self._build_incremental_response(
