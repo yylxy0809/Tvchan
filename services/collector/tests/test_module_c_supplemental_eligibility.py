@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from collector.module_c_supplemental_eligibility import build_dispositions, parse_symbols
+from collector.module_c_eligibility import _write_outputs
 
 
 def test_parse_symbols_requires_small_explicit_deduplicated_scope() -> None:
@@ -31,3 +32,9 @@ def test_supplemental_scope_requires_five_eligible_resolved_dispositions() -> No
     rows[0]["eligible"] = False
     with pytest.raises(RuntimeError, match="five eligible resolved"):
         build_dispositions(rows, ("605003.SH",))
+
+
+def test_supplemental_output_contract_requires_explicit_empty_exclusion_summary(tmp_path) -> None:
+    metadata = {"excluded_summary": {"excluded_scopes": 0, "reasons": {}}}
+    _write_outputs(tmp_path, [], metadata)
+    assert (tmp_path / "excluded_summary.json").is_file()

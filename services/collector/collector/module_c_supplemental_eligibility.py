@@ -171,7 +171,9 @@ async def freeze_supplemental(conn: asyncpg.Connection, args: argparse.Namespace
             "build_id": str(build_id),"manifest_version": args.manifest_version,
             "config_hash": MODULE_C_CONFIG_HASH,"active_universe_hash": active_hash,
             "manifest_hash": manifest_hash,"active_symbols": active_symbols,
-            **provenance,**summary,
+            **provenance,
+            "excluded_summary": {"excluded_scopes": 0, "reasons": {}},
+            **summary,
         }
         _write_outputs(args.output_dir, dispositions, metadata)
         return metadata
