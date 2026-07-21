@@ -397,7 +397,8 @@ class PostgresKlineWriter:
                 amount_x100,
                 is_complete,
                 revision,
-                source
+                source,
+                updated_at
             )
             select
                 s.id,
@@ -411,7 +412,8 @@ class PostgresKlineWriter:
                 $9,
                 $10,
                 $11,
-                $12
+                $12,
+                clock_timestamp()
             from symbols s
             where s.code = split_part($1, '.', 1)
               and s.exchange = split_part($1, '.', 2)
@@ -425,7 +427,7 @@ class PostgresKlineWriter:
                 is_complete = excluded.is_complete,
                 revision = greatest(excluded.revision, klines.revision + 1),
                 source = excluded.source,
-                updated_at = now()
+                updated_at = clock_timestamp()
             where not (klines.is_complete and not excluded.is_complete)
               and (
                     ({source_priority_case('excluded.source', timestamp='excluded.ts', coverage_end=coverage_end)}) > ({source_priority_case('klines.source', timestamp='klines.ts', coverage_end=coverage_end)})
@@ -437,6 +439,11 @@ class PostgresKlineWriter:
                             or (
                                 not excluded.is_complete
                                 and not klines.is_complete
+                                and ({payload_changed})
+                            )
+                            or (
+                                excluded.is_complete
+                                and klines.is_complete
                                 and ({payload_changed})
                             )
                         )
@@ -473,7 +480,7 @@ class PostgresKlineWriter:
         await self._upsert_ingest_watermarks(
             conn,
             scopes=[
-                (symbol_ids[symbol], timeframe, bounds[1])
+                (symbol_ids[symbol], timeframe, bounds[0], bounds[1])
                 for (symbol, timeframe), bounds in sorted(scope_bounds.items())
                 if symbol in symbol_ids
             ],
@@ -483,7 +490,7 @@ class PostgresKlineWriter:
         self,
         conn,
         *,
-        scopes: list[tuple[int, int, datetime]],
+        scopes: list[tuple[int, int, datetime, datetime]],
     ) -> None:
         if not scopes:
             return
@@ -495,21 +502,29 @@ class PostgresKlineWriter:
                 last_bar_end,
                 source,
                 note,
+                change_version,
                 updated_at
             )
             select
                 target.symbol_id,
                 target.timeframe,
-                target.last_bar_end,
+                canonical.last_bar_end,
                 'canonical-kline-writer',
-                'advanced atomically with canonical K-line upsert',
-                canonical.updated_at
-            from unnest($1::integer[], $2::integer[], $3::timestamptz[])
-                as target(symbol_id, timeframe, last_bar_end)
-            join klines canonical
-              on canonical.symbol_id = target.symbol_id
-             and canonical.timeframe = target.timeframe
-             and canonical.ts = target.last_bar_end
+                'advanced atomically with canonical K-line change version',
+                1,
+                canonical.changed_at
+            from unnest(
+                $1::integer[], $2::integer[], $3::timestamptz[], $4::timestamptz[]
+            ) as target(symbol_id, timeframe, first_bar_end, last_bar_end)
+            cross join lateral (
+                select max(kline.ts) as last_bar_end,
+                       max(kline.updated_at) as changed_at
+                from klines kline
+                where kline.symbol_id = target.symbol_id
+                  and kline.timeframe = target.timeframe
+                  and kline.ts between target.first_bar_end and target.last_bar_end
+            ) canonical
+            where canonical.last_bar_end is not null
             on conflict (symbol_id, timeframe) do update
             set last_bar_end = greatest(
                     coalesce(scheme2_ingest_watermarks.last_bar_end, excluded.last_bar_end),
@@ -517,16 +532,25 @@ class PostgresKlineWriter:
                 ),
                 source = excluded.source,
                 note = excluded.note,
-                updated_at = excluded.updated_at
+                change_version = scheme2_ingest_watermarks.change_version + case
+                    when excluded.updated_at > scheme2_ingest_watermarks.updated_at then 1
+                    else 0
+                end,
+                updated_at = greatest(
+                    scheme2_ingest_watermarks.updated_at,
+                    excluded.updated_at
+                )
             where excluded.last_bar_end > scheme2_ingest_watermarks.last_bar_end
                or (
                     excluded.last_bar_end = scheme2_ingest_watermarks.last_bar_end
                     and excluded.updated_at > scheme2_ingest_watermarks.updated_at
                )
+               or excluded.updated_at > scheme2_ingest_watermarks.updated_at
             """,
             [scope[0] for scope in scopes],
             [scope[1] for scope in scopes],
             [scope[2] for scope in scopes],
+            [scope[3] for scope in scopes],
         )
 
     async def _register_source_coverage(self, conn, rows: list[tuple]) -> None:

@@ -92,7 +92,8 @@ class PostgresChanCStreamStore:
                             else ingest.last_bar_end
                         end as target_bar_end,
                         head.run_id as expected_head_run_id,
-                        head.base_to_bar_end as expected_head_base_to_bar_end
+                        head.base_to_bar_end as expected_head_base_to_bar_end,
+                        ingest.change_version as target_input_version
                     from scheme2_chan_c_published_heads head
                     join symbols s on s.id = head.symbol_id
                     join scheme2_ingest_watermarks ingest
@@ -135,15 +136,25 @@ class PostgresChanCStreamStore:
                           when head.chan_level = 10080 then
                               date_trunc('week', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
                               > date_trunc('week', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                              or (
+                                  date_trunc('week', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
+                                  = date_trunc('week', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                                  and ingest.change_version > head.consumed_input_version
+                              )
                           when head.chan_level = 43200 then
                               date_trunc('month', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
                               > date_trunc('month', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                              or (
+                                  date_trunc('month', closed_bar.target_bar_end at time zone 'Asia/Shanghai')
+                                  = date_trunc('month', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                                  and ingest.change_version > head.consumed_input_version
+                              )
                           else (
                               coalesce(ingest.last_bar_end, '-infinity'::timestamptz)
                                   > head.base_to_bar_end
                               or (
                                   ingest.last_bar_end = head.base_to_bar_end
-                                  and ingest.updated_at > head.updated_at
+                                  and ingest.change_version > head.consumed_input_version
                               )
                           )
                       end
@@ -173,6 +184,7 @@ class PostgresChanCStreamStore:
                         shard_bucket,
                         anchor_bar_end,
                         target_bar_end,
+                        target_input_version,
                         expected_head_run_id,
                         expected_head_base_to_bar_end
                     )
@@ -205,6 +217,7 @@ class PostgresChanCStreamStore:
                         mod(abs(hashtext((select code || '.' || exchange from symbols where id = candidate_jobs.symbol_id))::bigint), 1024)::smallint,
                         anchor_bar_end,
                         target_bar_end,
+                        target_input_version,
                         expected_head_run_id,
                         expected_head_base_to_bar_end
                     from candidate_jobs
@@ -227,6 +240,10 @@ class PostgresChanCStreamStore:
                         target_bar_end = greatest(
                             coalesce(scheme2_chan_c_tail_tasks.target_bar_end, '-infinity'::timestamptz),
                             excluded.target_bar_end
+                        ),
+                        target_input_version = greatest(
+                            scheme2_chan_c_tail_tasks.target_input_version,
+                            excluded.target_input_version
                         ),
                         expected_head_run_id = excluded.expected_head_run_id,
                         expected_head_base_to_bar_end = excluded.expected_head_base_to_bar_end,
@@ -285,6 +302,9 @@ class PostgresChanCStreamStore:
                      and head.mode = task.mode
                      and head.base_timeframe = task.base_timeframe
                      and head.status = 'published'
+                    join scheme2_ingest_watermarks ingest
+                      on ingest.symbol_id = task.symbol_id
+                     and ingest.timeframe = task.base_timeframe
                     left join lateral (
                         select k.ts as target_bar_end
                         from klines k
@@ -389,6 +409,9 @@ class PostgresChanCStreamStore:
                      and head.mode = task.mode
                      and head.base_timeframe = task.base_timeframe
                      and head.status = 'published'
+                    join scheme2_ingest_watermarks ingest
+                      on ingest.symbol_id = task.symbol_id
+                     and ingest.timeframe = task.base_timeframe
                     where (
                           task.status in ('pending', 'failed', 'success')
                           or (
@@ -401,14 +424,16 @@ class PostgresChanCStreamStore:
                           when task.chan_level = 10080 then
                               date_trunc('week', task.target_bar_end at time zone 'Asia/Shanghai')
                               > date_trunc('week', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                              or ingest.change_version > head.consumed_input_version
                           when task.chan_level = 43200 then
                               date_trunc('month', task.target_bar_end at time zone 'Asia/Shanghai')
                               > date_trunc('month', head.base_to_bar_end at time zone 'Asia/Shanghai')
+                              or ingest.change_version > head.consumed_input_version
                           else (
                               task.target_bar_end > head.base_to_bar_end
                               or (
                                   task.target_bar_end = head.base_to_bar_end
-                                  and task.updated_at > head.updated_at
+                                  and ingest.change_version > head.consumed_input_version
                               )
                           )
                       end
@@ -435,6 +460,8 @@ class PostgresChanCStreamStore:
                     lease_until = now() + ($3::int * interval '1 second'),
                     lease_heartbeat_at = now(),
                     claimed_target_bar_end = task.target_bar_end,
+                    target_input_version = greatest(task.target_input_version, ingest.change_version),
+                    claimed_input_version = ingest.change_version,
                     expected_head_run_id = coalesce(
                         (
                             select head.run_id
@@ -463,9 +490,11 @@ class PostgresChanCStreamStore:
                     ),
                     last_error = null,
                     updated_at = now()
-                from next_tasks, symbols s
+                from next_tasks, symbols s, scheme2_ingest_watermarks ingest
                 where task.id = next_tasks.id
                   and s.id = task.symbol_id
+                  and ingest.symbol_id = task.symbol_id
+                  and ingest.timeframe = task.base_timeframe
                 returning
                     task.id,
                     s.code || '.' || s.exchange as symbol,
@@ -478,7 +507,8 @@ class PostgresChanCStreamStore:
                     task.expected_head_base_to_bar_end,
                     task.claim_token,
                     task.lease_version,
-                    task.claimed_target_bar_end
+                    task.claimed_target_bar_end,
+                    task.claimed_input_version
                 """,
                 max(1, limit),
                 worker_id,
@@ -506,8 +536,10 @@ class PostgresChanCStreamStore:
                 set status = case
                         when $3::varchar = 'failed' and coalesce($5, '') like 'Refusing to publish non-advancing Chan tail%' then 'success'
                         when $3::varchar = 'failed' and coalesce($5, '') like 'Stale Chan head%' then 'pending'
+                        when $3::varchar = 'failed' and coalesce($5, '') like 'Stale Chan input%' then 'pending'
                         when $3::varchar = 'failed' then 'failed'
-                        when target_bar_end > coalesce(claimed_target_bar_end, '-infinity'::timestamptz) then 'pending'
+                        when target_bar_end > coalesce(claimed_target_bar_end, '-infinity'::timestamptz)
+                          or target_input_version > coalesce(claimed_input_version, -1) then 'pending'
                         else 'success'
                     end,
                     last_success_bar_end = case when $3::varchar = 'success' then coalesce($4, last_success_bar_end) else last_success_bar_end end,
@@ -516,12 +548,14 @@ class PostgresChanCStreamStore:
                         when $3::varchar = 'success' then 0
                         when coalesce($5, '') like 'Refusing to publish non-advancing Chan tail%' then 0
                         when coalesce($5, '') like 'Stale Chan head%' then consecutive_failures
+                        when coalesce($5, '') like 'Stale Chan input%' then consecutive_failures
                         else consecutive_failures + 1
                     end,
                     backoff_until = case
                         when $3::varchar = 'success' then null
                         when coalesce($5, '') like 'Refusing to publish non-advancing Chan tail%' then null
                         when coalesce($5, '') like 'Stale Chan head%' then null
+                        when coalesce($5, '') like 'Stale Chan input%' then null
                         else now() + (
                             least(900, 30 * power(2, least(consecutive_failures, 5)))::int
                             * interval '1 second'
@@ -531,13 +565,18 @@ class PostgresChanCStreamStore:
                         when $3::varchar = 'failed' and coalesce($5, '') like 'Refusing to publish non-advancing Chan tail%'
                             then now() + (schedule_interval_seconds * interval '1 second')
                         when $3::varchar = 'failed' and coalesce($5, '') like 'Stale Chan head%' then now()
+                        when $3::varchar = 'failed' and coalesce($5, '') like 'Stale Chan input%' then now()
                         when $3::varchar = 'failed' then next_run_at
-                        when target_bar_end > coalesce(claimed_target_bar_end, '-infinity'::timestamptz) then now()
+                        when target_bar_end > coalesce(claimed_target_bar_end, '-infinity'::timestamptz)
+                          or target_input_version > coalesce(claimed_input_version, -1) then now()
                         else now() + (schedule_interval_seconds * interval '1 second')
                     end,
                     pending_since = case
                         when $3::varchar = 'success'
-                         and target_bar_end > coalesce(claimed_target_bar_end, '-infinity'::timestamptz)
+                         and (
+                             target_bar_end > coalesce(claimed_target_bar_end, '-infinity'::timestamptz)
+                             or target_input_version > coalesce(claimed_input_version, -1)
+                         )
                             then now()
                         else pending_since
                     end,
@@ -546,6 +585,7 @@ class PostgresChanCStreamStore:
                     worker_id = null,
                     claim_token = null,
                     claimed_target_bar_end = null,
+                    claimed_input_version = null,
                     updated_at = now()
                 where id = $1
                   and status = 'running'

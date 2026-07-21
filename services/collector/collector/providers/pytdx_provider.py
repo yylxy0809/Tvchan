@@ -13,6 +13,7 @@ from collector.providers.seed import SeedProvider
 from trading_protocol import Bar, SymbolInfo, canonical_kline_timestamp, normalize_timeframe
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+TDX_CLOSE_GRACE = timedelta(seconds=1)
 
 
 class PytdxLunchReopenRowError(ValueError):
@@ -449,7 +450,7 @@ def _is_tdx_period_complete(
         return current_week > bar_week
     if normalized == "1m":
         return (current.year, current.month) > (local_end.year, local_end.month)
-    return current >= local_end
+    return current >= local_end + TDX_CLOSE_GRACE
 
 
 def _tdx_rows_to_bars(

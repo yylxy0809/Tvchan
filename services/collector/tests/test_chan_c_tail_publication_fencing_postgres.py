@@ -1,6 +1,6 @@
 """Opt-in PostgreSQL acceptance for Module C tail publication fencing.
 
-The test database must be disposable and must already contain migrations 001..043.
+The test database must be disposable and must already contain all migrations through 050.
 """
 
 from __future__ import annotations
@@ -17,9 +17,11 @@ from collector.storage.chan_c_stream_postgres import (
 )
 from collector.storage.chan_postgres import (
     PostgresChanWriter,
+    StaleChanHeadError,
     StaleTailTaskLeaseError,
 )
-from trading_protocol import MODULE_C_CONFIG_HASH
+from collector.storage.postgres import PostgresKlineWriter
+from trading_protocol import Bar, MODULE_C_CONFIG_HASH
 
 
 TEST_DATABASE_URL = os.getenv("MODULE_C_EXECUTION_TEST_DATABASE_URL", "")
@@ -42,6 +44,72 @@ class _Pool:
 
     def acquire(self):
         return _Acquire(self.connection)
+
+
+@pytest.mark.skipif(
+    not TEST_DATABASE_URL,
+    reason="set MODULE_C_EXECUTION_TEST_DATABASE_URL for a disposable migrated PostgreSQL database",
+)
+def test_earlier_canonical_revision_advances_independent_input_version() -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+
+    async def scenario() -> None:
+        connection = await asyncpg.connect(TEST_DATABASE_URL)
+        transaction = connection.transaction()
+        await transaction.start()
+        try:
+            suffix = uuid4().hex[:10].upper()
+            code = f"W{suffix}"
+            symbol = f"{code}.TS"
+            await connection.execute(
+                "insert into symbols (code,exchange,name,market,is_active) "
+                "values ($1,'TS',$1,'A_SHARE',true)",
+                code,
+            )
+            earlier = datetime(2026, 7, 3, 6, 55, tzinfo=UTC)
+            latest = datetime(2026, 7, 3, 7, 0, tzinfo=UTC)
+            writer = PostgresKlineWriter(TEST_DATABASE_URL)
+            await writer._upsert_bars_rows(
+                connection,
+                [
+                    (
+                        symbol, 5, earlier, 10000, 11000, 9000, 10500,
+                        100, 1000, True, 0, 2,
+                    ),
+                    (
+                        symbol, 5, latest, 10000, 11000, 9000, 10500,
+                        100, 1000, True, 0, 2,
+                    ),
+                ],
+            )
+            before = await connection.fetchrow(
+                "select last_bar_end,change_version from scheme2_ingest_watermarks "
+                "where symbol_id=(select id from symbols where code=$1 and exchange='TS') "
+                "and timeframe=5",
+                code,
+            )
+            await writer._upsert_bars_rows(
+                connection,
+                [
+                    (
+                        symbol, 5, earlier, 10000, 11000, 9000, 10600,
+                        101, 1000, True, 0, 2,
+                    )
+                ],
+            )
+            after = await connection.fetchrow(
+                "select last_bar_end,change_version from scheme2_ingest_watermarks "
+                "where symbol_id=(select id from symbols where code=$1 and exchange='TS') "
+                "and timeframe=5",
+                code,
+            )
+            assert before["last_bar_end"] == after["last_bar_end"] == latest
+            assert int(after["change_version"]) == int(before["change_version"]) + 1
+        finally:
+            await transaction.rollback()
+            await connection.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.skipif(
@@ -280,6 +348,7 @@ def test_expired_normalized_tail_claim_fences_stale_publication() -> None:
                     publication_claim_token=str(claim_a["claim_token"]),
                     publication_lease_version=int(claim_a["lease_version"]),
                     publication_target_bar_end=claim_a["claimed_target_bar_end"],
+                    expected_input_version=int(claim_a["claimed_input_version"]),
                 )
             assert await publication_counts() == before_stale
             assert tuple(
@@ -357,6 +426,7 @@ def test_expired_normalized_tail_claim_fences_stale_publication() -> None:
                         publication_target_bar_end=claim_b[
                             "claimed_target_bar_end"
                         ],
+                        expected_input_version=int(claim_b["claimed_input_version"]),
                     )
                 )
                 await asyncio.sleep(1.25)
@@ -401,6 +471,7 @@ def test_expired_normalized_tail_claim_fences_stale_publication() -> None:
                 publication_claim_token=str(claim_b["claim_token"]),
                 publication_lease_version=int(claim_b["lease_version"]),
                 publication_target_bar_end=claim_b["claimed_target_bar_end"],
+                expected_input_version=int(claim_b["claimed_input_version"]),
             )
             after_success = await publication_counts()
             assert after_success == (
@@ -444,6 +515,120 @@ def test_expired_normalized_tail_claim_fences_stale_publication() -> None:
                 symbols=[symbol],
             ) == []
             assert await publication_counts() == counts_after_success
+
+            # A claims canonical rev2, B commits rev3 before A publishes. A must
+            # roll back completely; the durable task then reclaims rev3 and wins.
+            await connection.execute(
+                "update klines set close_x1000=10600,revision=revision+1,"
+                "updated_at=clock_timestamp() where symbol_id=$1 and timeframe=10080 and ts=$2",
+                symbol_id,
+                head_bar_end,
+            )
+            await connection.execute(
+                "update scheme2_ingest_watermarks set change_version=change_version+1,"
+                "updated_at=clock_timestamp() where symbol_id=$1 and timeframe=10080",
+                symbol_id,
+            )
+            assert await store.ensure_tail_tasks_for_stale_heads(
+                levels=["1w"], modes=["confirmed"], limit=10, symbols=[symbol]
+            ) == 1
+            claim_rev2 = (
+                await store.claim_tail_tasks(
+                    limit=1, worker_id="rev2-worker", lease_seconds=600, symbols=[symbol]
+                )
+            )[0]
+
+            before_rev2_publish = await publication_counts()
+            race_transaction = connection.transaction()
+            await race_transaction.start()
+            race_committed = False
+            race_connection = await asyncpg.connect(TEST_DATABASE_URL)
+            try:
+                await connection.fetchrow(
+                    "select id from scheme2_chan_c_tail_tasks where id=$1 for update",
+                    task_id,
+                )
+                race_writer = PostgresChanWriter(
+                    TEST_DATABASE_URL, tail_config_hash=MODULE_C_CONFIG_HASH,
+                    native_base_timeframe=True, publication_profile="online",
+                    publication_source="stream", run_kind="online",
+                    run_group_id="online", worker_id="rev2-race-worker",
+                )
+                race_writer._pool = _Pool(race_connection)
+                rev2_publish = asyncio.create_task(race_writer.replace_incremental_analysis(
+                    symbol=symbol, level="1w", modes=["confirmed"],
+                    anchor_bar_end=claim_rev2["anchor_bar_end"], bar_until=publication_bar_end,
+                    response={"snapshot_version": f"rev2-{suffix}", "strokes": [],
+                              "segments": [], "centers": [], "signals": []},
+                    expected_head_run_id=int(claim_rev2["expected_head_run_id"]),
+                    expected_head_base_to_bar_end=claim_rev2["expected_head_base_to_bar_end"],
+                    publication_task_id=int(claim_rev2["id"]),
+                    publication_claim_token=str(claim_rev2["claim_token"]),
+                    publication_lease_version=int(claim_rev2["lease_version"]),
+                    publication_target_bar_end=claim_rev2["claimed_target_bar_end"],
+                    expected_input_version=int(claim_rev2["claimed_input_version"]),
+                ))
+                wait_event_type = None
+                for _ in range(50):
+                    wait_event_type = await connection.fetchval(
+                        "select wait_event_type from pg_stat_activity where pid=$1",
+                        race_connection.get_server_pid(),
+                    )
+                    if wait_event_type == "Lock":
+                        break
+                    await asyncio.sleep(0.02)
+                assert wait_event_type == "Lock"
+                await connection.execute(
+                    "update klines set close_x1000=10700,revision=revision+1,"
+                    "updated_at=clock_timestamp() where symbol_id=$1 and timeframe=10080 and ts=$2",
+                    symbol_id, head_bar_end,
+                )
+                await connection.execute(
+                    "update scheme2_ingest_watermarks set change_version=change_version+1,"
+                    "updated_at=clock_timestamp() where symbol_id=$1 and timeframe=10080",
+                    symbol_id,
+                )
+                await race_transaction.commit()
+                race_committed = True
+                with pytest.raises(StaleChanHeadError, match="Stale Chan input") as stale:
+                    await asyncio.wait_for(rev2_publish, timeout=5)
+            finally:
+                if not race_committed:
+                    await race_transaction.rollback()
+                await race_connection.close()
+            assert await publication_counts() == before_rev2_publish
+            assert await store.complete_tail_task(
+                task_id=int(claim_rev2["id"]),
+                claim_token=str(claim_rev2["claim_token"]),
+                error=str(stale.value),
+            )
+            claim_rev3 = (
+                await store.claim_tail_tasks(
+                    limit=1, worker_id="rev3-worker", lease_seconds=600, symbols=[symbol]
+                )
+            )[0]
+            assert int(claim_rev3["claimed_input_version"]) > int(
+                claim_rev2["claimed_input_version"]
+            )
+            rev3 = await writer.replace_incremental_analysis(
+                symbol=symbol, level="1w", modes=["confirmed"],
+                anchor_bar_end=claim_rev3["anchor_bar_end"], bar_until=publication_bar_end,
+                response={"snapshot_version": f"rev3-{suffix}", "strokes": [],
+                          "segments": [], "centers": [], "signals": []},
+                expected_head_run_id=int(claim_rev3["expected_head_run_id"]),
+                expected_head_base_to_bar_end=claim_rev3["expected_head_base_to_bar_end"],
+                publication_task_id=int(claim_rev3["id"]),
+                publication_claim_token=str(claim_rev3["claim_token"]),
+                publication_lease_version=int(claim_rev3["lease_version"]),
+                publication_target_bar_end=claim_rev3["claimed_target_bar_end"],
+                expected_input_version=int(claim_rev3["claimed_input_version"]),
+            )
+            assert await connection.fetchval(
+                "select consumed_input_version from scheme2_chan_c_published_heads "
+                "where symbol_id=$1 and chan_level=10080 and mode='confirmed'",
+                symbol_id,
+            ) == claim_rev3["claimed_input_version"]
+            assert rev3["snapshot_version"] == f"rev3-{suffix}"
 
             next_period_target = datetime(2026, 7, 10, 7, tzinfo=UTC)
             await connection.execute(

@@ -663,6 +663,7 @@ class PostgresChanWriter:
         publication_claim_token: str,
         publication_lease_version: int,
         publication_target_bar_end: datetime,
+        expected_input_version: int,
         expected_head_run_id: int,
         expected_head_base_to_bar_end: datetime,
     ) -> dict[str, Any]:
@@ -687,6 +688,8 @@ class PostgresChanWriter:
             )
             if symbol_id is None:
                 raise RuntimeError(f"Unknown symbol in database: {symbol}")
+            if expected_input_version < 0:
+                raise ValueError("Incremental publication requires a canonical input version")
 
             level_code = timeframe_to_db_code(level)
             base_timeframe_code = timeframe_to_db_code(
@@ -698,7 +701,7 @@ class PostgresChanWriter:
             head = await conn.fetchrow(
                 f"""
                 select run_id, base_from_bar_end, base_to_bar_end, snapshot_version,
-                       updated_at
+                       updated_at, consumed_input_version
                 from {published_heads_table}
                 where symbol_id = $1
                   and chan_level = $2
@@ -733,25 +736,24 @@ class PostgresChanWriter:
                     f"Stale Chan head endpoint for {symbol} {level}: expected {expected_head_base_to_bar_end}, "
                     f"got {head['base_to_bar_end']}"
                 )
-            same_endpoint_revision = False
-            if head["base_to_bar_end"] is not None and bar_until == head["base_to_bar_end"]:
-                same_endpoint_revision = bool(
-                    await conn.fetchval(
-                        """
-                        select exists (
-                            select 1
-                            from klines kline
-                            where kline.symbol_id = $1
-                              and kline.timeframe = $2
-                              and kline.ts = $3
-                              and kline.updated_at > $4
-                        )
-                        """,
-                        symbol_id,
-                        base_timeframe_code,
-                        bar_until,
-                        head["updated_at"],
-                    )
+            same_endpoint_revision = (
+                expected_input_version > int(head["consumed_input_version"])
+            )
+            current_input_version = await conn.fetchval(
+                """
+                select change_version
+                from scheme2_ingest_watermarks
+                where symbol_id = $1 and timeframe = $2
+                """,
+                symbol_id,
+                base_timeframe_code,
+            )
+            if current_input_version is None or int(current_input_version) != int(
+                expected_input_version
+            ):
+                raise StaleChanHeadError(
+                    f"Stale Chan input for {symbol} {level}: expected version "
+                    f"{expected_input_version}, got {current_input_version}"
                 )
             if head["base_to_bar_end"] is not None and (
                 bar_until < head["base_to_bar_end"]
@@ -806,6 +808,7 @@ class PostgresChanWriter:
                         base_timeframe_code=base_timeframe_code,
                         anchor_bar_end=anchor_bar_end,
                         claimed_target_bar_end=publication_target_bar_end,
+                        expected_input_version=expected_input_version,
                         expected_head_run_id=expected_head_run_id,
                         expected_head_base_to_bar_end=expected_head_base_to_bar_end,
                     )
@@ -896,6 +899,7 @@ class PostgresChanWriter:
                         expected_run_id=expected_head_run_id or int(head["run_id"]),
                         old_base_to_bar_end=head["base_to_bar_end"],
                         publication_claim_token=publication_claim_token,
+                        expected_input_version=expected_input_version,
                     )
                     await self._upsert_recompute_watermarks(
                         conn,
@@ -938,6 +942,7 @@ class PostgresChanWriter:
         base_timeframe_code: int,
         anchor_bar_end: datetime,
         claimed_target_bar_end: datetime,
+        expected_input_version: int,
         expected_head_run_id: int,
         expected_head_base_to_bar_end: datetime,
     ) -> None:
@@ -954,6 +959,7 @@ class PostgresChanWriter:
                    task.lease_until,
                    task.anchor_bar_end,
                    task.claimed_target_bar_end,
+                   task.claimed_input_version,
                    task.target_bar_end,
                    task.expected_head_run_id,
                    task.expected_head_base_to_bar_end
@@ -980,6 +986,8 @@ class PostgresChanWriter:
             and task["lease_until"] > checked_at
             and task["anchor_bar_end"] == anchor_bar_end
             and task["claimed_target_bar_end"] == claimed_target_bar_end
+            and task["claimed_input_version"] is not None
+            and int(task["claimed_input_version"]) == expected_input_version
             and task["target_bar_end"] is not None
             and task["target_bar_end"] >= claimed_target_bar_end
             and task["expected_head_run_id"] is not None
@@ -1005,6 +1013,8 @@ class PostgresChanWriter:
             """
             with completion as (
                 select id,
+                       target_input_version > coalesce(claimed_input_version, -1)
+                           as has_new_input,
                        case
                            when chan_level = 10080 then
                                date_trunc('week', target_bar_end at time zone 'Asia/Shanghai')
@@ -1023,7 +1033,7 @@ class PostgresChanWriter:
             )
             update scheme2_chan_c_tail_tasks task
             set status = case
-                    when completion.has_new_period then 'pending'
+                    when completion.has_new_period or completion.has_new_input then 'pending'
                     else 'success'
                 end,
                 last_success_bar_end = $4,
@@ -1031,11 +1041,11 @@ class PostgresChanWriter:
                 consecutive_failures = 0,
                 backoff_until = null,
                 next_run_at = case
-                    when completion.has_new_period then now()
+                    when completion.has_new_period or completion.has_new_input then now()
                     else now() + (schedule_interval_seconds * interval '1 second')
                 end,
                 pending_since = case
-                    when completion.has_new_period then now()
+                    when completion.has_new_period or completion.has_new_input then now()
                     else pending_since
                 end,
                 lease_until = null,
@@ -1043,6 +1053,7 @@ class PostgresChanWriter:
                 worker_id = null,
                 claim_token = null,
                 claimed_target_bar_end = null,
+                claimed_input_version = null,
                 updated_at = now()
             from completion
             where task.id = completion.id
@@ -1289,6 +1300,7 @@ class PostgresChanWriter:
         snapshot_version: str,
         run_id: int,
         expected_run_id: int,
+        expected_input_version: int,
         old_base_to_bar_end: datetime | None = None,
         publication_claim_token: str | None = None,
     ) -> None:
@@ -1306,6 +1318,7 @@ class PostgresChanWriter:
                     run_id = $9,
                     published_at = now(),
                     updated_at = now(),
+                    consumed_input_version = $12,
                     last_error = null
                 where symbol_id = $1
                   and chan_level = $2
@@ -1313,20 +1326,17 @@ class PostgresChanWriter:
                   and base_timeframe = $4
                   and status = 'published'
                   and run_id = $10
+                  and exists (
+                      select 1
+                      from scheme2_ingest_watermarks ingest
+                      where ingest.symbol_id = $1
+                        and ingest.timeframe = $4
+                        and ingest.change_version = $12
+                  )
                   and (
-                      base_to_bar_end is null
-                      or base_to_bar_end < $6
-                      or (
-                          base_to_bar_end = $6
-                          and exists (
-                              select 1
-                              from klines kline
-                              where kline.symbol_id = $1
-                                and kline.timeframe = $4
-                                and kline.ts = $6
-                                and kline.updated_at > head.updated_at
-                          )
-                      )
+                      (base_to_bar_end is null and $12 >= head.consumed_input_version)
+                      or (base_to_bar_end < $6 and $12 >= head.consumed_input_version)
+                      or (base_to_bar_end = $6 and $12 > head.consumed_input_version)
                   )
                 """,
                 symbol_id,
@@ -1340,10 +1350,12 @@ class PostgresChanWriter:
                 run_id,
                 expected_run_id,
                 self.tail_config_hash,
+                expected_input_version,
             )
             if not result.endswith(" 1"):
                 raise StaleChanHeadError(
-                    f"Chan head CAS failed for symbol_id={symbol_id} level={level_code} mode={mode}"
+                    f"Stale Chan input or head CAS failed for symbol_id={symbol_id} "
+                    f"level={level_code} mode={mode} input_version={expected_input_version}"
                 )
             await self._append_head_history_outbox(
                 conn,

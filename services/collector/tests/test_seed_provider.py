@@ -156,6 +156,29 @@ def test_pytdx_marks_the_open_intraday_period_incomplete() -> None:
     assert (closed_bar.complete, closed_bar.revision) == (True, 0)
 
 
+def test_pytdx_close_boundary_requires_one_second_grace() -> None:
+    item = {
+        "datetime": "2026-07-21 09:35",
+        "open": 10,
+        "high": 11,
+        "low": 9,
+        "close": 10.5,
+        "vol": 100,
+    }
+
+    boundary = _tdx_bar_to_bar(
+        "000001.SZ", "5f", item,
+        now=datetime(2026, 7, 21, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    after_grace = _tdx_bar_to_bar(
+        "000001.SZ", "5f", item,
+        now=datetime(2026, 7, 21, 9, 35, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert boundary.complete is False
+    assert after_grace.complete is True
+
+
 def test_pytdx_weekly_period_closes_only_after_the_week() -> None:
     item = {
         "datetime": "2026-07-20",

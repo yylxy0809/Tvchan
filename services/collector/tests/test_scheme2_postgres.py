@@ -201,6 +201,7 @@ def test_writer_updates_changed_open_bar_and_never_downgrades_closed_bar() -> No
     assert "klines.is_complete and not excluded.is_complete" in normalized
     assert "is distinct from" in normalized
     assert "klines.revision + 1" in normalized
+    assert "excluded.is_complete and klines.is_complete" in normalized
 
 
 def test_watermark_changes_only_for_a_new_or_revised_canonical_bar() -> None:
@@ -231,9 +232,10 @@ def test_watermark_changes_only_for_a_new_or_revised_canonical_bar() -> None:
 
     normalized = " ".join(asyncio.run(scenario()).lower().split())
 
-    assert "join klines" in normalized
-    assert "canonical.updated_at" in normalized
-    assert "note, updated_at" in normalized
+    assert "from klines kline" in normalized
+    assert "max(kline.updated_at)" in normalized
+    assert "change_version" in normalized
+    assert "first_bar_end" in normalized
     assert "excluded.updated_at > scheme2_ingest_watermarks.updated_at" in normalized
 
 

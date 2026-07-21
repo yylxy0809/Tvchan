@@ -4,6 +4,8 @@ import asyncio
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 
+import pytest
+
 import collector.chan_c_stream as stream
 from collector.chan_c_stream import (
     bars_through_claimed_period,
@@ -116,6 +118,7 @@ def test_chan_c_stream_clips_each_publication_to_its_claimed_target(monkeypatch)
             "claimed_target_bar_end": first,
             "claim_token": "claim-a",
             "lease_version": 7,
+            "claimed_input_version": 2,
         },
         {
             "id": 11,
@@ -126,6 +129,7 @@ def test_chan_c_stream_clips_each_publication_to_its_claimed_target(monkeypatch)
             "claimed_target_bar_end": second,
             "claim_token": "claim-b",
             "lease_version": 8,
+            "claimed_input_version": 2,
         },
     ]
 
@@ -226,6 +230,7 @@ def test_weekly_process_accepts_canonical_bar_before_raw_period_label(
                     "claimed_target_bar_end": claimed_friday,
                     "claim_token": "claim-week",
                     "lease_version": 9,
+                    "claimed_input_version": 2,
                 }
             ],
             chan_py_path=None,
@@ -304,6 +309,7 @@ def test_later_tail_failure_does_not_reclassify_an_already_completed_task(
             "claimed_target_bar_end": first,
             "claim_token": "claim-a",
             "lease_version": 7,
+            "claimed_input_version": 2,
         },
         {
             "id": 11,
@@ -315,6 +321,7 @@ def test_later_tail_failure_does_not_reclassify_an_already_completed_task(
             "claimed_target_bar_end": second,
             "claim_token": "claim-b",
             "lease_version": 8,
+            "claimed_input_version": 2,
         },
     ]
 
@@ -355,8 +362,45 @@ def test_chan_c_stream_discovers_and_publishes_same_endpoint_revisions() -> None
         / "chan_postgres.py"
     ).read_text(encoding="utf-8")
 
-    assert "ingest.updated_at > head.updated_at" in storage_source
-    assert "kline.updated_at > head.updated_at" in writer_source
+    assert "ingest.change_version > head.consumed_input_version" in storage_source
+    assert "ingest.change_version = $12" in writer_source
+
+
+def test_chan_c_stream_retries_then_fails_closed_on_redis_false(monkeypatch) -> None:
+    target = datetime(2026, 7, 3, 7, 0, tzinfo=UTC)
+    bar = Bar("000001.SZ", "5f", target, 10, 11, 9, 10.5, 100)
+    attempts = 0
+
+    class KlineWriter:
+        async def get_bars_chunk(self, *_args, **_kwargs):
+            return [bar]
+
+    class ChanWriter:
+        async def replace_incremental_analysis(self, **_kwargs):
+            return {"run_id": 1, "snapshot_version": "v1"}
+
+    async def fake_compute(**_kwargs):
+        return {"snapshot_version": "v1", "strokes": [], "segments": [], "centers": [], "signals": []}
+
+    async def failed_publish(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return False
+
+    monkeypatch.setattr(stream, "compute_module_c_overlay", fake_compute)
+    monkeypatch.setattr(stream, "validate_module_c_response", lambda **_kwargs: None)
+    monkeypatch.setattr(stream, "filter_chan_response_level", lambda response, _level: response)
+    monkeypatch.setattr(stream, "publish_chan_head_update", failed_publish)
+
+    with pytest.raises(RuntimeError, match="failed after 3 attempts"):
+        asyncio.run(stream.process_symbol_tail(
+            kline_writer=KlineWriter(), chan_writer=ChanWriter(), symbol="000001.SZ",
+            jobs=[{"id": 1, "chan_level": 5, "mode": "confirmed", "anchor_bar_end": target,
+                   "last_bar_end": target, "claimed_target_bar_end": target,
+                   "claimed_input_version": 2, "claim_token": "claim", "lease_version": 1}],
+            chan_py_path=None, tail_bar_limit=10, context_bars=0, redis_url="redis://unused",
+        ))
+    assert attempts == 3
 
 
 def test_closed_period_cutoffs_use_current_local_week_and_month_start() -> None:
