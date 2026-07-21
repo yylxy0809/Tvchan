@@ -80,6 +80,8 @@ class Settings:
             raise RuntimeError("DATABASE_POOL_MIN_SIZE must be greater than zero")
         if self.database_pool_max_size < self.database_pool_min_size:
             raise RuntimeError("DATABASE_POOL_MAX_SIZE must be at least DATABASE_POOL_MIN_SIZE")
+        if self.database_pool_max_size > 32:
+            raise RuntimeError("DATABASE_POOL_MAX_SIZE must be at most 32")
         if self.chan_lifecycle_observer_stale_seconds <= 0:
             raise RuntimeError("CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS must be greater than zero")
         if self.api_token and self.admin_api_token and self.api_token == self.admin_api_token:

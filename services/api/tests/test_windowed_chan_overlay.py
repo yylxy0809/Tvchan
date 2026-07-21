@@ -55,6 +55,11 @@ class _Conn:
     async def fetchval(self, *_args):
         return 1
 
+    async def execute(self, query, *_args):
+        self.queries.append(query)
+        self.args.append(_args)
+        return "SET"
+
     async def fetch(self, query, *_args):
         self.queries.append(query)
         self.args.append(_args)
@@ -148,6 +153,9 @@ def test_windowed_detail_keeps_one_line_on_each_boundary_and_raw_geometry() -> N
         assert "unnest($1::bigint[], $2::integer[], $3::text[]) with ordinality" in stroke_query.lower()
         assert "tstzrange(coalesce(detail.begin_base_ts, detail.start_ts), coalesce(detail.end_base_ts, detail.end_ts), '[]')" in stroke_query
         assert stroke_query.count("limit 1") == 2
+        assert "cross join lateral" in stroke_query.lower()
+        assert "limit $6" in stroke_query.lower()
+        assert conn.queries[0] == "set local statement_timeout = '1000ms'"
         assert conn.transactions == [{"isolation": "repeatable_read", "readonly": True}]
     asyncio.run(scenario())
 
@@ -268,6 +276,8 @@ def test_windowed_detail_batches_all_level_mode_runs_into_four_queries() -> None
         ]
         assert len(detail) == 4
         for _query, args in detail:
+            assert "cross join lateral" in _query.lower()
+            assert _query.lower().count("limit $6") >= 2
             assert len(args[0]) == len(args[1]) == len(args[2]) == 6
             assert args[2] == ["5f", "5f", "30f", "30f", "1d", "1d"]
 

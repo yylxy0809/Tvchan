@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from app.core.config import Settings, get_settings
@@ -128,3 +130,22 @@ def test_database_pool_sizes_fail_fast(monkeypatch, minimum: str, maximum: str, 
 
     with pytest.raises(RuntimeError, match=message):
         Settings()
+
+
+def test_database_pool_maximum_has_a_hard_upper_bound(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_POOL_MAX_SIZE", "33")
+
+    with pytest.raises(RuntimeError, match="at most 32"):
+        Settings()
+
+
+def test_websocket_access_log_omits_query_arguments() -> None:
+    nginx = (
+        Path(__file__).resolve().parents[3] / "deploy/nginx.tv.conf"
+    ).read_text(encoding="utf-8")
+
+    assert '"$request_method $uri $server_protocol"' in nginx
+    assert "access_log /var/log/nginx/ws_access.log ws_no_args;" in nginx
+    ws_location = nginx.split("location /ws/ {", 1)[1].split("}", 1)[0]
+    assert "$request_uri" not in ws_location
+    assert "$args" not in ws_location

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -36,8 +37,12 @@ CHAN_SNAPSHOT_INTERVAL_SECONDS = 3.0
 MAX_SUBSCRIPTIONS_PER_CONNECTION = 32
 MAX_IN_FLIGHT_CHART_REQUESTS = 4
 MAX_CHART_OUTBOX_MESSAGES = 64
+MAX_CHART_OUTBOX_BYTES = 2 * 1024 * 1024
 CHART_REQUEST_TIMEOUT_SECONDS = 7.0
+CHART_QUERY_SLOT_TIMEOUT_SECONDS = 0.25
 CHART_SEND_TIMEOUT_SECONDS = 1.0
+CHART_CLEANUP_TIMEOUT_SECONDS = 1.0
+REDIS_CLEANUP_TIMEOUT_SECONDS = 0.5
 REDIS_CHAN_HEAD_UPDATE_CHANNEL = "chan:head_updates"
 _SLOW_REQUEST_TYPES = frozenset({"get_bars", "get_chan", "get_chart_window", "get_chart_bundle"})
 
@@ -47,23 +52,43 @@ class _ChartSender:
 
     def __init__(self, websocket: WebSocket) -> None:
         self._websocket = websocket
-        self._outbox: asyncio.PriorityQueue[tuple[int, int, dict[str, Any]]] = (
+        self._outbox: asyncio.PriorityQueue[tuple[int, int, int, dict[str, Any]]] = (
             asyncio.PriorityQueue(maxsize=MAX_CHART_OUTBOX_MESSAGES)
         )
+        self._outbox_condition = asyncio.Condition()
+        self._outbox_bytes = 0
         self._sequence = 0
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         self._sequence += 1
         priority = 0 if payload.get("type") == "pong" else 1
+        payload_bytes = len(
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        if payload_bytes > MAX_CHART_OUTBOX_BYTES:
+            raise ValueError("Chart response exceeds the outbound byte budget")
         await asyncio.wait_for(
-            self._outbox.put((priority, self._sequence, payload)),
+            self._enqueue(priority, self._sequence, payload_bytes, payload),
             timeout=CHART_SEND_TIMEOUT_SECONDS,
         )
+
+    async def _enqueue(
+        self, priority: int, sequence: int, payload_bytes: int, payload: dict[str, Any]
+    ) -> None:
+        async with self._outbox_condition:
+            await self._outbox_condition.wait_for(
+                lambda: (
+                    not self._outbox.full()
+                    and self._outbox_bytes + payload_bytes <= MAX_CHART_OUTBOX_BYTES
+                )
+            )
+            self._outbox_bytes += payload_bytes
+            self._outbox.put_nowait((priority, sequence, payload_bytes, payload))
 
     async def run(self) -> None:
         try:
             while True:
-                _priority, _sequence, payload = await self._outbox.get()
+                _priority, _sequence, payload_bytes, payload = await self._outbox.get()
                 try:
                     await asyncio.wait_for(
                         self._websocket.send_json(payload),
@@ -71,6 +96,9 @@ class _ChartSender:
                     )
                 finally:
                     self._outbox.task_done()
+                    async with self._outbox_condition:
+                        self._outbox_bytes -= payload_bytes
+                        self._outbox_condition.notify_all()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -150,12 +178,10 @@ async def chart_ws(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
     finally:
-        producer_task.cancel()
-        for task in request_tasks:
-            task.cancel()
-        await asyncio.gather(producer_task, *request_tasks, return_exceptions=True)
-        writer_task.cancel()
-        await asyncio.gather(writer_task, return_exceptions=True)
+        await _cancel_chart_tasks(
+            producer_task, writer_task, *request_tasks,
+            timeout=CHART_CLEANUP_TIMEOUT_SECONDS,
+        )
 
 
 async def _run_chart_request(
@@ -167,9 +193,10 @@ async def _run_chart_request(
 ) -> None:
     try:
         async with asyncio.timeout(CHART_REQUEST_TIMEOUT_SECONDS):
-            await _handle_chart_message(
-                websocket, request_adapter, message, request_id, subscriptions
-            )
+            async with _chart_query_slot(request_adapter):
+                await _handle_chart_message(
+                    websocket, request_adapter, message, request_id, subscriptions
+                )
     except asyncio.CancelledError:
         raise
     except TimeoutError:
@@ -192,6 +219,46 @@ def _finish_request_task(
     tasks.discard(task)
     if not task.cancelled():
         task.exception()
+
+
+class ChartQueryCapacityError(RuntimeError):
+    pass
+
+
+@asynccontextmanager
+async def _chart_query_slot(request_adapter: "_RequestAdapter"):
+    app = getattr(request_adapter, "app", None)
+    state = getattr(app, "state", None)
+    semaphore = getattr(state, "chart_query_semaphore", None)
+    if semaphore is None:
+        settings = get_settings()
+        semaphore = asyncio.Semaphore(_chart_query_capacity(settings.database_pool_max_size))
+        if state is not None:
+            state.chart_query_semaphore = semaphore
+    try:
+        await asyncio.wait_for(
+            semaphore.acquire(), timeout=CHART_QUERY_SLOT_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        raise ChartQueryCapacityError("Chart server is busy; retry shortly") from exc
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
+def _chart_query_capacity(database_pool_max_size: int) -> int:
+    return max(1, database_pool_max_size - 1)
+
+
+async def _cancel_chart_tasks(
+    *tasks: asyncio.Task[Any], timeout: float
+) -> None:
+    active = [task for task in tasks if not task.done()]
+    for task in active:
+        task.cancel()
+    if active:
+        await asyncio.wait(active, timeout=timeout)
 
 
 async def _handle_chart_message(
@@ -398,9 +465,10 @@ async def _publish_chan_updates(
         )
     finally:
         try:
-            await pubsub.unsubscribe(REDIS_CHAN_HEAD_UPDATE_CHANNEL)
-            await pubsub.aclose()
-            await redis_client.aclose()
+            async with asyncio.timeout(REDIS_CLEANUP_TIMEOUT_SECONDS):
+                await pubsub.unsubscribe(REDIS_CHAN_HEAD_UPDATE_CHANNEL)
+                await pubsub.aclose()
+                await redis_client.aclose()
         except Exception:
             pass
 
@@ -447,18 +515,19 @@ async def _send_chan_subscription_updates(
                     reason="source_sequence_gap",
                     source_event=event,
                 )
-            overlay = await build_chan_overlay(
-                request=request_adapter,
-                symbol=subscription.params.symbol,
-                timeframe=subscription.params.timeframe,
-                levels=subscription.params.levels,
-                modes=subscription.params.modes,
-                from_ts=subscription.params.from_ts,
-                to_ts=subscription.params.to_ts,
-                limit=subscription.params.limit,
-                settings=settings,
-                authoritative_window=True,
-            )
+            async with _chart_query_slot(request_adapter):
+                overlay = await build_chan_overlay(
+                    request=request_adapter,
+                    symbol=subscription.params.symbol,
+                    timeframe=subscription.params.timeframe,
+                    levels=subscription.params.levels,
+                    modes=subscription.params.modes,
+                    from_ts=subscription.params.from_ts,
+                    to_ts=subscription.params.to_ts,
+                    limit=subscription.params.limit,
+                    settings=settings,
+                    authoritative_window=True,
+                )
             payload = _dump_model(overlay)
             if event is not None:
                 stream = _source_stream(event)
@@ -642,17 +711,18 @@ async def _send_legacy_bundle(
     settings: Any,
 ) -> None:
     params = subscription.params
-    bundle = await build_chart_bundle_v3(
-        request=request_adapter,
-        symbol=params.symbol,
-        timeframe=params.timeframe,
-        levels=params.levels,
-        modes=params.modes,
-        from_ts=params.from_ts,
-        to_ts=params.to_ts,
-        limit=params.limit,
-        settings=settings,
-    )
+    async with _chart_query_slot(request_adapter):
+        bundle = await build_chart_bundle_v3(
+            request=request_adapter,
+            symbol=params.symbol,
+            timeframe=params.timeframe,
+            levels=params.levels,
+            modes=params.modes,
+            from_ts=params.from_ts,
+            to_ts=params.to_ts,
+            limit=params.limit,
+            settings=settings,
+        )
     version = bundle.snapshot_version or bundle.snapshot_id
     if subscription.snapshot_version == version:
         return
@@ -677,14 +747,18 @@ async def _try_create_redis_client(redis_url: str):
     client = None
     try:
         client = redis.from_url(
-            redis_url, decode_responses=True, socket_connect_timeout=0.2
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=0.2,
+            socket_timeout=0.5,
         )
         await client.ping()
         return client
     except Exception:
         if client is not None:
             try:
-                await client.aclose()
+                async with asyncio.timeout(REDIS_CLEANUP_TIMEOUT_SECONDS):
+                    await client.aclose()
             except Exception:
                 pass
         return None

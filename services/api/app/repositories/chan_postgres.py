@@ -28,6 +28,7 @@ DB_TO_DIRECTION = {
     -1: "down",
 }
 MAX_OVERLAY_ITEMS_PER_KIND = 2_000
+OVERLAY_STATEMENT_TIMEOUT_MS = 1_000
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 MODULE_C_CHAN_TABLES = {
@@ -246,6 +247,9 @@ async def _get_windowed_module_c_overlay_db(
     code, exchange = split_symbol(symbol)
     async with pool.acquire() as conn:
         async with conn.transaction(isolation="repeatable_read", readonly=True):
+            await conn.execute(
+                f"set local statement_timeout = '{OVERLAY_STATEMENT_TIMEOUT_MS}ms'"
+            )
             symbol_id = await conn.fetchval(
                 "select id from symbols where code = $1 and exchange = $2 and is_active = true",
                 code, exchange,
@@ -357,53 +361,58 @@ async def _fetch_windowed_stroke_like_batch(
             select run_id, mode_code, requested_level, request_ordinal
             from unnest($1::bigint[], $2::integer[], $3::text[]) with ordinality
                  as item(run_id, mode_code, requested_level, request_ordinal)
-        ), candidates as (
-            select requested.request_ordinal, requested.requested_level, 1 as boundary_order,
-                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
-                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
-                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
-                   detail.begin_base_seq, detail.end_base_seq,
-                   detail.start_price_x1000, detail.end_price_x1000,
-                   detail.direction, detail.is_confirmed, detail.extra
-            from requested
-            join {table} detail on detail.run_id = requested.run_id
-                               and detail.mode = requested.mode_code
-            where tstzrange(coalesce(detail.begin_base_ts, detail.start_ts), coalesce(detail.end_base_ts, detail.end_ts), '[]')
-                  && tstzrange($4, $5, '[]')
-            union all
-            select requested.request_ordinal, requested.requested_level, 0 as boundary_order,
-                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
-                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
-                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
-                   detail.begin_base_seq, detail.end_base_seq,
-                   detail.start_price_x1000, detail.end_price_x1000,
-                   detail.direction, detail.is_confirmed, detail.extra
-            from requested
-            cross join lateral (
-                select item.* from {table} item
-                where item.run_id = requested.run_id and item.mode = requested.mode_code
-                  and coalesce(item.end_base_ts, item.end_ts) < $4
-                order by coalesce(item.end_base_ts, item.end_ts) desc, item.seq desc, item.id desc
-                limit 1
-            ) detail
-            union all
-            select requested.request_ordinal, requested.requested_level, 2 as boundary_order,
-                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
-                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
-                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
-                   detail.begin_base_seq, detail.end_base_seq,
-                   detail.start_price_x1000, detail.end_price_x1000,
-                   detail.direction, detail.is_confirmed, detail.extra
-            from requested
-            cross join lateral (
-                select item.* from {table} item
-                where item.run_id = requested.run_id and item.mode = requested.mode_code
-                  and coalesce(item.begin_base_ts, item.start_ts) > $5
-                order by coalesce(item.begin_base_ts, item.start_ts), item.seq, item.id
-                limit 1
-            ) detail
         )
-        select * from candidates
+        select requested.request_ordinal, requested.requested_level,
+               detail.boundary_order,
+               detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
+               detail.begin_base_ts, detail.end_base_ts,
+               detail.begin_base_seq, detail.end_base_seq,
+               detail.start_price_x1000, detail.end_price_x1000,
+               detail.direction, detail.is_confirmed, detail.extra
+        from requested
+        cross join lateral (
+            (select 1 as boundary_order,
+                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
+                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
+                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
+                   detail.begin_base_seq, detail.end_base_seq,
+                   detail.start_price_x1000, detail.end_price_x1000,
+                   detail.direction, detail.is_confirmed, detail.extra
+            from {table} detail
+            where detail.run_id = requested.run_id
+              and detail.mode = requested.mode_code
+              and tstzrange(coalesce(detail.begin_base_ts, detail.start_ts), coalesce(detail.end_base_ts, detail.end_ts), '[]')
+                  && tstzrange($4, $5, '[]')
+            order by coalesce(detail.begin_base_ts, detail.start_ts),
+                     coalesce(detail.end_base_ts, detail.end_ts), detail.seq, detail.id
+            limit $6)
+            union all
+            (select 0 as boundary_order,
+                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
+                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
+                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
+                   detail.begin_base_seq, detail.end_base_seq,
+                   detail.start_price_x1000, detail.end_price_x1000,
+                   detail.direction, detail.is_confirmed, detail.extra
+            from {table} detail
+            where detail.run_id = requested.run_id and detail.mode = requested.mode_code
+              and coalesce(detail.end_base_ts, detail.end_ts) < $4
+            order by coalesce(detail.end_base_ts, detail.end_ts) desc, detail.seq desc, detail.id desc
+            limit 1)
+            union all
+            (select 2 as boundary_order,
+                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
+                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
+                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
+                   detail.begin_base_seq, detail.end_base_seq,
+                   detail.start_price_x1000, detail.end_price_x1000,
+                   detail.direction, detail.is_confirmed, detail.extra
+            from {table} detail
+            where detail.run_id = requested.run_id and detail.mode = requested.mode_code
+              and coalesce(detail.begin_base_ts, detail.start_ts) > $5
+            order by coalesce(detail.begin_base_ts, detail.start_ts), detail.seq, detail.id
+            limit 1)
+        ) detail
         order by request_ordinal, boundary_order, begin_base_ts, end_base_ts, seq, id
         limit $6
         """,
@@ -435,10 +444,17 @@ async def _fetch_windowed_centers_batch(
                detail.begin_base_seq, detail.end_base_seq,
                detail.low_x1000, detail.high_x1000, detail.is_confirmed, detail.extra
         from requested
-        join chan_c_centers detail on detail.run_id = requested.run_id
-                                  and detail.mode = requested.mode_code
-        where tstzrange(coalesce(detail.begin_base_ts, detail.start_ts), coalesce(detail.end_base_ts, detail.end_ts), '[]')
-              && tstzrange($4, $5, '[]')
+        cross join lateral (
+            select item.*
+            from chan_c_centers item
+            where item.run_id = requested.run_id
+              and item.mode = requested.mode_code
+              and tstzrange(coalesce(item.begin_base_ts, item.start_ts), coalesce(item.end_base_ts, item.end_ts), '[]')
+                  && tstzrange($4, $5, '[]')
+            order by coalesce(item.begin_base_ts, item.start_ts),
+                     coalesce(item.end_base_ts, item.end_ts), item.seq, item.id
+            limit $6
+        ) detail
         order by requested.request_ordinal, begin_base_ts, end_base_ts, detail.seq, detail.id
         limit $6
         """,
@@ -468,10 +484,16 @@ async def _fetch_windowed_signals_batch(
                detail.base_seq, detail.price_x1000, detail.signal_type,
                detail.is_confirmed, detail.extra
         from requested
-        join chan_c_signals detail on detail.run_id = requested.run_id
-                                  and detail.mode = requested.mode_code
-        where coalesce(detail.base_ts, detail.ts) >= $4
-          and coalesce(detail.base_ts, detail.ts) <= $5
+        cross join lateral (
+            select item.*
+            from chan_c_signals item
+            where item.run_id = requested.run_id
+              and item.mode = requested.mode_code
+              and coalesce(item.base_ts, item.ts) >= $4
+              and coalesce(item.base_ts, item.ts) <= $5
+            order by coalesce(item.base_ts, item.ts), item.id
+            limit $6
+        ) detail
         order by requested.request_ordinal, base_ts, detail.id
         limit $6
         """,

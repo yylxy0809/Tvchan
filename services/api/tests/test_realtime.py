@@ -4,8 +4,11 @@ import asyncio
 from concurrent.futures import CancelledError as FutureCancelledError
 import json
 import threading
+import time
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app.main import create_app
 from app.models import (
@@ -320,6 +323,86 @@ def test_chart_ws_sender_serializes_all_producers() -> None:
         await asyncio.gather(writer, return_exceptions=True)
         assert socket.max_active == 1
         assert len(socket.messages) == 8
+
+    asyncio.run(scenario())
+
+
+def test_chart_ws_sender_enforces_byte_budget(monkeypatch) -> None:
+    class Socket:
+        async def send_json(self, _payload):
+            return None
+
+    async def scenario():
+        monkeypatch.setattr(chart_ws, "MAX_CHART_OUTBOX_BYTES", 100)
+        monkeypatch.setattr(chart_ws, "CHART_SEND_TIMEOUT_SECONDS", 0.01)
+        sender = chart_ws._ChartSender(Socket())
+        await sender.send_json({"type": "event", "value": "x" * 45})
+        with pytest.raises(TimeoutError):
+            await sender.send_json({"type": "event", "value": "y" * 45})
+        with pytest.raises(ValueError, match="outbound byte budget"):
+            await sender.send_json({"type": "event", "value": "z" * 100})
+
+    asyncio.run(scenario())
+
+
+def test_chart_ws_global_query_slot_is_pool_linked_and_times_out(monkeypatch) -> None:
+    async def scenario():
+        assert chart_ws._chart_query_capacity(1) == 1
+        assert chart_ws._chart_query_capacity(8) == 7
+        semaphore = asyncio.Semaphore(1)
+        await semaphore.acquire()
+        adapter = chart_ws._RequestAdapter(
+            SimpleNamespace(state=SimpleNamespace(chart_query_semaphore=semaphore))
+        )
+        monkeypatch.setattr(chart_ws, "CHART_QUERY_SLOT_TIMEOUT_SECONDS", 0.01)
+        with pytest.raises(chart_ws.ChartQueryCapacityError, match="server is busy"):
+            async with chart_ws._chart_query_slot(adapter):
+                raise AssertionError("capacity guard was bypassed")
+
+    asyncio.run(scenario())
+
+
+def test_chart_ws_cleanup_has_a_total_deadline() -> None:
+    async def scenario():
+        release = asyncio.Event()
+
+        async def delays_cancellation():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        task = asyncio.create_task(delays_cancellation())
+        await asyncio.sleep(0)
+        started = time.monotonic()
+        await chart_ws._cancel_chart_tasks(task, timeout=0.01)
+        assert time.monotonic() - started < 0.2
+        assert not task.done()
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(scenario())
+
+
+def test_chart_ws_redis_client_has_read_timeout(monkeypatch) -> None:
+    import redis.asyncio as redis
+
+    captured = {}
+
+    class Client:
+        async def ping(self):
+            return True
+
+    def fake_from_url(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return Client()
+
+    async def scenario():
+        monkeypatch.setattr(redis, "from_url", fake_from_url)
+        client = await chart_ws._try_create_redis_client("redis://test")
+        assert client is not None
+        assert captured["socket_connect_timeout"] == 0.2
+        assert captured["socket_timeout"] == 0.5
 
     asyncio.run(scenario())
 
