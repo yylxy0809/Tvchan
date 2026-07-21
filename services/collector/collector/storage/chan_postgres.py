@@ -701,7 +701,8 @@ class PostgresChanWriter:
             head = await conn.fetchrow(
                 f"""
                 select run_id, base_from_bar_end, base_to_bar_end, snapshot_version,
-                       updated_at, consumed_input_version
+                       updated_at, consumed_input_version, batch_id,
+                       publication_namespace, profile_id, run_group_id
                 from {published_heads_table}
                 where symbol_id = $1
                   and chan_level = $2
@@ -721,6 +722,24 @@ class PostgresChanWriter:
             if head is None:
                 raise RuntimeError(
                     f"No published Chan head for incremental publish: {symbol} {level}"
+                )
+            inherited_provenance = (
+                head["batch_id"],
+                head["publication_namespace"],
+                head["profile_id"],
+                head["run_group_id"],
+            )
+            if (
+                not isinstance(inherited_provenance[0], int)
+                or isinstance(inherited_provenance[0], bool)
+                or inherited_provenance[0] <= 0
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in inherited_provenance[1:]
+                )
+            ):
+                raise RuntimeError(
+                    f"Published Chan head provenance is incomplete: {symbol} {level}"
                 )
             if expected_head_run_id is not None and int(head["run_id"]) != int(
                 expected_head_run_id
@@ -784,6 +803,12 @@ class PostgresChanWriter:
                     f"{head['snapshot_version']}:tail:{int(anchor_bar_end.timestamp())}:"
                     f"{int(bar_until.timestamp())}"
                 )
+            run_identity = hashlib.sha256(
+                (
+                    f"{head['batch_id']}|{head['run_group_id']}|{symbol}|{level}|"
+                    f"{snapshot_version}|{expected_input_version}"
+                ).encode("utf-8")
+            ).hexdigest()
             combined_response = await self._build_incremental_response(
                 conn,
                 previous_run_id=int(head["run_id"]),
@@ -828,9 +853,24 @@ class PostgresChanWriter:
                             computed_at,
                             run_kind,
                             run_group_id,
-                            cutoff_bar_end
+                            cutoff_bar_end,
+                            base_timeframe,
+                            batch_id,
+                            publication_namespace,
+                            profile_id,
+                            run_identity,
+                            provenance
                         )
-                        values ($1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(), $9, $10, $6)
+                        values (
+                            $1, $2, 0, $3, $4, $5, $6, $7, 'running', $8, now(),
+                            $9, $10, $6, $11, $12, $13, $14, $15,
+                            jsonb_build_object(
+                                'source', $16::text,
+                                'profile', $17::text,
+                                'parent_run_id', $18::bigint,
+                                'input_version', $19::bigint
+                            )
+                        )
                         returning id
                         """,
                         symbol_id,
@@ -842,7 +882,16 @@ class PostgresChanWriter:
                         int(bar_count or 0),
                         snapshot_version,
                         self.run_kind,
-                        self.run_group_id,
+                        head["run_group_id"],
+                        base_timeframe_code,
+                        head["batch_id"],
+                        head["publication_namespace"],
+                        head["profile_id"],
+                        run_identity,
+                        self.publication_source,
+                        self.publication_profile,
+                        head["run_id"],
+                        expected_input_version,
                     )
                     stroke_count = await self._insert_stroke_like(
                         conn,
@@ -900,6 +949,7 @@ class PostgresChanWriter:
                         old_base_to_bar_end=head["base_to_bar_end"],
                         publication_claim_token=publication_claim_token,
                         expected_input_version=expected_input_version,
+                        publication_run_group_id=str(head["run_group_id"]),
                     )
                     await self._upsert_recompute_watermarks(
                         conn,
@@ -1303,6 +1353,7 @@ class PostgresChanWriter:
         expected_input_version: int,
         old_base_to_bar_end: datetime | None = None,
         publication_claim_token: str | None = None,
+        publication_run_group_id: str | None = None,
     ) -> None:
         table = self.tables["published_heads"]
         for mode in modes:
@@ -1370,6 +1421,7 @@ class PostgresChanWriter:
                 snapshot_version=snapshot_version,
                 claim_token=publication_claim_token,
                 config_hash=self.tail_config_hash,
+                run_group_id=publication_run_group_id,
             )
         return {
             "run_id": int(run_id),
@@ -1391,6 +1443,7 @@ class PostgresChanWriter:
         snapshot_version: str,
         claim_token: str | None = None,
         config_hash: str | None = None,
+        run_group_id: str | None = None,
     ) -> None:
         await conn.execute(
             """
@@ -1417,7 +1470,8 @@ class PostgresChanWriter:
             on conflict (head_history_id) do nothing
             """,
             symbol_id, level_code, mode, base_timeframe_code,
-            config_hash or self.run_config_hash, self.publication_profile, self.run_group_id,
+            config_hash or self.run_config_hash, self.publication_profile,
+            run_group_id or self.run_group_id,
             old_run_id, new_run_id, old_base_to_bar_end, new_base_to_bar_end,
             snapshot_version, self.worker_id, claim_token or self.claim_token, self.publication_source,
         )
