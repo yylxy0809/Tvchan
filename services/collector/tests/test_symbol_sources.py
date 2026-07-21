@@ -67,6 +67,26 @@ def test_tencent_12_digit_minute_timestamp_parses_as_bar_end() -> None:
     assert parsed.second == 0
 
 
+def test_http_providers_mark_the_open_intraday_period_incomplete() -> None:
+    now = datetime(2026, 7, 21, 13, 4, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    tencent = tencent_row_to_bar(
+        "000001.SZ",
+        "5f",
+        ["202607211305", "10", "10.5", "11", "9", "100"],
+        now=now,
+    )
+    baidu = baidu_row_to_bar(
+        "000001.SZ",
+        "5f",
+        ["202607211305", "10", "11", "9", "10.5", "100"],
+        now=now,
+    )
+
+    assert (tencent.complete, tencent.revision) == (False, 1)
+    assert (baidu.complete, baidu.revision) == (False, 1)
+
+
 def test_date_only_provider_rows_normalize_to_daily_close() -> None:
     tencent = tencent_row_to_bar("000001.SZ", "1d", ["2026-07-10", "10", "11", "12", "9", "1"])
     baidu = baidu_row_to_bar("000001.SZ", "1d", ["2026-07-10", "10", "11", "9", "12", "1"])
