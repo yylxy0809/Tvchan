@@ -10,6 +10,7 @@ import {
   setChanStudyOverlay,
 } from "./chanStudy";
 import {
+  CHAN_STUDY_REFRESH_INPUT_ID,
   chanOverlaySettingsToStudyInputs,
   studyInputItemsFromSettings,
   studyInputValuesToOverlaySettings,
@@ -121,6 +122,7 @@ const overlayCenterShapeIds = new WeakMap<TradingViewWidget, Map<string, ShapeId
 const overlayStrokeShapeIds = new WeakMap<TradingViewWidget, Map<string, ShapeId[]>>();
 const studyIds = new WeakMap<TradingViewWidget, ShapeId>();
 const studyDatasetKeys = new WeakMap<TradingViewWidget, string>();
+const studyRefreshRevisions = new WeakMap<TradingViewWidget, number>();
 const studySettingsSyncTimers = new WeakMap<TradingViewWidget, number>();
 const studyInputSignatures = new WeakMap<TradingViewWidget, string>();
 const studySettingsChangeHandlers = new WeakMap<
@@ -607,6 +609,7 @@ function removeChanStudy(widget: TradingViewWidget, chart: TradingViewChart): vo
   }
   studyIds.delete(widget);
   studyDatasetKeys.delete(widget);
+  studyRefreshRevisions.delete(widget);
 }
 
 function hasChanStudy(chart: TradingViewChart, studyId: ShapeId): boolean {
@@ -634,7 +637,15 @@ function readCurrentChanStudySettings(
 }
 
 function studyInputSignature(values: StudyInputValueItem[]): string {
-  return JSON.stringify(values.map((item) => [item.id, item.value]));
+  return JSON.stringify(values
+    .filter((item) => item.id !== CHAN_STUDY_REFRESH_INPUT_ID)
+    .map((item) => [item.id, item.value]));
+}
+
+function refreshChanStudyDataset(widget: TradingViewWidget, study: TradingViewStudy): void {
+  const revision = (studyRefreshRevisions.get(widget) ?? 0) + 1;
+  study.setInputValues([{ id: CHAN_STUDY_REFRESH_INPUT_ID, value: revision }]);
+  studyRefreshRevisions.set(widget, revision);
 }
 
 function stopChanStudySettingsSync(widget: TradingViewWidget): void {
@@ -738,11 +749,19 @@ async function renderChanStudy(
     const effectiveSettings = existingId === undefined
       ? settings
       : readCurrentChanStudySettings(chart, existingId, settings);
-    const shouldRecreate = existingId !== undefined && existingDatasetKey !== datasetKey;
-    if (shouldRecreate) {
+    const datasetChanged = existingId !== undefined && existingDatasetKey !== datasetKey;
+    let refreshed = false;
+    let recreated = false;
+    if (existingId !== undefined && datasetChanged) {
       if (!isCurrent()) return false;
-      removeChanStudy(widget, chart);
-      existingId = undefined;
+      try {
+        refreshChanStudyDataset(widget, chart.getStudyById(existingId));
+        refreshed = true;
+      } catch {
+        removeChanStudy(widget, chart);
+        existingId = undefined;
+        recreated = true;
+      }
     }
     const studyId = await ensureChanStudy(widget, effectiveSettings, isCurrent);
     if (studyId !== undefined) {
@@ -761,7 +780,8 @@ async function renderChanStudy(
       ready: studyId !== undefined,
       studyId: studyId ?? null,
       datasetKey,
-      recreated: shouldRecreate,
+      refreshed,
+      recreated,
       reused: existingId !== undefined && existingDatasetKey === datasetKey,
       settingsPreserved: existingDatasetKey !== undefined,
     });
