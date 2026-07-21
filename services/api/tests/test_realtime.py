@@ -43,9 +43,11 @@ def test_realtime_rejects_bad_token() -> None:
 
 def test_realtime_accepts_bearer_subprotocol_without_query_token() -> None:
     client = TestClient(create_app())
+    protocol = _ws_bearer_protocol("dev-local-token")
     with client.websocket_connect(
-        "/ws/v1/realtime", subprotocols=[_ws_bearer_protocol("dev-local-token")]
+        "/ws/v1/realtime", subprotocols=[protocol]
     ) as ws:
+        assert ws.accepted_subprotocol == protocol
         ws.send_json({"type": "ping"})
         assert ws.receive_json()["type"] == "pong"
 
@@ -58,7 +60,7 @@ def test_realtime_disconnect_waits_for_producer_cleanup(monkeypatch) -> None:
         scope = {"app": SimpleNamespace(state=SimpleNamespace())}
         query_params = {}
 
-        async def accept(self) -> None:
+        async def accept(self, **_kwargs) -> None:
             return None
 
         async def receive_json(self):
@@ -102,9 +104,11 @@ def test_chart_ws_rejects_bad_token() -> None:
 
 def test_chart_ws_accepts_bearer_subprotocol_without_query_token() -> None:
     client = TestClient(create_app())
+    protocol = _ws_bearer_protocol("dev-local-token")
     with client.websocket_connect(
-        "/ws/v2/chart", subprotocols=[_ws_bearer_protocol("dev-local-token")]
+        "/ws/v2/chart", subprotocols=[protocol]
     ) as ws:
+        assert ws.accepted_subprotocol == protocol
         ws.send_json({"type": "ping"})
         assert ws.receive_json()["type"] == "pong"
 

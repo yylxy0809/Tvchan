@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.security import (
     AuthenticationServiceUnavailable,
     authenticate_token_value,
+    websocket_bearer_subprotocol,
     websocket_token_value,
 )
 from app.routes.chan import DEFAULT_MODES, _display_levels_for_chart, build_chan_overlay
@@ -113,6 +114,7 @@ class _ChartSender:
 @router.websocket("/ws/v2/chart")
 async def chart_ws(websocket: WebSocket) -> None:
     settings = get_settings()
+    subprotocol = websocket_bearer_subprotocol(websocket)
     token = websocket_token_value(websocket)
     if settings.api_token or settings.admin_api_token:
         app = websocket.scope.get("app")
@@ -122,18 +124,18 @@ async def chart_ws(websocket: WebSocket) -> None:
             )
         except AuthenticationServiceUnavailable:
             # A pre-accept close is converted to an HTTP 403 by ASGI servers.
-            await websocket.accept()
+            await websocket.accept(subprotocol=subprotocol)
             await websocket.close(code=1013)
             return
     else:
         principal = True
     if principal is None:
         # Complete the handshake so the client receives the policy close code.
-        await websocket.accept()
+        await websocket.accept(subprotocol=subprotocol)
         await websocket.close(code=1008)
         return
 
-    await websocket.accept()
+    await websocket.accept(subprotocol=subprotocol)
     request_adapter = _RequestAdapter(websocket.scope.get("app"))
     subscriptions: dict[str, _ChartSubscription] = {}
     sender = _ChartSender(websocket)
