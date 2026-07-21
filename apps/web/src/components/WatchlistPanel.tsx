@@ -719,7 +719,7 @@ export function WatchlistPanel({
           <h3>策略信号</h3>
           <div className="tv-strategy-signal-list">
             {(profile?.strategySignals ?? []).map((item) => (
-              <StrategySignalRow key={item.key} signal={item} />
+              <StrategySignalRow key={item.eventId} signal={item} />
             ))}
           </div>
         </div>
@@ -785,12 +785,16 @@ function chanModeLabel(mode: ChanStrokeState["mode"]): string {
 }
 
 function StrategySignalRow({ signal }: { signal: StrategySignal }) {
+  const eventTime = signal.disappearTime ?? signal.confirmTime ?? signal.firstSeenTime ?? signal.pointTime;
   return (
     <div className="tv-strategy-signal-row">
       <span>{signal.label}</span>
       <strong data-direction={directionOfSignalTone(signal.tone)}>
         {signal.value}
       </strong>
+      <small data-status={signal.status}>{signal.status}</small>
+      <time dateTime={eventTime ?? undefined}>{eventTime ?? "--"}</time>
+      <code title="稳定事件 ID">{signal.eventId}</code>
     </div>
   );
 }

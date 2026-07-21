@@ -88,6 +88,8 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       USE_SEED_DATA: "false"
       DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@timescaledb:5432/${POSTGRES_DB:-tradingview_local}
+      DATABASE_POOL_MIN_SIZE: ${DATABASE_POOL_MIN_SIZE:-1}
+      DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-8}
       REDIS_URL: redis://redis:6379/0
       CHAN_LIFECYCLE_OBSERVER: ${CHAN_LIFECYCLE_OBSERVER:-chan-lifecycle-v1}
       CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS: ${CHAN_LIFECYCLE_OBSERVER_STALE_SECONDS:-120}
@@ -130,7 +132,7 @@ services:
     ports:
       - "${WEB_GATEWAY_BIND:-0.0.0.0}:${WEB_GATEWAY_PORT:-8080}:80"
     healthcheck:
-      test: ["CMD-SHELL", "test -s /usr/share/nginx/html/index.html && wget -qO- http://127.0.0.1/healthz >/dev/null"]
+      test: ["CMD-SHELL", "test -s /usr/share/nginx/html/index.html && test -s /usr/share/nginx/html/charting_library/charting_library.js && wget -qO- http://127.0.0.1/healthz >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -152,7 +154,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.collector
     container_name: tv_backend_market_fill_worker
-    profiles: ["manual-market-fill"]
+    profiles: ["manual-market-fill", "realtime-pipeline"]
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -171,6 +173,7 @@ services:
       MARKET_FILL_SYMBOL_LIMIT: ${MARKET_FILL_SYMBOL_LIMIT:-10}
       MARKET_FILL_TIMEFRAMES: ${MARKET_FILL_TIMEFRAMES:-5f,15f,30f,1h,1d,1w,1m}
       MARKET_FILL_BAR_LIMIT: ${MARKET_FILL_BAR_LIMIT:-300}
+      MARKET_FILL_CONCURRENCY: ${MARKET_FILL_CONCURRENCY:-1}
       MARKET_FILL_SLEEP: ${MARKET_FILL_SLEEP:-0.25}
       MARKET_FILL_LOOP: ${MARKET_FILL_LOOP:-1}
       MARKET_FILL_LOOP_INTERVAL: ${MARKET_FILL_LOOP_INTERVAL:-60}

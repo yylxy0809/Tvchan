@@ -65,6 +65,7 @@ export async function loginWithToken(token: string): Promise<AuthSession> {
         Authorization: `Bearer ${normalized}`,
       },
       body: JSON.stringify({ token: normalized }),
+      signal: AbortSignal.timeout(1_000),
     });
     if (!response.ok) {
       throw new AuthenticationError(
@@ -93,7 +94,7 @@ export async function loginWithToken(token: string): Promise<AuthSession> {
     if (error instanceof AuthenticationError) {
       throw error;
     }
-    if (error instanceof TypeError) {
+    if (error instanceof TypeError || (error instanceof DOMException && error.name === "TimeoutError")) {
       throw new AuthenticationError("Authentication service unavailable.");
     }
     throw error;

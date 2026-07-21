@@ -7,6 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
+    "check:runtime-assets": "node scripts/check-charting-library.mjs",
     "test:contract": "npx --yes tsx --test src/config.contract.test.ts src/auth/api.contract.test.ts src/app/sessionPersistence.contract.test.ts src/api/chanOverlayManager.contract.test.ts src/api/chanRealtimeOverlayBridge.contract.test.ts src/api/chanRealtimeLive.contract.test.ts src/tradingview/chanStudy.contract.test.ts src/tradingview/datafeed.contract.test.ts src/api/chartDataManager.contract.test.ts src/api/marketData.contract.test.ts src/api/marketSidebar.contract.test.ts src/components/StrongestTodayPanel.contract.test.tsx src/components/StockNewsPanel.contract.test.tsx src/components/WatchlistPanel.contract.test.tsx src/components/AdminConsole.contract.test.tsx"
   },
   "dependencies": {

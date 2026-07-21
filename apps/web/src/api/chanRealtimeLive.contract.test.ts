@@ -12,6 +12,7 @@ import { installAsyncSubscription } from "../components/ChartWorkspace";
 class FakeWebSocket {
   static readonly OPEN = 1;
   static instances: FakeWebSocket[] = [];
+  static failFirstConnection = false;
   readyState = 0;
   sent: unknown[] = [];
   onopen: (() => void) | null = null;
@@ -21,8 +22,13 @@ class FakeWebSocket {
 
   constructor(readonly url: string) {
     FakeWebSocket.instances.push(this);
+    const shouldFail = FakeWebSocket.failFirstConnection && FakeWebSocket.instances.length === 1;
     queueMicrotask(() => {
       if (this.readyState !== 0) return;
+      if (shouldFail) {
+        this.onerror?.();
+        return;
+      }
       this.readyState = FakeWebSocket.OPEN;
       this.onopen?.();
     });
@@ -198,7 +204,7 @@ test("session reset closes chart and realtime sockets still connecting", async (
   assert.equal(chartSocket.readyState, 3);
   assert.equal(realtimeSocket.readyState, 3);
   (await chartSubscription)();
-  await assert.rejects(realtimeSubscription, /Authentication session changed/);
+  (await realtimeSubscription)();
 });
 
 test("an open realtime socket error reconnects and fences late messages", async (t) => {
@@ -228,6 +234,37 @@ test("an open realtime socket error reconnects and fences late messages", async 
   assert.deepEqual(FakeWebSocket.instances[1].sent[0], {
     type: "subscribe", id: "bar:000001.SZ:5f", symbol: "000001.SZ", timeframes: ["5f"],
   });
+  release();
+});
+
+test("an initial realtime connection failure retains the subscription and retries after 250ms", async (t) => {
+  const original = globalThis.WebSocket;
+  (globalThis as { WebSocket?: typeof WebSocket }).WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  FakeWebSocket.instances = [];
+  FakeWebSocket.failFirstConnection = true;
+  const manager = new ChartDataManager();
+  const feedback: Array<{ state: string; lastEventAt?: number }> = [];
+  const releaseFeedback = manager.subscribeRealtimeFeedback((event) => feedback.push(event));
+  t.after(() => {
+    manager.resetSession();
+    releaseFeedback();
+    FakeWebSocket.failFirstConnection = false;
+    globalThis.WebSocket = original;
+  });
+
+  const release = await manager.subscribeRealtimeBars({
+    symbol: "000001.SZ", timeframe: "5f",
+  }, () => {}, () => {});
+
+  assert.equal(FakeWebSocket.instances.length, 1);
+  await sleep(300);
+  assert.equal(FakeWebSocket.instances.length, 2);
+  assert.deepEqual(FakeWebSocket.instances[1].sent[0], {
+    type: "subscribe", id: "bar:000001.SZ:5f", symbol: "000001.SZ", timeframes: ["5f"],
+  });
+  assert.equal(feedback.some((event) => event.state === "connecting"), true);
+  assert.equal(feedback.some((event) => event.state === "degraded"), true);
+  assert.equal(feedback[feedback.length - 1]?.state, "live");
   release();
 });
 

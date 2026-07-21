@@ -1,6 +1,6 @@
 import { Moon, Sun } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { chartDataManager } from "../api/chartDataManager";
+import { chartDataManager, type RealtimeFeedback } from "../api/chartDataManager";
 import { createHttpMarketSidebarTransport } from "../api/marketSidebar";
 import { MarketSidebarStore } from "../api/marketSidebarStore";
 import { ChanOverlayManager, chanLevelsForTimeframe } from "../api/chanOverlayManager";
@@ -95,6 +95,8 @@ export function ChartWorkspace({
   const remoteIndicatorSettingsReadyRef = useRef(false);
   const suppressNextIndicatorSettingsSyncRef = useRef(false);
   const [chartMode, setChartMode] = useState<ChartMode>("loading");
+  const [realtimeFeedback, setRealtimeFeedback] = useState<RealtimeFeedback>({ state: "connecting", channel: "bars" });
+  const [feedbackNow, setFeedbackNow] = useState(Date.now);
   const [bars, setBars] = useState<ApiBar[]>([]);
   const [currentSymbol, setCurrentSymbol] = useState(loadInitialChartSymbol);
   const [confirmedChartSymbol, setConfirmedChartSymbol] = useState(loadInitialChartSymbol);
@@ -117,6 +119,15 @@ export function ChartWorkspace({
     marketSidebarStore.getSnapshot,
     marketSidebarStore.getSnapshot,
   );
+
+  useEffect(() => {
+    const unsubscribe = chartDataManager.subscribeRealtimeFeedback(setRealtimeFeedback);
+    const timer = window.setInterval(() => setFeedbackNow(Date.now()), 250);
+    return () => {
+      unsubscribe();
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     void marketSidebarStore.start();
@@ -596,6 +607,11 @@ export function ChartWorkspace({
         >
           {chartTheme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
         </button>
+        <div className="chart-realtime-status" data-state={realtimeFeedback.state} role="status" aria-live="polite">
+          <strong>{realtimeStateLabel(realtimeFeedback.state)}</strong>
+          <span>{realtimeFeedback.channel === "bars" ? "K线" : "缠论"}</span>
+          <span>最近事件 {formatRealtimeAge(realtimeFeedback.lastEventAt, feedbackNow)}</span>
+        </div>
         {chartMode === "loading" ? (
           <div className="chart-loading">Loading TradingView</div>
         ) : null}
@@ -620,6 +636,17 @@ export function ChartWorkspace({
       />
     </section>
   );
+}
+
+function realtimeStateLabel(state: RealtimeFeedback["state"]): string {
+  if (state === "live") return "实时";
+  if (state === "degraded") return "已降级";
+  return "连接中";
+}
+
+function formatRealtimeAge(lastEventAt: number | undefined, now: number): string {
+  if (lastEventAt === undefined) return "--";
+  return `${Math.max(0, now - lastEventAt)}ms`;
 }
 
 async function refreshFallbackBars(

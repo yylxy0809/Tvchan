@@ -315,3 +315,22 @@ test("login attempt fence makes the latest attempt win and invalidates unmounted
   fence.dispose();
   assert.equal(fence.isCurrent(second), false);
 });
+
+test("login aborts a stalled request after one second", async (t) => {
+  t.after(restoreGlobals);
+  installWindow({
+    getItem() { return null; }, setItem() {}, removeItem() {}, clear() {}, key() { return null; }, length: 0,
+  });
+  globalThis.fetch = async (_input, init) => {
+    const signal = init?.signal;
+    assert.ok(signal);
+    return new Promise<Response>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  };
+
+  const startedAt = Date.now();
+  await assert.rejects(loginWithToken("deadline-token"), /Authentication service unavailable/);
+  assert.ok(Date.now() - startedAt >= 900);
+  assert.ok(Date.now() - startedAt < 1_300);
+});

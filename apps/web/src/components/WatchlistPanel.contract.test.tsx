@@ -83,3 +83,31 @@ test("renders Chan stroke status with Chinese labels", () => {
   assert.match(html, /已确认/);
   assert.doesNotMatch(html, /5f stroke|5f unavailable|Predictive|Confirmed|>Up</);
 });
+
+test("renders stable strategy lifecycle identity, status, and event time", () => {
+  const html = renderToStaticMarkup(
+    <WatchlistPanel
+      activeSymbol="000001.SZ"
+      onSelectSymbol={() => undefined}
+      onWatchlistSymbolsChange={() => undefined}
+      quotes={{}}
+      profile={{
+        symbol: "000001.SZ", name: "平安银行", exchange: "SZ", code: "000001", assetType: "stock",
+        latestPrice: null, dayChangePercent: null, volume: null, amount: null, sector: null, concepts: [],
+        marketCap: null, peRatio: null, turnoverRate: null, fundFlow: { net: null, main: null, retail: null },
+        chanStrokeStates: [], strategySignals: [{
+          key: "b2", eventId: "evt-stable-42", label: "二买", value: "confirmed", tone: "up", source: "local_db",
+          eventType: "strategy_lifecycle", status: "active", sourceLevel: "1d", sourceSignalType: "b2",
+          sourceSignalSide: "buy", pointTime: "2026-07-21T09:35:00+08:00",
+          firstSeenTime: "2026-07-21T09:36:00+08:00", confirmTime: "2026-07-21T09:37:00+08:00",
+          disappearTime: null, sourceSnapshotVersion: "snapshot-9", confidenceScore: 0.9, strengthScore: 0.8,
+        }], source: "iwencai", freshness: "fresh", asOf: "2026-07-21T09:37:00+08:00", tradingDate: "2026-07-21",
+      }}
+      sidebarStatus={{ state: "ready" }}
+    />,
+  );
+
+  assert.match(html, /evt-stable-42/);
+  assert.match(html, /active/);
+  assert.match(html, /2026-07-21T09:37:00\+08:00/);
+});

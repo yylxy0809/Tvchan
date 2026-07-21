@@ -27,3 +27,12 @@ test("frontend configuration cannot mint authenticated sessions", () => {
   assert.doesNotMatch(source, /isFrontendAdminToken/);
   assert.doesNotMatch(source, /isFrontendLoginToken/);
 });
+
+test("gateway keeps entry configuration uncached and versioned runtime assets immutable", () => {
+  const source = readFileSync(new URL("../../../deploy/nginx.tv.conf", import.meta.url), "utf8");
+
+  assert.match(source, /location = \/app-config\.js[\s\S]*no-store/);
+  assert.match(source, /location = \/index\.html[\s\S]*no-store/);
+  assert.match(source, /location \/assets\/[\s\S]*max-age=31536000, immutable/);
+  assert.match(source, /location \/charting_library\/[\s\S]*max-age=31536000, immutable/);
+});
