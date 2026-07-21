@@ -386,7 +386,7 @@ def _logical_key(timeframe: int) -> str:
 
 
 def _expected_sources(timeframe: int) -> str:
-    return "(2,4,9)" if timeframe in (5, 30, 1440) else "(8)"
+    return "(2,4,6,9)" if timeframe in (5, 30, 1440) else "(8)"
 
 
 def build_gate_sql(timeframe: int) -> str:

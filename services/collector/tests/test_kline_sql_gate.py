@@ -80,7 +80,13 @@ def test_validation_contract_is_aggregated_in_sql() -> None:
     assert "between 575 and 690" in sql
     assert "between 785 and 900" in sql
     assert "unexpected_source" in sql
-    assert "source not in (2,4,9)" in sql
+    assert "source not in (2,4,6,9)" in sql
+
+
+def test_intraday_and_daily_contract_accepts_live_tencent_canonical_rows() -> None:
+    for timeframe in (5, 30, 1440):
+        sql = build_gate_sql(timeframe).lower()
+        assert "source not in (2,4,6,9)" in sql
 
 
 def test_catalog_scope_is_cross_checked_inside_each_imported_snapshot() -> None:
