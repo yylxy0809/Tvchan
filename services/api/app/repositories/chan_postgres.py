@@ -245,54 +245,41 @@ async def _get_windowed_module_c_overlay_db(
 ) -> ChanOverlayResponse | None:
     code, exchange = split_symbol(symbol)
     async with pool.acquire() as conn:
-        symbol_id = await conn.fetchval(
-            "select id from symbols where code = $1 and exchange = $2 and is_active = true",
-            code, exchange,
-        )
-        if symbol_id is None:
-            return None
-        runs = await _select_windowed_module_c_runs(
-            conn, symbol_id=symbol_id, levels=levels, modes=modes,
-            first_ts=first_ts, last_ts=last_ts,
-        )
-        if runs is None:
-            return None
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            symbol_id = await conn.fetchval(
+                "select id from symbols where code = $1 and exchange = $2 and is_active = true",
+                code, exchange,
+            )
+            if symbol_id is None:
+                return None
+            runs = await _select_windowed_module_c_runs(
+                conn, symbol_id=symbol_id, levels=levels, modes=modes,
+                first_ts=first_ts, last_ts=last_ts,
+            )
+            if runs is None:
+                return None
 
-        strokes: list[ChanStrokeResponse] = []
-        segments: list[ChanStrokeResponse] = []
-        centers: list[ChanCenterResponse] = []
-        signals: list[ChanSignalResponse] = []
-        budget = _OutputBudget(MAX_OVERLAY_ITEMS_PER_KIND)
-        for level in levels:
-            for mode in modes:
-                run = runs[(level, mode)]
-                mode_code = MODE_TO_DB[mode]
-                strokes.extend(
-                    _stroke_row_to_response(row, level)
-                    for row in await _fetch_windowed_stroke_like(
-                        conn, MODULE_C_CHAN_TABLES["strokes"], run["run_id"], mode_code,
-                        first_ts, last_ts, budget,
-                    )
-                )
-                segments.extend(
-                    _stroke_row_to_response(row, level)
-                    for row in await _fetch_windowed_stroke_like(
-                        conn, MODULE_C_CHAN_TABLES["segments"], run["run_id"], mode_code,
-                        first_ts, last_ts, budget,
-                    )
-                )
-                centers.extend(
-                    _center_row_to_response(row, level)
-                    for row in await _fetch_windowed_centers(
-                        conn, run["run_id"], mode_code, first_ts, last_ts, budget,
-                    )
-                )
-                signals.extend(
-                    _signal_row_to_response(row, level)
-                    for row in await _fetch_windowed_signals(
-                        conn, run["run_id"], mode_code, first_ts, last_ts, budget,
-                    )
-                )
+            run_ids, mode_codes, run_levels = _windowed_run_arguments(runs, levels, modes)
+            budget = _OutputBudget(MAX_OVERLAY_ITEMS_PER_KIND)
+            stroke_rows = await _fetch_windowed_stroke_like_batch(
+                conn, MODULE_C_CHAN_TABLES["strokes"], run_ids, mode_codes,
+                run_levels, first_ts, last_ts, budget,
+            )
+            segment_rows = await _fetch_windowed_stroke_like_batch(
+                conn, MODULE_C_CHAN_TABLES["segments"], run_ids, mode_codes,
+                run_levels, first_ts, last_ts, budget,
+            )
+            center_rows = await _fetch_windowed_centers_batch(
+                conn, run_ids, mode_codes, run_levels, first_ts, last_ts, budget,
+            )
+            signal_rows = await _fetch_windowed_signals_batch(
+                conn, run_ids, mode_codes, run_levels, first_ts, last_ts, budget,
+            )
+
+        strokes = [_stroke_row_to_response(row, row["requested_level"]) for row in stroke_rows]
+        segments = [_stroke_row_to_response(row, row["requested_level"]) for row in segment_rows]
+        centers = [_center_row_to_response(row, row["requested_level"]) for row in center_rows]
+        signals = [_signal_row_to_response(row, row["requested_level"]) for row in signal_rows]
 
     return ChanOverlayResponse(
         symbol=symbol, chart_timeframe=chart_timeframe, levels=levels, modes=modes,
@@ -301,6 +288,19 @@ async def _get_windowed_module_c_overlay_db(
         requested_bar_count=requested_bar_count, bars_by_level={level: 0 for level in levels},
         strokes=_sort_detail(strokes), segments=_sort_detail(segments),
         centers=_sort_detail(centers), signals=_sort_detail(signals), channels=[],
+    )
+
+
+def _windowed_run_arguments(
+    runs: dict[tuple[str, str], dict[str, Any]],
+    levels: list[str],
+    modes: list[str],
+) -> tuple[list[int], list[int], list[str]]:
+    ordered = [(level, mode, runs[(level, mode)]) for level in levels for mode in modes]
+    return (
+        [int(run["run_id"]) for _level, _mode, run in ordered],
+        [MODE_TO_DB[mode] for _level, mode, _run in ordered],
+        [level for level, _mode, _run in ordered],
     )
 
 
@@ -337,6 +337,147 @@ async def _select_windowed_module_c_runs(
     if len(selected) != len(levels) * len(modes):
         return None
     return selected
+
+
+async def _fetch_windowed_stroke_like_batch(
+    conn,
+    table: str,
+    run_ids: list[int],
+    mode_codes: list[int],
+    levels: list[str],
+    first_ts: datetime,
+    last_ts: datetime,
+    budget: _OutputBudget,
+):
+    if table not in {MODULE_C_CHAN_TABLES["strokes"], MODULE_C_CHAN_TABLES["segments"]}:
+        raise ValueError("Unsupported Module C line table")
+    rows = await conn.fetch(
+        f"""
+        with requested as (
+            select run_id, mode_code, requested_level, request_ordinal
+            from unnest($1::bigint[], $2::integer[], $3::text[]) with ordinality
+                 as item(run_id, mode_code, requested_level, request_ordinal)
+        ), candidates as (
+            select requested.request_ordinal, requested.requested_level, 1 as boundary_order,
+                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
+                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
+                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
+                   detail.begin_base_seq, detail.end_base_seq,
+                   detail.start_price_x1000, detail.end_price_x1000,
+                   detail.direction, detail.is_confirmed, detail.extra
+            from requested
+            join {table} detail on detail.run_id = requested.run_id
+                               and detail.mode = requested.mode_code
+            where tstzrange(coalesce(detail.begin_base_ts, detail.start_ts), coalesce(detail.end_base_ts, detail.end_ts), '[]')
+                  && tstzrange($4, $5, '[]')
+            union all
+            select requested.request_ordinal, requested.requested_level, 0 as boundary_order,
+                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
+                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
+                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
+                   detail.begin_base_seq, detail.end_base_seq,
+                   detail.start_price_x1000, detail.end_price_x1000,
+                   detail.direction, detail.is_confirmed, detail.extra
+            from requested
+            cross join lateral (
+                select item.* from {table} item
+                where item.run_id = requested.run_id and item.mode = requested.mode_code
+                  and coalesce(item.end_base_ts, item.end_ts) < $4
+                order by coalesce(item.end_base_ts, item.end_ts) desc, item.seq desc, item.id desc
+                limit 1
+            ) detail
+            union all
+            select requested.request_ordinal, requested.requested_level, 2 as boundary_order,
+                   detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
+                   coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
+                   coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
+                   detail.begin_base_seq, detail.end_base_seq,
+                   detail.start_price_x1000, detail.end_price_x1000,
+                   detail.direction, detail.is_confirmed, detail.extra
+            from requested
+            cross join lateral (
+                select item.* from {table} item
+                where item.run_id = requested.run_id and item.mode = requested.mode_code
+                  and coalesce(item.begin_base_ts, item.start_ts) > $5
+                order by coalesce(item.begin_base_ts, item.start_ts), item.seq, item.id
+                limit 1
+            ) detail
+        )
+        select * from candidates
+        order by request_ordinal, boundary_order, begin_base_ts, end_base_ts, seq, id
+        limit $6
+        """,
+        run_ids, mode_codes, levels, first_ts, last_ts, budget.remaining + 1,
+    )
+    return budget.consume(rows)
+
+
+async def _fetch_windowed_centers_batch(
+    conn,
+    run_ids: list[int],
+    mode_codes: list[int],
+    levels: list[str],
+    first_ts: datetime,
+    last_ts: datetime,
+    budget: _OutputBudget,
+):
+    rows = await conn.fetch(
+        """
+        with requested as (
+            select run_id, mode_code, requested_level, request_ordinal
+            from unnest($1::bigint[], $2::integer[], $3::text[]) with ordinality
+                 as item(run_id, mode_code, requested_level, request_ordinal)
+        )
+        select requested.request_ordinal, requested.requested_level,
+               detail.id, detail.mode, detail.seq, detail.start_ts, detail.end_ts,
+               coalesce(detail.begin_base_ts, detail.start_ts) as begin_base_ts,
+               coalesce(detail.end_base_ts, detail.end_ts) as end_base_ts,
+               detail.begin_base_seq, detail.end_base_seq,
+               detail.low_x1000, detail.high_x1000, detail.is_confirmed, detail.extra
+        from requested
+        join chan_c_centers detail on detail.run_id = requested.run_id
+                                  and detail.mode = requested.mode_code
+        where tstzrange(coalesce(detail.begin_base_ts, detail.start_ts), coalesce(detail.end_base_ts, detail.end_ts), '[]')
+              && tstzrange($4, $5, '[]')
+        order by requested.request_ordinal, begin_base_ts, end_base_ts, detail.seq, detail.id
+        limit $6
+        """,
+        run_ids, mode_codes, levels, first_ts, last_ts, budget.remaining + 1,
+    )
+    return budget.consume(rows)
+
+
+async def _fetch_windowed_signals_batch(
+    conn,
+    run_ids: list[int],
+    mode_codes: list[int],
+    levels: list[str],
+    first_ts: datetime,
+    last_ts: datetime,
+    budget: _OutputBudget,
+):
+    rows = await conn.fetch(
+        """
+        with requested as (
+            select run_id, mode_code, requested_level, request_ordinal
+            from unnest($1::bigint[], $2::integer[], $3::text[]) with ordinality
+                 as item(run_id, mode_code, requested_level, request_ordinal)
+        )
+        select requested.request_ordinal, requested.requested_level,
+               detail.id, detail.mode, detail.ts, coalesce(detail.base_ts, detail.ts) as base_ts,
+               detail.base_seq, detail.price_x1000, detail.signal_type,
+               detail.is_confirmed, detail.extra
+        from requested
+        join chan_c_signals detail on detail.run_id = requested.run_id
+                                  and detail.mode = requested.mode_code
+        where coalesce(detail.base_ts, detail.ts) >= $4
+          and coalesce(detail.base_ts, detail.ts) <= $5
+        order by requested.request_ordinal, base_ts, detail.id
+        limit $6
+        """,
+        run_ids, mode_codes, levels, first_ts, last_ts, budget.remaining + 1,
+    )
+    return budget.consume(rows)
 
 
 async def _fetch_windowed_stroke_like(

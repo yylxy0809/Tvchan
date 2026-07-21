@@ -20,14 +20,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "asyncpg is required when USE_SEED_DATA=false. "
                 "Install services/api/requirements.txt."
             ) from exc
-        # Chart reads are coalesced by the frontend managers. One lazy reader
-        # avoids compiling the same hypertable query independently on idle
-        # connections; the local deployment favours predictable latency and
-        # low resource use over parallel chart reads.
         app.state.db_pool = await asyncpg.create_pool(
             settings.database_url,
-            min_size=1,
-            max_size=1,
+            min_size=settings.database_pool_min_size,
+            max_size=settings.database_pool_max_size,
         )
     repository = getattr(app.state, "market_sidebar_repository", None)
     set_db_pool = getattr(repository, "set_db_pool", None)

@@ -34,7 +34,51 @@ from trading_protocol import normalize_timeframe
 router = APIRouter(tags=["chart-ws"])
 CHAN_SNAPSHOT_INTERVAL_SECONDS = 3.0
 MAX_SUBSCRIPTIONS_PER_CONNECTION = 32
+MAX_IN_FLIGHT_CHART_REQUESTS = 4
+MAX_CHART_OUTBOX_MESSAGES = 64
+CHART_REQUEST_TIMEOUT_SECONDS = 7.0
+CHART_SEND_TIMEOUT_SECONDS = 1.0
 REDIS_CHAN_HEAD_UPDATE_CHANNEL = "chan:head_updates"
+_SLOW_REQUEST_TYPES = frozenset({"get_bars", "get_chan", "get_chart_window", "get_chart_bundle"})
+
+
+class _ChartSender:
+    """Bound every producer behind one prioritized ASGI writer."""
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+        self._outbox: asyncio.PriorityQueue[tuple[int, int, dict[str, Any]]] = (
+            asyncio.PriorityQueue(maxsize=MAX_CHART_OUTBOX_MESSAGES)
+        )
+        self._sequence = 0
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        self._sequence += 1
+        priority = 0 if payload.get("type") == "pong" else 1
+        await asyncio.wait_for(
+            self._outbox.put((priority, self._sequence, payload)),
+            timeout=CHART_SEND_TIMEOUT_SECONDS,
+        )
+
+    async def run(self) -> None:
+        try:
+            while True:
+                _priority, _sequence, payload = await self._outbox.get()
+                try:
+                    await asyncio.wait_for(
+                        self._websocket.send_json(payload),
+                        timeout=CHART_SEND_TIMEOUT_SECONDS,
+                    )
+                finally:
+                    self._outbox.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            try:
+                await self._websocket.close(code=1011)
+            except Exception:
+                pass
+            raise
 
 
 @router.websocket("/ws/v2/chart")
@@ -63,19 +107,40 @@ async def chart_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     request_adapter = _RequestAdapter(websocket.scope.get("app"))
     subscriptions: dict[str, _ChartSubscription] = {}
+    sender = _ChartSender(websocket)
+    writer_task = asyncio.create_task(sender.run())
     producer_task = asyncio.create_task(
-        _publish_chan_updates(websocket, request_adapter, subscriptions, settings)
+        _publish_chan_updates(sender, request_adapter, subscriptions, settings)
     )
+    request_tasks: set[asyncio.Task[None]] = set()
     try:
         while True:
             message = await websocket.receive_json()
             request_id = str(message.get("request_id") or "")
+            if str(message.get("type") or "") in _SLOW_REQUEST_TYPES:
+                if len(request_tasks) >= MAX_IN_FLIGHT_CHART_REQUESTS:
+                    await sender.send_json({
+                        "type": "error",
+                        "request_id": request_id,
+                        "error": "Too many in-flight chart requests",
+                    })
+                    continue
+                task = asyncio.create_task(
+                    _run_chart_request(
+                        sender, request_adapter, message, request_id, subscriptions
+                    )
+                )
+                request_tasks.add(task)
+                task.add_done_callback(
+                    lambda completed: _finish_request_task(request_tasks, completed)
+                )
+                continue
             try:
                 await _handle_chart_message(
-                    websocket, request_adapter, message, request_id, subscriptions
+                    sender, request_adapter, message, request_id, subscriptions
                 )
             except Exception as exc:
-                await websocket.send_json(
+                await sender.send_json(
                     {
                         "type": "error",
                         "request_id": request_id,
@@ -86,6 +151,47 @@ async def chart_ws(websocket: WebSocket) -> None:
         return
     finally:
         producer_task.cancel()
+        for task in request_tasks:
+            task.cancel()
+        await asyncio.gather(producer_task, *request_tasks, return_exceptions=True)
+        writer_task.cancel()
+        await asyncio.gather(writer_task, return_exceptions=True)
+
+
+async def _run_chart_request(
+    websocket: Any,
+    request_adapter: "_RequestAdapter",
+    message: dict[str, Any],
+    request_id: str,
+    subscriptions: dict[str, "_ChartSubscription"],
+) -> None:
+    try:
+        async with asyncio.timeout(CHART_REQUEST_TIMEOUT_SECONDS):
+            await _handle_chart_message(
+                websocket, request_adapter, message, request_id, subscriptions
+            )
+    except asyncio.CancelledError:
+        raise
+    except TimeoutError:
+        await websocket.send_json({
+            "type": "error",
+            "request_id": request_id,
+            "error": "Chart request timed out",
+        })
+    except Exception as exc:
+        await websocket.send_json({
+            "type": "error",
+            "request_id": request_id,
+            "error": _error_message(exc),
+        })
+
+
+def _finish_request_task(
+    tasks: set[asyncio.Task[None]], task: asyncio.Task[None]
+) -> None:
+    tasks.discard(task)
+    if not task.cancelled():
+        task.exception()
 
 
 async def _handle_chart_message(

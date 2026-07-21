@@ -751,6 +751,7 @@ def test_redis_repository_maps_published_chan_and_strategy_rows_from_local_db() 
                 }]
             if "strategy_signal_events" in query:
                 return [{
+                    "event_id": "42",
                     "event_type": "entry", "status": "confirmed", "strategy_code": "weekly_daily_b2",
                     "strategy_version": "v1", "source_level": "1d", "source_signal_type": "b2",
                     "source_signal_side": "buy", "point_time": datetime(2026, 7, 10, 6),
@@ -779,8 +780,14 @@ def test_redis_repository_maps_published_chan_and_strategy_rows_from_local_db() 
         }],
     }
     assert projection["strategy_signals"][0] == {
-        "key": "weekly_daily_b2:v1:entry", "label": "weekly_daily_b2",
+        "key": "42", "event_id": "42", "label": "weekly_daily_b2",
         "value": "b2", "tone": "up", "source": "local_db",
+        "event_type": "entry", "status": "confirmed", "source_level": "1d",
+        "source_signal_type": "b2", "source_signal_side": "buy",
+        "point_time": "2026-07-10T06:00:00", "first_seen_time": "2026-07-10T06:00:00",
+        "confirm_time": None, "disappear_time": None,
+        "source_snapshot_version": "strategy-v1", "confidence_score": 0.9,
+        "strength_score": 0.7,
     }
 
 

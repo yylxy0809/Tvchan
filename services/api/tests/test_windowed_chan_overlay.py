@@ -46,6 +46,11 @@ class _Conn:
     def __init__(self):
         self.queries: list[str] = []
         self.args: list[tuple] = []
+        self.transactions: list[dict] = []
+
+    def transaction(self, **kwargs):
+        self.transactions.append(kwargs)
+        return _Acquire(self)
 
     async def fetchval(self, *_args):
         return 1
@@ -62,18 +67,24 @@ class _Conn:
                 "base_to_bar_end": _dt(99), "bar_from": _dt(1),
                 "bar_until": _dt(99), "computed_at": _dt(99),
             }]
+        if "chan_c_strokes" in query and "with requested as" in query:
+            return [
+                {**_line(1, 2, "previous"), "requested_level": "5f"},
+                {**_line(11, 12, "inside"), "requested_level": "5f"},
+                {**_line(21, 22, "following"), "requested_level": "5f"},
+            ]
         if "from chan_c_strokes" in query:
             if "limit 1" in query and " < $3" in query:
                 return [_line(1, 2, "previous")]
             if "limit 1" in query and " > $3" in query:
                 return [_line(21, 22, "following")]
             return [_line(11, 12, "inside")]
-        if "from chan_c_segments" in query:
+        if "chan_c_segments" in query:
             return []
-        if "from chan_c_centers" in query:
-            return [_center(9, 14)]
-        if "from chan_c_signals" in query:
-            return [_signal(12)]
+        if "chan_c_centers" in query:
+            return [{**_center(9, 14), "requested_level": "5f"}]
+        if "chan_c_signals" in query:
+            return [{**_signal(12), "requested_level": "5f"}]
         return []
 
 
@@ -130,12 +141,14 @@ def test_windowed_detail_keeps_one_line_on_each_boundary_and_raw_geometry() -> N
         assert response.snapshot_version == _windowed_snapshot_version("000001.SZ", {
             ("5f", "confirmed"): {"run_id": 7, "snapshot_version": "s-1"},
         })
-        detail_queries = [query for query in conn.queries if "from chan_c_strokes" in query]
-        assert len(detail_queries) == 3
-        assert "run_id = $1 and mode = $2" in detail_queries[0]
-        assert "tstzrange(coalesce(begin_base_ts, start_ts), coalesce(end_base_ts, end_ts), '[]')" in detail_queries[0]
-        assert "limit $5" in detail_queries[0]
-        assert all("limit 1" in query for query in detail_queries[1:])
+        detail_queries = [query for query in conn.queries if "chan_c_" in query and "published_heads" not in query]
+        assert len(detail_queries) == 4
+        assert len([query for query in detail_queries if "chan_c_strokes" in query]) == 1
+        stroke_query = next(query for query in detail_queries if "chan_c_strokes" in query)
+        assert "unnest($1::bigint[], $2::integer[], $3::text[]) with ordinality" in stroke_query.lower()
+        assert "tstzrange(coalesce(detail.begin_base_ts, detail.start_ts), coalesce(detail.end_base_ts, detail.end_ts), '[]')" in stroke_query
+        assert stroke_query.count("limit 1") == 2
+        assert conn.transactions == [{"isolation": "repeatable_read", "readonly": True}]
     asyncio.run(scenario())
 
 
@@ -212,8 +225,52 @@ def test_windowed_queries_cap_at_remaining_plus_one() -> None:
             modes=["confirmed"], first_ts=_dt(10), last_ts=_dt(20), requested_bar_count=3,
         )
         assert response is not None
-        main_line_args = next(args for query, args in zip(conn.queries, conn.args) if "from chan_c_strokes" in query and "limit $5" in query)
+        main_line_args = next(args for query, args in zip(conn.queries, conn.args) if "chan_c_strokes" in query)
         assert main_line_args[-1] == 2_001
+    asyncio.run(scenario())
+
+
+def test_windowed_detail_batches_all_level_mode_runs_into_four_queries() -> None:
+    class BatchConn(_Conn):
+        async def fetch(self, query, *args):
+            self.queries.append(query)
+            self.args.append(args)
+            if "from scheme2_chan_c_published_heads" in query:
+                rows = []
+                for level in (5, 30, 1440):
+                    for index, mode in enumerate(("confirmed", "predictive"), start=1):
+                        rows.append({
+                            "chan_level": level,
+                            "mode": mode,
+                            "run_id": level * 10 + index,
+                            "snapshot_version": f"{level}-{mode}",
+                            "base_from_bar_end": _dt(1),
+                            "base_to_bar_end": _dt(99),
+                            "bar_from": _dt(1),
+                            "bar_until": _dt(99),
+                            "computed_at": _dt(99),
+                        })
+                return rows
+            return []
+
+    async def scenario() -> None:
+        conn = BatchConn()
+        response = await get_windowed_module_c_overlay_db(
+            _Pool(conn), symbol="000001.SZ", chart_timeframe="5f",
+            levels=["5f", "30f", "1d"], modes=["confirmed", "predictive"],
+            first_ts=_dt(10), last_ts=_dt(20), requested_bar_count=3,
+        )
+        assert response is not None
+        detail = [
+            (query, args)
+            for query, args in zip(conn.queries, conn.args)
+            if "with requested as" in query
+        ]
+        assert len(detail) == 4
+        for _query, args in detail:
+            assert len(args[0]) == len(args[1]) == len(args[2]) == 6
+            assert args[2] == ["5f", "5f", "30f", "30f", "1d", "1d"]
+
     asyncio.run(scenario())
 
 

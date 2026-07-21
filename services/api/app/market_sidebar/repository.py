@@ -184,7 +184,7 @@ async def _read_local_projection(connection: Any, symbol: str) -> dict:
     try:
         rows = await connection.fetch(
             """
-            select event_type, status, strategy_code, strategy_version, source_level,
+            select signal.id::text as event_id, event_type, status, strategy_code, strategy_version, source_level,
                    source_signal_type, source_signal_side, point_time, first_seen_time,
                    confirm_time, disappear_time, source_snapshot_version,
                    confidence_score, strength_score
@@ -242,9 +242,22 @@ def _strategy_signal(row: Any) -> dict:
     side = row["source_signal_side"]
     value = row["source_signal_type"] or row["event_type"] or row["status"]
     return {
-        "key": f"{row['strategy_code']}:{row['strategy_version']}:{row['event_type']}",
+        "key": row["event_id"],
+        "event_id": row["event_id"],
         "label": row["strategy_code"],
         "value": str(value),
         "tone": "up" if side == "buy" else "down" if side == "sell" else "neutral",
         "source": "local_db",
+        "event_type": row["event_type"],
+        "status": row["status"],
+        "source_level": row["source_level"],
+        "source_signal_type": row["source_signal_type"],
+        "source_signal_side": side,
+        "point_time": _json_time(row["point_time"]),
+        "first_seen_time": _json_time(row["first_seen_time"]),
+        "confirm_time": _json_time(row["confirm_time"]),
+        "disappear_time": _json_time(row["disappear_time"]),
+        "source_snapshot_version": row["source_snapshot_version"],
+        "confidence_score": float(row["confidence_score"]) if row["confidence_score"] is not None else None,
+        "strength_score": float(row["strength_score"]) if row["strength_score"] is not None else None,
     }

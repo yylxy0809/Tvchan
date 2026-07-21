@@ -92,10 +92,23 @@ class LocalChanState(BaseModel):
 
 class LocalStrategySignal(BaseModel):
     key: str
+    event_id: str
     label: str
     value: str
     tone: Literal["up", "down", "neutral"]
     source: Literal["local_db"]
+    event_type: str
+    status: str
+    source_level: str | None
+    source_signal_type: str | None
+    source_signal_side: str | None
+    point_time: str | None
+    first_seen_time: str | None
+    confirm_time: str | None
+    disappear_time: str | None
+    source_snapshot_version: str | None
+    confidence_score: float | None
+    strength_score: float | None
 
 
 class ActiveProfile(IwencaiDomain):

@@ -106,3 +106,25 @@ def test_lifecycle_observer_stale_threshold_must_be_positive(monkeypatch) -> Non
 
     with pytest.raises(RuntimeError, match="must be greater than zero"):
         Settings()
+
+
+def test_database_pool_sizes_are_bounded_and_configurable(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_POOL_MIN_SIZE", "2")
+    monkeypatch.setenv("DATABASE_POOL_MAX_SIZE", "6")
+
+    settings = Settings()
+
+    assert settings.database_pool_min_size == 2
+    assert settings.database_pool_max_size == 6
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum", "message"),
+    [("0", "8", "MIN_SIZE"), ("4", "3", "MAX_SIZE")],
+)
+def test_database_pool_sizes_fail_fast(monkeypatch, minimum: str, maximum: str, message: str) -> None:
+    monkeypatch.setenv("DATABASE_POOL_MIN_SIZE", minimum)
+    monkeypatch.setenv("DATABASE_POOL_MAX_SIZE", maximum)
+
+    with pytest.raises(RuntimeError, match=message):
+        Settings()
