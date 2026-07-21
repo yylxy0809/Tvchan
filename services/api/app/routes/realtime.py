@@ -211,7 +211,7 @@ async def realtime_ws(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
     finally:
-        producer_task.cancel()
+        await _cancel_task(producer_task)
         await _cancel_task(sidebar_task)
         await _cancel_task(sidebar_listener_task)
         repository = getattr(websocket.scope["app"].state, "market_sidebar_repository", None)
