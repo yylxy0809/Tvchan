@@ -13,6 +13,7 @@ import {
   renderChanOverlay,
 } from "./widget";
 import { createDefaultChanOverlaySettings } from "./overlaySettings";
+import { studyInputItemsFromSettings } from "./chanStudySettings";
 
 const {
   applyPivotBreak,
@@ -343,6 +344,59 @@ test("mid-render stale fence leaves Pine state and study objects untouched", asy
     assert.equal(__CHAN_STUDY_TESTING__.getActiveStudyState(), before);
   } finally {
     Object.assign(globalThis, { window: originalWindow });
+  }
+});
+
+test("a changed overlay dataset recreates the Pine study to recalculate plots", async () => {
+  const originalWindow = globalThis.window;
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const activeStudies = new Set<string>();
+  const removed: string[] = [];
+  let creates = 0;
+  const settings = createDefaultChanOverlaySettings();
+  const study = {
+    applyOverrides: () => {},
+    getInputValues: () => studyInputItemsFromSettings(settings),
+    setUserEditEnabled: () => {},
+  };
+  const chart = {
+    createStudy: async () => {
+      const id = `study-${++creates}`;
+      activeStudies.add(id);
+      return id;
+    },
+    getStudyById: (id: string) => {
+      if (!activeStudies.has(id)) throw new Error("study missing");
+      return study;
+    },
+    removeEntity: (id: string) => {
+      removed.push(id);
+      activeStudies.delete(id);
+    },
+  };
+  const widget = {
+    activeChart: () => chart,
+    onChartReady: (callback: () => void) => callback(),
+  };
+  Object.assign(globalThis, { window: globalThis });
+  globalThis.setInterval = (() => 1) as unknown as typeof globalThis.setInterval;
+  globalThis.clearInterval = (() => {}) as unknown as typeof globalThis.clearInterval;
+  try {
+    assert.equal(await __CHAN_WIDGET_RENDER_TESTING__.renderChanStudy(
+      widget as never, studyOverlay(12), settings, [],
+    ), true);
+    assert.equal(await __CHAN_WIDGET_RENDER_TESTING__.renderChanStudy(
+      widget as never, studyOverlay(13), settings, [],
+    ), true);
+    assert.equal(creates, 2);
+    assert.deepEqual(removed, ["study-1"]);
+  } finally {
+    Object.assign(globalThis, {
+      window: originalWindow,
+      setInterval: originalSetInterval,
+      clearInterval: originalClearInterval,
+    });
   }
 });
 
