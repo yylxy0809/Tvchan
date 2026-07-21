@@ -7,6 +7,7 @@ import httpx
 
 from collector.models import ProviderHealth
 from collector.providers.base import MarketDataProvider
+from collector.providers.pytdx_provider import _is_tdx_period_complete
 from trading_protocol import Bar, SymbolInfo, canonical_kline_timestamp, normalize_timeframe
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -145,16 +146,26 @@ def parse_local_datetime(value: str, timeframe: str, *, timestamp_is_bar_end: bo
     return canonical_kline_timestamp(timeframe, dt, date_only=date_only)
 
 
-def tencent_row_to_bar(symbol: str, timeframe: str, row: list) -> Bar:
+def tencent_row_to_bar(
+    symbol: str,
+    timeframe: str,
+    row: list,
+    *,
+    now: datetime | None = None,
+) -> Bar:
+    ts = parse_local_datetime(row[0], timeframe, timestamp_is_bar_end=True)
+    complete = _is_tdx_period_complete(timeframe, ts, now=now)
     return Bar(
         symbol=symbol.upper(),
         timeframe=timeframe,
-        ts=parse_local_datetime(row[0], timeframe, timestamp_is_bar_end=True),
+        ts=ts,
         open=float(row[1]),
         close=float(row[2]),
         high=float(row[3]),
         low=float(row[4]),
         volume=tencent_volume_to_shares(symbol, row[5]),
+        complete=complete,
+        revision=0 if complete else 1,
         source="tencent",
     )
 
@@ -167,7 +178,13 @@ def tencent_volume_to_shares(symbol: str, raw_volume: object) -> int:
     return volume * 100
 
 
-def baidu_row_to_bar(symbol: str, timeframe: str, row) -> Bar:
+def baidu_row_to_bar(
+    symbol: str,
+    timeframe: str,
+    row,
+    *,
+    now: datetime | None = None,
+) -> Bar:
     if isinstance(row, dict):
         values = row
         ts_value = values.get("date") or values.get("time")
@@ -179,15 +196,19 @@ def baidu_row_to_bar(symbol: str, timeframe: str, row) -> Bar:
     else:
         values = list(row)
         ts_value, open_value, high_value, low_value, close_value, volume_value = values[:6]
+    ts = parse_local_datetime(str(ts_value), timeframe)
+    complete = _is_tdx_period_complete(timeframe, ts, now=now)
     return Bar(
         symbol=symbol.upper(),
         timeframe=timeframe,
-        ts=parse_local_datetime(str(ts_value), timeframe),
+        ts=ts,
         open=float(open_value),
         high=float(high_value),
         low=float(low_value),
         close=float(close_value),
         volume=int(float(volume_value or 0)),
+        complete=complete,
+        revision=0 if complete else 1,
         source="baidu",
     )
 
