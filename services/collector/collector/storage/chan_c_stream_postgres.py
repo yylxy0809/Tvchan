@@ -77,9 +77,33 @@ class PostgresChanCStreamStore:
         assert self._pool is not None
         level_codes = [timeframe_to_db_code(level) for level in levels]
         week_cutoff_utc, month_cutoff_utc = closed_period_cutoffs_utc()
+        if any(code in HIGHER_TIMEFRAME_CODES for code in level_codes):
+            closed_bar_join = """
+                    left join lateral (
+                        select k.ts as target_bar_end
+                        from klines k
+                        where k.symbol_id = head.symbol_id
+                          and k.timeframe = head.base_timeframe
+                          and k.source = any(array[2,3,4,5,6,7,8,9]::smallint[])
+                          and (
+                              (head.chan_level = 10080 and k.ts < $6::timestamptz)
+                              or (head.chan_level = 43200 and k.ts < $7::timestamptz)
+                          )
+                        order by k.ts desc
+                        limit 1
+                    ) closed_bar on head.chan_level in (10080, 43200)
+            """
+        else:
+            # Avoid planning a 910-chunk hypertable scan when only intraday/daily
+            # levels are requested. The CASE below never reads this null value.
+            closed_bar_join = """
+                    left join lateral (
+                        select null::timestamptz as target_bar_end
+                    ) closed_bar on false
+            """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 with selected_symbols as materialized (
                     select id, code, exchange
                     from symbols
@@ -121,19 +145,7 @@ class PostgresChanCStreamStore:
                         order by coalesce(end_base_ts, end_ts) desc, seq desc, id desc
                         limit 1
                     ) latest_stroke on true
-                    left join lateral (
-                        select k.ts as target_bar_end
-                        from klines k
-                        where k.symbol_id = head.symbol_id
-                          and k.timeframe = head.base_timeframe
-                          and k.source = any(array[2,3,4,5,6,7,8,9]::smallint[])
-                          and (
-                              (head.chan_level = 10080 and k.ts < $6::timestamptz)
-                              or (head.chan_level = 43200 and k.ts < $7::timestamptz)
-                          )
-                        order by k.ts desc
-                        limit 1
-                    ) closed_bar on head.chan_level in (10080, 43200)
+                    {closed_bar_join}
                     where head.status = 'published'
                       and head.run_id is not null
                       and head.base_to_bar_end is not null
