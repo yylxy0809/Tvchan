@@ -417,6 +417,8 @@ async def _load_strict_inputs(
     freshness: FreshnessContract,
     *,
     for_share: bool = True,
+    catalog_scope_names: tuple[str, ...] | None = None,
+    catalog_scope_manifest_sha256: str | None = None,
 ) -> StrictInputs:
     audit_sql = (
         "SELECT status,apply_mode,parameters,summary FROM kline_audit_runs "
@@ -495,13 +497,29 @@ async def _load_strict_inputs(
     ]
     if len(symbols) != active_count or _manifest_sha256(universe_manifest) != active_sha256:
         raise RuntimeError("active universe does not match canonical audit evidence")
+    catalog_symbols = symbols
+    verified_catalog_sha256 = catalog_sha256
+    if catalog_scope_names is not None or catalog_scope_manifest_sha256 is not None:
+        if (
+            catalog_scope_names is None
+            or catalog_scope_manifest_sha256 is None
+            or not 1 <= len(catalog_scope_names) <= 20
+            or len(set(catalog_scope_names)) != len(catalog_scope_names)
+            or not _SHA256_RE.fullmatch(catalog_scope_manifest_sha256)
+        ):
+            raise RuntimeError("supplemental catalog scope provenance is invalid")
+        wanted = set(catalog_scope_names)
+        catalog_symbols = [symbol for symbol in symbols if symbol.name in wanted]
+        if {symbol.name for symbol in catalog_symbols} != wanted:
+            raise RuntimeError("supplemental catalog scope no longer matches active universe")
+        verified_catalog_sha256 = catalog_scope_manifest_sha256
     await _verify_active_catalog(
         connection,
-        symbols,
+        catalog_symbols,
         generation_id=catalog_generation_id,
         control_revision=catalog_control_revision,
         expected_scope_count=catalog_expected,
-        manifest_sha256=catalog_sha256,
+        manifest_sha256=verified_catalog_sha256,
     )
 
     checkpoint_rows = await connection.fetch(
