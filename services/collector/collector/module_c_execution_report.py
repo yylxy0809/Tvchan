@@ -95,7 +95,8 @@ HEAD_COVERAGE_SQL = """
 with expected as (
     select task.symbol_id, task.symbol, task.chan_level, task.status as task_status,
            task.run_id as task_run_id, task.target_bar_until,
-           task.bar_count as task_bar_count, mode.mode
+           task.bar_count as task_bar_count, mode.mode,
+           (task.expected_heads ->> mode.mode)::bigint as expected_head_run_id
     from chan_c_full_recompute_tasks task
     cross join (values ('confirmed'::varchar), ('predictive'::varchar)) mode(mode)
     where task.batch_id = $1 and task.eligible
@@ -120,6 +121,19 @@ with expected as (
                and task_run.bar_count is not distinct from expected.task_bar_count
                and task_run.base_timeframe = head_run.base_timeframe
            ) as input_identity_equivalent,
+           (
+               expected.expected_head_run_id = head.run_id
+               and task_run.symbol_id = head_run.symbol_id
+               and task_run.chan_level = head_run.chan_level
+               and task_run.input_signature = head_run.input_signature
+               and task_run.config_hash = head_run.config_hash
+               and task_run.bar_from is not distinct from head_run.bar_from
+               and task_run.bar_until = head_run.bar_until
+               and task_run.bar_until = expected.target_bar_until
+               and task_run.bar_count is not distinct from head_run.bar_count
+               and task_run.bar_count is not distinct from expected.task_bar_count
+               and task_run.base_timeframe = head_run.base_timeframe
+           ) as recorded_head_equivalent,
            history.id as history_id,
            outbox.id as outbox_id,
            outbox.status as outbox_status
@@ -147,6 +161,7 @@ with expected as (
                and (
                    (head_batch_id = $1 and head_run_batch_id = $1)
                    or (task_status = 'completed' and input_identity_equivalent)
+                   or (task_status = 'completed' and recorded_head_equivalent)
                )
            ) as covered,
            (
