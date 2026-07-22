@@ -699,6 +699,8 @@ def test_head_coverage_accepts_direct_batch_or_strict_input_equivalent_noop() ->
     assert "task_run.bar_count is not distinct from head_run.bar_count" in normalized
     assert "task_run.bar_count is not distinct from expected.task_bar_count" in normalized
     assert "task_run.base_timeframe = head_run.base_timeframe" in normalized
+    assert "expected.expected_head_run_id = head.run_id" in normalized
+    assert "task_status = 'completed' and recorded_head_equivalent" in normalized
     assert "history.new_run_id = head.run_id" in normalized
     assert "outbox_status is distinct from 'completed'" in normalized
 
