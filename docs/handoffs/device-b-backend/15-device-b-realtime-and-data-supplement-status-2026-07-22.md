@@ -34,13 +34,13 @@
 
 ### 范围
 
-- 启动时间：2026-07-22 18:04（Asia/Shanghai）。
+- 初始启动时间：2026-07-22 18:04（Asia/Shanghai）；18:19 切换为可观测的独立命名容器和分周期窗口。
 - 数据源：腾讯 HTTPS；不修改或断开 VPN，不依赖不稳定的通达信/PyTDX 链路。
 - 标的范围：数据库中全部 `is_active=true` 的沪深标的，共 `5209` 个，其中 SH `2315`、SZ `2894`。
 - 已经永久停用的 325 个不可获取标的不进入补采。
 - 周期：`5f/30f/1d`。
 - 目标：从全量基线的 2026-07-17 收盘补到 2026-07-22 收盘 `2026-07-22T07:00:00Z`。
-- 每周期最多读取最近 `180` 根；该窗口覆盖 7 月 20、21、22 三个交易日的 5 分钟缺口。
+- 依次读取 `5f=180`、`30f=30`、`1d=5` 根；窗口覆盖 7 月 20、21、22 三个交易日的对应缺口，并避免对高周期重复读取 180 根历史。
 - 并发：`4`，保持为受控的四路写入。
 - 使用 `--skip-publish`，补采期间不向 Redis 广播，不触发全市场实时缠论重算。
 
@@ -50,21 +50,41 @@
 
 ### 当前运行身份
 
-补采作为现有 `tv_backend_market_fill_worker` 容器中的独立单次进程运行：
+补采运行在独立命名容器 `tv_market_fill_tencent_supplement_20260722` 中。三个命令顺序执行，任一时刻总并发保持为 `4`：
 
 ```text
 python -m collector.market_fill
   --provider tencent
   --symbols-from-db
   --symbol-limit 0
-  --timeframes 5f,30f,1d
+  --timeframes 5f
   --limit 180
+  --concurrency 4
+  --sleep 0.05
+  --skip-publish
+
+python -m collector.market_fill
+  --provider tencent
+  --symbols-from-db
+  --symbol-limit 0
+  --timeframes 30f
+  --limit 30
+  --concurrency 4
+  --sleep 0.05
+  --skip-publish
+
+python -m collector.market_fill
+  --provider tencent
+  --symbols-from-db
+  --symbol-limit 0
+  --timeframes 1d
+  --limit 5
   --concurrency 4
   --sleep 0.05
   --skip-publish
 ```
 
-这是幂等 upsert。若宿主机或容器在完成前重启，可使用相同冻结参数重新执行；已经写入的有效数据不得删除。
+相较三个周期统一读取 180 根，分周期窗口把计划读取量从约 281 万根降到约 112 万根，减少约 60%。这是幂等 upsert；若宿主机或容器在完成前重启，可使用相同冻结参数重新执行，已经写入的有效数据不得删除。
 
 ## 补采完成门禁
 
