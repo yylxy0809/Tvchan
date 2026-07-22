@@ -46,6 +46,49 @@ def test_approved_canary_may_cover_a_strict_supplemental_recovery_build() -> Non
         },
         approved_parameters=approved,
     )
+    assert approved_canary_covers_build(
+        eligibility_build_id="supplemental-v2",
+        parameters={
+            "scope": "supplemental",
+            "supplemental_contract_version": "module-c-supplemental-selection-v2",
+            "source_build_id": "new-audited-source",
+        },
+        approved_parameters=approved,
+    )
+
+
+def test_revalidate_supplemental_v2_uses_only_its_frozen_catalog_scope(monkeypatch) -> None:
+    source = _strict_v2_source()
+    source["parameters"] = {
+        **source["parameters"],
+        "scope": "supplemental",
+        "supplemental_contract_version": "module-c-supplemental-selection-v2",
+        "supplemental_symbols": ["605003.SH"],
+        "supplemental_catalog_manifest_sha256": "a" * 64,
+    }
+    calls = []
+
+    async def fake_load(conn, audit_run_id, freshness, **kwargs):
+        calls.append(kwargs)
+        return _strict_inputs(source)
+
+    async def fake_contract(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(batch_control, "_load_strict_inputs", fake_load)
+    monkeypatch.setattr(batch_control, "validate_strict_build", fake_contract)
+
+    asyncio.run(
+        revalidate_strict_v2_build(
+            object(), source, build_id="33333333-3333-3333-3333-333333333333"
+        )
+    )
+
+    assert calls == [{
+        "for_share": True,
+        "catalog_scope_names": ("605003.SH",),
+        "catalog_scope_manifest_sha256": "a" * 64,
+    }]
 
 
 def _selection() -> dict[str, object]:

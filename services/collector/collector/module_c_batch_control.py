@@ -37,6 +37,9 @@ REQUIRED_CANARY_TRAITS = frozenset(
 PRODUCTION_CANARY_SELECTION_VERSIONS = frozenset(
     {"module-c-canary-selection-v2", "module-c-canary-selection-v3"}
 )
+SUPPLEMENTAL_SELECTION_VERSIONS = frozenset(
+    {"module-c-supplemental-selection-v1", "module-c-supplemental-selection-v2"}
+)
 STRICT_V2_PROVENANCE_FIELDS = (
     "canonical_audit_run_id",
     "audit_evidence_sha256",
@@ -215,7 +218,7 @@ def approved_canary_covers_build(
     return (
         parameters.get("scope") == "supplemental"
         and parameters.get("supplemental_contract_version")
-        == "module-c-supplemental-selection-v1"
+        in SUPPLEMENTAL_SELECTION_VERSIONS
         and bool(parameters.get("source_build_id"))
     )
 
@@ -274,11 +277,31 @@ async def revalidate_strict_v2_build(
     """Revalidate one frozen build against the current strict-v2 input snapshot."""
     provenance, parameters = _strict_v2_provenance(build)
     freshness = parse_freshness_contract(parameters["freshness_contract"])
+    load_options: dict[str, Any] = {"for_share": for_share}
+    build_parameters = _json_object(build["parameters"])
+    if (
+        build_parameters.get("scope") == "supplemental"
+        and build_parameters.get("supplemental_contract_version")
+        == "module-c-supplemental-selection-v2"
+    ):
+        symbols = build_parameters.get("supplemental_symbols")
+        scope_sha256 = build_parameters.get("supplemental_catalog_manifest_sha256")
+        if (
+            not isinstance(symbols, list)
+            or not all(isinstance(symbol, str) and symbol for symbol in symbols)
+            or not isinstance(scope_sha256, str)
+            or not _SHA256_RE.fullmatch(scope_sha256)
+        ):
+            raise RuntimeError("Supplemental strict-v2 catalog scope provenance is invalid")
+        load_options.update(
+            catalog_scope_names=tuple(symbols),
+            catalog_scope_manifest_sha256=scope_sha256,
+        )
     strict = await _load_strict_inputs(
         conn,
         provenance["canonical_audit_run_id"],
         freshness,
-        for_share=for_share,
+        **load_options,
     )
     observed = {
         "canonical_audit_run_id": provenance["canonical_audit_run_id"],
