@@ -125,7 +125,6 @@ with expected as (
                expected.expected_head_run_id = head.run_id
                and task_run.symbol_id = head_run.symbol_id
                and task_run.chan_level = head_run.chan_level
-               and task_run.input_signature = head_run.input_signature
                and task_run.config_hash = head_run.config_hash
                and task_run.bar_from is not distinct from head_run.bar_from
                and task_run.bar_until = head_run.bar_until
