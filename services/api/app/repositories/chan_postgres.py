@@ -329,7 +329,14 @@ async def _select_windowed_module_c_runs(
           and head.run_id is not null
           and head.base_from_bar_end <= $4
           and head.base_to_bar_end = watermark.last_bar_end
-          and head.consumed_input_version = watermark.change_version
+          and (
+                head.consumed_input_version = watermark.change_version
+                or (
+                    watermark.last_bar_end > now()
+                    and head.consumed_input_version < watermark.change_version
+                    and watermark.change_version - head.consumed_input_version = 1
+                )
+              )
           and run.status = 'success' and run.config_hash = any($5::varchar[])
           and run.bar_from <= $4 and run.bar_until = watermark.last_bar_end
         order by head.chan_level, head.mode, coalesce(head.published_at, head.updated_at) desc, head.id desc
