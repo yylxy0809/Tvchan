@@ -332,7 +332,7 @@ async def _select_windowed_module_c_runs(
           and (
                 head.consumed_input_version = watermark.change_version
                 or (
-                    watermark.last_bar_end > now()
+                    watermark.last_bar_end > now() - interval '90 seconds'
                     and head.consumed_input_version < watermark.change_version
                     and watermark.change_version - head.consumed_input_version = 1
                 )
