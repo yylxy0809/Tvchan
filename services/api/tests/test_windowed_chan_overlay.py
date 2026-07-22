@@ -167,6 +167,9 @@ def test_head_selection_rejects_missing_mode_or_invalid_module_c_run() -> None:
             assert "join scheme2_ingest_watermarks watermark" in query
             assert "head.base_to_bar_end = watermark.last_bar_end" in query
             assert "head.consumed_input_version = watermark.change_version" in query
+            assert "watermark.last_bar_end > now()" in query
+            assert "head.consumed_input_version < watermark.change_version" in query
+            assert "watermark.change_version - head.consumed_input_version = 1" in query
             assert "run.bar_until = watermark.last_bar_end" in query
             assert "run.status = 'success'" in query
             assert "run.config_hash = any($5::varchar[])" in query
@@ -191,6 +194,7 @@ def test_head_selection_rejects_each_invalid_head_attribute() -> None:
                 assert "head.status = 'published'" in query
                 assert "head.base_to_bar_end = watermark.last_bar_end" in query
                 assert "head.consumed_input_version = watermark.change_version" in query
+                assert "watermark.last_bar_end > now()" in query
                 assert "run.status = 'success' and run.config_hash = any($5::varchar[])" in query
                 _symbol_id, _levels, modes, first, config_hashes = _args
                 if not (
@@ -201,7 +205,14 @@ def test_head_selection_rejects_each_invalid_head_attribute() -> None:
                     and row["config_hash"] in config_hashes
                     and row["base_from_bar_end"] <= first
                     and row["base_to_bar_end"] == row["watermark_last_bar_end"]
-                    and row["consumed_input_version"] == row["watermark_change_version"]
+                    and (
+                        row["consumed_input_version"] == row["watermark_change_version"]
+                        or (
+                        row.get("watermark_bar_is_open", False)
+                        and row["consumed_input_version"] < row["watermark_change_version"]
+                        and row["watermark_change_version"] - row["consumed_input_version"] == 1
+                        )
+                    )
                     and row["bar_from"] <= first
                     and row["bar_until"] == row["watermark_last_bar_end"]
                 ):
@@ -221,6 +232,7 @@ def test_head_selection_rejects_each_invalid_head_attribute() -> None:
         "config_hash": MODULE_C_CONFIG_HASH,
         "watermark_last_bar_end": _dt(99),
         "consumed_input_version": 3, "watermark_change_version": 3,
+        "watermark_bar_is_open": False,
     }
     # The query predicates are tested independently because a DB fake must not
     # accidentally accept rows that a real WHERE clause would reject.
@@ -233,9 +245,37 @@ def test_head_selection_rejects_each_invalid_head_attribute() -> None:
         {**valid, "base_from_bar_end": _dt(11)},
         {**valid, "base_to_bar_end": _dt(98)},
         {**valid, "consumed_input_version": 2},
+        {**valid, "consumed_input_version": 1, "watermark_bar_is_open": True},
         {**valid, "bar_until": _dt(98)},
     ):
         asyncio.run(assert_rejected(rejected))
+
+
+def test_head_selection_allows_previous_revision_only_for_open_bar() -> None:
+    row = {
+        "chan_level": 5, "mode": "confirmed", "run_id": 1, "snapshot_version": "v",
+        "base_from_bar_end": _dt(1), "base_to_bar_end": _dt(99),
+        "bar_from": _dt(1), "bar_until": _dt(99), "base_timeframe": 5,
+        "head_status": "published", "run_status": "success",
+        "config_hash": MODULE_C_CONFIG_HASH,
+        "watermark_last_bar_end": _dt(99),
+        "consumed_input_version": 2, "watermark_change_version": 3,
+        "watermark_bar_is_open": True,
+    }
+
+    class OpenBarConn:
+        async def fetch(self, query, *_args):
+            assert "watermark.last_bar_end > now()" in query
+            assert "head.consumed_input_version < watermark.change_version" in query
+            assert "watermark.change_version - head.consumed_input_version = 1" in query
+            return [row]
+
+    selected = asyncio.run(_select_windowed_module_c_runs(
+        OpenBarConn(), symbol_id=1, levels=["5f"], modes=["confirmed"],
+        first_ts=_dt(10), last_ts=_dt(20),
+    ))
+    assert selected is not None
+    assert selected[("5f", "confirmed")]["run_id"] == 1
 
 
 def test_head_selection_uses_each_native_closed_watermark() -> None:
